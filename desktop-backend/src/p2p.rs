@@ -1,6 +1,6 @@
 use super::{bearer, internal, ApiError, AppState};
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::HeaderMap,
     routing::{get, post},
     Json, Router,
@@ -29,10 +29,21 @@ struct P2pGroup {
     joined_at: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct P2pMessage {
+    id: String,
+    channel_id: String,
+    author: String,
+    content: String,
+    created_at: String,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/p2p/friends", get(list_friends).post(save_friend))
         .route("/p2p/groups", get(list_groups).post(save_group))
+        .route("/p2p/messages/{channel_id}", get(list_messages).post(save_message))
 }
 
 async fn list_friends(
@@ -138,6 +149,65 @@ async fn save_group(
     .await
     .map_err(internal)?;
     Ok(Json(group))
+}
+
+async fn list_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+) -> Result<Json<Vec<P2pMessage>>, ApiError> {
+    let owner = bearer(&headers, &state)?;
+    if !valid_id(&channel_id) {
+        return Err(ApiError::Bad("Canal P2P inválido".into()));
+    }
+    let rows = sqlx::query_as::<_, (String, String, String, String)>(
+        "SELECT id,author,content,created_at FROM p2p_messages WHERE owner_user_id=? AND channel_id=? ORDER BY created_at DESC LIMIT 200",
+    )
+    .bind(owner)
+    .bind(&channel_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(internal)?;
+    Ok(Json(rows.into_iter().rev().map(|(id, author, content, created_at)| P2pMessage {
+        id,
+        channel_id: channel_id.clone(),
+        author,
+        content,
+        created_at,
+    }).collect()))
+}
+
+async fn save_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+    Json(message): Json<P2pMessage>,
+) -> Result<Json<P2pMessage>, ApiError> {
+    let owner = bearer(&headers, &state)?;
+    if channel_id != message.channel_id
+        || !valid_id(&channel_id)
+        || !valid_id(&message.id)
+        || message.author.trim().is_empty()
+        || message.author.chars().count() > 80
+        || message.content.trim().is_empty()
+        || message.content.chars().count() > 4_000
+        || chrono::DateTime::parse_from_rfc3339(&message.created_at).is_err()
+    {
+        return Err(ApiError::Bad("Mensagem P2P inválida".into()));
+    }
+    sqlx::query(
+        "INSERT OR IGNORE INTO p2p_messages(owner_user_id,channel_id,id,author,content,created_at) VALUES(?,?,?,?,?,?)",
+    )
+    .bind(owner)
+    .bind(&message.channel_id)
+    .bind(&message.id)
+    .bind(&message.author)
+    .bind(&message.content)
+    .bind(&message.created_at)
+    .execute(&state.db)
+    .await
+    .map_err(internal)?;
+    Ok(Json(message))
 }
 
 fn validate_peer(peer_id: &str, display_name: &str, public_key: &Value) -> Result<(), ApiError> {

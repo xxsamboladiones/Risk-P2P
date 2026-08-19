@@ -70,11 +70,15 @@ async function copyText(value: string): Promise<void> {
   document.body.appendChild(textarea);
   textarea.select();
   textarea.setSelectionRange(0, value.length);
+  let copiedWithDom = false;
   try {
-    if (document.execCommand("copy")) return;
+    copiedWithDom = document.execCommand("copy");
+  } catch {
+    copiedWithDom = false;
   } finally {
     textarea.remove();
   }
+  if (copiedWithDom) return;
 
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(value);

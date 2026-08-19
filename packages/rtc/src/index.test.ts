@@ -129,6 +129,37 @@ describe("MeshWebRTCTransport", () => {
     expect(transport.getDiagnostics()[0]?.pendingIceCandidates).toBe(0);
   });
 
+  it("renegocia imediatamente quando uma track é publicada após a conexão", async () => {
+    const callbacks = events();
+    const peerId = "00000000-0000-4000-8000-000000000002";
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
+    await transport.connect(peerId, true);
+    expect(callbacks.sendOffer).toHaveBeenCalledTimes(1);
+    await transport.acceptAnswer(peerId, { type: "answer", sdp: "answer-1" });
+
+    const track = { id: "camera-track", kind: "video" } as MediaStreamTrack;
+    const stream = { id: "camera-stream" } as MediaStream;
+    await transport.publishTrack(track, stream);
+
+    expect(callbacks.sendOffer).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserva renegociação pendente se a câmera/tela ligar enquanto uma offer está em voo", async () => {
+    const callbacks = events();
+    const peerId = "00000000-0000-4000-8000-000000000002";
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
+    await transport.connect(peerId, true);
+    expect(callbacks.sendOffer).toHaveBeenCalledTimes(1);
+
+    const track = { id: "screen-track", kind: "video" } as MediaStreamTrack;
+    const stream = { id: "screen-stream" } as MediaStream;
+    await transport.publishTrack(track, stream);
+    expect(callbacks.sendOffer).toHaveBeenCalledTimes(1);
+
+    await transport.acceptAnswer(peerId, { type: "answer", sdp: "answer-1" });
+    expect(callbacks.sendOffer).toHaveBeenCalledTimes(2);
+  });
+
   it("abre um DataChannel por peer e entrega mensagens sem servidor", async () => {
     const callbacks = { ...events(), onDataMessage: vi.fn(), onDataState: vi.fn() };
     const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);

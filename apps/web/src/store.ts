@@ -1,0 +1,18 @@
+import { create } from "zustand";
+import type { PeerState } from "@risk/protocol";
+
+export type Participant = { peerId: string; displayName: string; state: PeerState; streams?: Record<string, MediaStream>; connection?: RTCPeerConnectionState };
+type CallState = {
+  token: string | null; roomId: string | null; selfPeerId: string | null; participants: Record<string, Participant>; localPreviews: { camera: MediaStream | null; screen: MediaStream | null }; localState: PeerState; error: string | null;
+  setSession(token: string): void; setRoom(roomId: string | null): void; setSelf(peerId: string): void;
+  setLocalMedia(previews: { camera: MediaStream | null; screen: MediaStream | null }, state: PeerState): void; upsert(participant: Participant): void; remove(peerId: string): void; setError(error: string | null): void; reset(): void;
+};
+export const useCallStore = create<CallState>((set) => ({
+  token: sessionStorage.getItem("accessToken"), roomId: null, selfPeerId: null, participants: {}, localPreviews: { camera: null, screen: null }, localState: { microphone: true, camera: false, screenShare: false }, error: null,
+  setSession: (token) => { sessionStorage.setItem("accessToken", token); set({ token }); },
+  setRoom: (roomId) => set({ roomId }), setSelf: (selfPeerId) => set({ selfPeerId }),
+  setLocalMedia: (localPreviews, localState) => set({ localPreviews, localState: { ...localState } }),
+  upsert: (participant) => set((state) => ({ participants: { ...state.participants, [participant.peerId]: { ...state.participants[participant.peerId], ...participant } } })),
+  remove: (peerId) => set((state) => { const participants = { ...state.participants }; delete participants[peerId]; return { participants }; }),
+  setError: (error) => set({ error }), reset: () => { sessionStorage.removeItem("accessToken"); set({ token: null, roomId: null, selfPeerId: null, participants: {}, localPreviews: { camera: null, screen: null }, localState: { microphone: true, camera: false, screenShare: false } }); }
+}));

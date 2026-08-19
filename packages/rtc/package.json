@@ -1,0 +1,1 @@
+{"name":"@risk/rtc","version":"0.1.0","type":"module","exports":"./src/index.ts","scripts":{"typecheck":"tsc --noEmit","build":"tsc --noEmit","test":"vitest run --passWithNoTests"},"dependencies":{"@risk/protocol":"workspace:*","@risk/shared":"workspace:*"},"devDependencies":{"typescript":"^5.7.3","vitest":"^3.0.5"}}

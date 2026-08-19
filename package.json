@@ -1,0 +1,15 @@
+{
+  "name": "risk-p2p",
+  "private": true,
+  "packageManager": "pnpm@10.15.0",
+  "scripts": {
+    "dev": "pnpm --parallel --filter @risk/web --filter @risk/desktop dev",
+    "dev:web": "pnpm --filter @risk/web dev",
+    "dev:desktop": "pnpm --filter @risk/desktop dev",
+    "build": "pnpm -r build",
+    "build:web": "pnpm --filter @risk/web build",
+    "build:desktop": "pnpm --filter @risk/desktop build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test"
+  }
+}

@@ -53,6 +53,7 @@ function contentType(filePath: string): string {
     case ".js": return "text/javascript; charset=utf-8";
     case ".css": return "text/css; charset=utf-8";
     case ".json": return "application/json; charset=utf-8";
+    case ".wasm": return "application/wasm";
     case ".svg": return "image/svg+xml";
     case ".png": return "image/png";
     case ".jpg": case ".jpeg": return "image/jpeg";

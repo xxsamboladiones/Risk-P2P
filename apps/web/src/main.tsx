@@ -21,7 +21,7 @@ import {
 } from "lucide-react";
 import { api, type Channel, type ChatMessage, type Community, type CurrentUser, type Friend, type PendingFriend } from "./api";
 import { CallController } from "./call";
-import { ChatController, type ChatConnectionStatus } from "./chat";
+import { ChatController, privateConversationId, type ChatConnectionStatus } from "./chat";
 import { GroupInvitePanel } from "./components/GroupInvitePanel";
 import { P2PInvitePanel } from "./components/P2PInvitePanel";
 import {
@@ -205,6 +205,8 @@ function SocialHome() {
   const [friends, setFriends] = useState<Friend[]>([]);
   const [pending, setPending] = useState<PendingFriend[]>([]);
   const [selectedCommunity, setSelectedCommunity] = useState<Community | null>(null);
+  const [activeFriend, setActiveFriend] = useState<Friend | null>(null);
+  const [privateChannelId, setPrivateChannelId] = useState<string | null>(null);
   const [groupMembers, setGroupMembers] = useState<PublicPeerIdentity[]>([]);
   const [channels, setChannels] = useState<Channel[]>([]);
   const [activeChannel, setActiveChannel] = useState<Channel | null>(null);
@@ -234,6 +236,7 @@ function SocialHome() {
     setPending(social.pending);
     setCommunities(mergedGroups);
     setSelectedCommunity((current) => current ? mergedGroups.find((item) => item.id === current.id) ?? null : current);
+    setActiveFriend((current) => current ? mergedFriends.find((item) => item.id === current.id) ?? null : current);
   }
 
   useEffect(() => {
@@ -249,6 +252,23 @@ function SocialHome() {
   useEffect(() => {
     void api.me(token).then(setCurrentUser).catch((cause) => setError(cause instanceof Error ? cause.message : "Falha ao carregar perfil"));
   }, [token]);
+
+  useEffect(() => {
+    let alive = true;
+    if (!activeFriend?.local || !currentUser) {
+      setPrivateChannelId(null);
+      return () => { alive = false; };
+    }
+    void Promise.all([getOrCreateLocalIdentity(currentUser.displayName), loadLocalFriends()])
+      .then(async ([identity, localFriends]) => {
+        const friend = localFriends.find((item) => item.peerId === activeFriend.id);
+        if (!friend) throw new Error("Identidade P2P deste amigo não está disponível neste dispositivo.");
+        return privateConversationId(identity.peerId, friend.peerId);
+      })
+      .then((channelId) => { if (alive) setPrivateChannelId(channelId); })
+      .catch((cause) => { if (alive) setError(cause instanceof Error ? cause.message : "Falha ao preparar conversa privada"); });
+    return () => { alive = false; };
+  }, [activeFriend, currentUser]);
 
   useEffect(() => {
     let alive = true;
@@ -283,13 +303,20 @@ function SocialHome() {
   }, [selectedCommunity, token]);
 
   useEffect(() => {
-    if (!activeChannel || activeChannel.kind !== "text") { setMessages([]); return; }
+    const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
+    if (!conversationId) { setMessages([]); return; }
     let alive = true;
     const offMessage = chat.onMessage((message) => {
-      if (alive) setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
+      if (!alive) return;
+      setMessages((current) => {
+        if (current.some((item) => item.id === message.id)) return current;
+        return [...current, message].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      });
     });
     const offStatus = chat.onStatus((status) => { if (alive) setChatStatus(status); });
-    void chat.history(activeChannel.id).then((items) => { if (alive) setMessages(items); }).catch((cause) => setError(cause instanceof Error ? cause.message : "Falha no histórico local"));
+    void chat.history(conversationId)
+      .then((items) => { if (alive) setMessages([...items].sort((a, b) => a.createdAt.localeCompare(b.createdAt))); })
+      .catch((cause) => setError(cause instanceof Error ? cause.message : "Falha no histórico local"));
     return () => {
       alive = false;
       offMessage();
@@ -297,7 +324,7 @@ function SocialHome() {
       void chat.disconnect();
       setChatStatus("disconnected");
     };
-  }, [activeChannel]);
+  }, [activeChannel, activeFriend, privateChannelId]);
 
   async function enterVoice(channel: Channel) {
     if (!channel.voiceRoomId) return;
@@ -309,16 +336,33 @@ function SocialHome() {
   }
 
   async function connectChat() {
-    if (!activeChannel || activeChannel.kind !== "text" || !currentUser) return;
+    if (!currentUser) return;
     try {
       const { iceServers } = await api.turnCredentials(token);
+      if (activeFriend) {
+        if (!activeFriend.local || !privateChannelId) throw new Error("Esta conversa privada P2P ainda não está pronta.");
+        const [identity, localFriends] = await Promise.all([
+          getOrCreateLocalIdentity(currentUser.displayName),
+          loadLocalFriends(),
+        ]);
+        const friend = localFriends.find((item) => item.peerId === activeFriend.id);
+        if (!friend) throw new Error("Este amigo não possui identidade P2P local.");
+        await chat.connect(privateChannelId, currentUser.displayName, iceServers, {
+          identity,
+          trustedPeers: [friend],
+          namespace: "friend",
+          maxRemotePeers: 1,
+        });
+        return;
+      }
+      if (!activeChannel || activeChannel.kind !== "text") return;
       await chat.connect(activeChannel.id, currentUser.displayName, iceServers);
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Falha ao conectar o chat"); }
   }
 
   async function submitMessage(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!activeChannel) return;
+    if (!activeFriend && !activeChannel) return;
     const input = event.currentTarget.elements.namedItem("message") as HTMLInputElement;
     const content = input.value.trim();
     if (!content) return;
@@ -337,14 +381,14 @@ function SocialHome() {
   return <>
     <main className="social-shell">
       <aside className="space-rail">
-        <button className={!selectedCommunity ? "space active" : "space"} onClick={() => setSelectedCommunity(null)} title="Amigos"><Sparkles/></button>
+        <button className={!selectedCommunity ? "space active" : "space"} onClick={() => { setSelectedCommunity(null); setActiveFriend(null); }} title="Amigos"><Sparkles/></button>
         <div className="rail-separator"/>
-        {communities.map((group) => <button key={group.id} className={selectedCommunity?.id === group.id ? "space active" : "space"} onClick={() => setSelectedCommunity(group)} title={group.name}>{group.name.slice(0, 2).toUpperCase()}</button>)}
+        {communities.map((group) => <button key={group.id} className={selectedCommunity?.id === group.id ? "space active" : "space"} onClick={() => { setActiveFriend(null); setSelectedCommunity(group); }} title={group.name}>{group.name.slice(0, 2).toUpperCase()}</button>)}
         <button className="space add" onClick={() => setModal("group")} title="Criar grupo"><Plus/></button>
       </aside>
 
       <aside className="navigation">
-        <div className="nav-title">{selectedCommunity?.name ?? "Risk"}</div>
+        <div className="nav-title">{selectedCommunity?.name ?? activeFriend?.displayName ?? "Risk"}</div>
         {selectedCommunity ? <>
           <div className="nav-section"><span>CANAIS DE TEXTO</span><button onClick={() => setModal("channel")}><Plus size={15}/></button></div>
           {channels.filter((item) => item.kind === "text").map((channel) => <button key={channel.id} className={activeChannel?.id === channel.id ? "channel active" : "channel"} onClick={() => setActiveChannel(channel)}><Hash/>{channel.name}</button>)}
@@ -353,7 +397,8 @@ function SocialHome() {
           <div className="nav-section"><span>MEMBROS</span><button onClick={() => setModal("member")}><UserPlus size={15}/></button></div>
           {groupMembers.slice(0, 8).map((member) => <div className="mini-user" key={member.peerId}><i>{member.displayName[0]?.toUpperCase()}</i><span>{member.displayName}</span></div>)}
         </> : <>
-          <button className="channel active"><Users/>Amigos</button>
+          <button className={!activeFriend ? "channel active" : "channel"} onClick={() => setActiveFriend(null)}><Users/>Amigos</button>
+          {activeFriend && <button className="channel active"><MessageCircle/>{activeFriend.displayName}</button>}
           <button className="channel" onClick={() => setModal("friend")}><UserPlus/>Adicionar amigo</button>
         </>}
         <div className="account-bar">
@@ -365,12 +410,19 @@ function SocialHome() {
 
       <section className="content-panel">
         {error && <div className="global-error" onClick={() => setError("")}>{error}</div>}
-        {!selectedCommunity ? <>
+        {activeFriend ? <>
+          <header className="content-header"><MessageCircle/><strong>{activeFriend.displayName}</strong><span>Mensagem direta P2P</span><button className={`chat-connect ${chatStatus}`} disabled={!privateChannelId || chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat privado conectado" : chatStatus === "connected" ? "Aguardando amigo…" : chatStatus === "connecting" ? "Conectando…" : "Conectar P2P"}</button></header>
+          <div className="messages">
+            {messages.map((message) => <article key={message.id}><div className="avatar">{message.author[0]}</div><div><strong>{message.author}</strong><time>{new Date(message.createdAt).toLocaleString()}</time><p>{message.content}</p></div></article>)}
+            {!messages.length && <div className="channel-welcome"><MessageCircle/><h2>Conversa com {activeFriend.displayName}</h2><p>Os dois amigos devem abrir esta conversa e clicar em Conectar P2P. Depois disso as mensagens seguem pelo WebRTC DataChannel.</p></div>}
+          </div>
+          <form className="message-box" onSubmit={(event) => void submitMessage(event)}><Plus/><input name="message" maxLength={4000} placeholder={`Mensagem para ${activeFriend.displayName}`} autoComplete="off"/><button><Send/></button></form>
+        </> : !selectedCommunity ? <>
           <header className="content-header"><Users/><strong>Amigos</strong><button onClick={() => setModal("friend")}>Adicionar amigo</button></header>
           <div className="friends-layout"><div>
             <h3>Seus amigos — {friends.length}</h3>
             {pending.map((request) => <div className="friend-row pending" key={request.requestId}><div className="avatar">{request.displayName[0]}</div><div><strong>{request.displayName}</strong><small>Quer adicionar você</small></div><button onClick={() => void api.acceptFriend(token, request.requestId).then(loadSocial).catch((cause) => setError(cause instanceof Error ? cause.message : "Falha ao aceitar"))}>Aceitar</button></div>)}
-            {friends.map((friend) => <div className="friend-row" key={friend.id}><div className="avatar">{friend.displayName[0]}</div><div><strong>{friend.displayName}</strong><small>{friend.local ? "Amigo P2P neste dispositivo" : "Amigo no Risk"}</small></div><MessageCircle/></div>)}
+            {friends.map((friend) => <div className="friend-row" key={friend.id}><div className="avatar">{friend.displayName[0]}</div><div><strong>{friend.displayName}</strong><small>{friend.local ? "Amigo P2P neste dispositivo" : "Amigo no Risk"}</small></div><button disabled={!friend.local} title={friend.local ? "Abrir chat privado P2P" : "Chat P2P requer amizade por identidade local"} onClick={() => { setSelectedCommunity(null); setActiveFriend(friend); }}><MessageCircle size={18}/></button></div>)}
             {!friends.length && !pending.length && <div className="empty-social"><Users/><h2>Seu círculo começa aqui</h2><p>Crie um código temporário ou use o código de outra pessoa.</p><button onClick={() => setModal("friend")}>Adicionar primeiro amigo</button></div>}
           </div><aside><h3>Atividade</h3><p>As salas de voz ativas dos seus grupos aparecerão aqui futuramente.</p></aside></div>
         </> : activeChannel?.kind === "text" ? <>
@@ -393,6 +445,7 @@ function SocialHome() {
           .then((group) => {
             const community: Community = { id: group.groupId, name: group.name, local: true };
             setCommunities((items) => [...items, community]);
+            setActiveFriend(null);
             setSelectedCommunity(community);
             setModal(null);
             window.dispatchEvent(new Event("risk:social-updated"));

@@ -1,133 +1,161 @@
 # Arquitetura e operação
 
-O Risk combina um backend central para identidade/dados duráveis com transporte P2P para comunicação em tempo real.
+O Risk Desktop usa Electron para a aplicação principal, React no renderer e um sidecar Rust/Axum para persistência local.
 
 ```text
-React / Electron ── HTTP(S) ── Axum ── PostgreSQL
-       │
-       ├── Supabase Realtime
-       │      Presence + Broadcast efêmeros
-       │      offer / answer / ICE / estado / perfil
-       │
-       └════════ WebRTC Mesh P2P ════════ outros peers
-              áudio / vídeo / tela / DataChannel
-                         │
-                    STUN / TURN
+┌──────────────────────────── Risk Desktop ────────────────────────────┐
+│                                                                      │
+│  Electron Main                                                       │
+│      │                                                               │
+│      ├── frontend React                                              │
+│      │       │                                                       │
+│      │       └── HTTP local + token efêmero                         │
+│      │                                                               │
+│      └── risk-desktop-backend                                        │
+│              │                                                       │
+│              └── SQLite em app.getPath("userData")                  │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+                │                              │
+                │ Supabase Realtime            │ STUN/TURN
+                │ Presence/Broadcast            │
+                └────────── WebRTC Mesh P2P ────┘
+                  áudio / vídeo / tela / dados
 ```
 
-## Responsabilidades
+## Desktop backend
 
-### Backend Rust
+`desktop-backend` é o backend usado pelo aplicativo empacotado. Ele não exige PostgreSQL.
 
-O backend continua responsável por:
+Na inicialização:
 
-- autenticação e rotação de refresh tokens;
-- contas e dados sociais persistentes do modelo central;
-- comunidades/canais persistentes;
-- memberships de voz representadas por `room_members`;
-- emissão de credenciais TURN temporárias.
+1. o Electron escolhe/abre uma origem HTTP local para os assets;
+2. gera `RISK_LOCAL_TOKEN` aleatório;
+3. inicia o sidecar;
+4. fornece `RISK_DATA_DIR=app.getPath("userData")`;
+5. fornece `RISK_WEB_ORIGIN` e `RISK_BACKEND_BIND=127.0.0.1:0`;
+6. o sidecar abre `risk.sqlite3` e executa migrations;
+7. o sidecar escreve `RISK_BACKEND_READY {"url":"http://127.0.0.1:..."}`;
+8. Electron valida `/health` e só então cria a janela.
 
-Ele **não participa do signaling WebRTC**. O desktop empacotado também não inclui PostgreSQL nem transforma esse backend em um processo local: builds de produção devem receber `VITE_API_URL` apontando para uma API acessível.
+O endpoint é dinâmico. Não existe uma porta fixa obrigatória para o backend ou para o servidor de assets do aplicativo empacotado.
 
-### Supabase Realtime
+Toda rota da API local, exceto `/health`, exige `X-Risk-Desktop-Token`. O token é criado novamente a cada execução e entregue ao renderer somente pelo preload/IPC.
 
-O Supabase é usado somente como rendezvous/signaling temporário. O cliente não usa `.from()`, Storage, Edge Functions ou tabelas Supabase para chamadas.
+## Persistência SQLite
 
-Broadcast não é usado como histórico. Presence desaparece quando o canal é encerrado. SDP, ICE e estado de chamada permanecem efêmeros no modelo do Risk.
+O banco local fica fora da pasta de instalação. Atualizar ou reinstalar os arquivos do programa não deve sobrescrever o banco em `userData`.
 
-### WebRTC
+O schema local contém atualmente contas, estado de sessão, amizades/pedidos locais, comunidades, canais, mensagens, salas e memberships. Há também migrations preparadas para mover registros sociais P2P para SQLite.
 
-O `MeshWebRTCTransport` mantém no máximo uma `RTCPeerConnection` por peer e impõe cinco peers remotos, ou seja, no máximo seis participantes por cliente Mesh. O limite é uma proteção de escalabilidade no cliente; ele não é uma política de autorização do signaling.
+A chave privada da identidade P2P permanece como `CryptoKey` não extraível no armazenamento WebCrypto/IndexedDB. Isso é intencional: serializar a chave privada em SQLite exigiria torná-la exportável ou adotar um keystore nativo separado.
 
-Cada entrada gera um UUID efêmero. A sala é transformada em SHA-256 antes de virar tópico Realtime. Candidatos ICE recebidos cedo ficam em memória até `remoteDescription`, com limite por peer.
+## Backend PostgreSQL legado
 
-DataChannels aplicam limite de payload e um limite simples de `bufferedAmount` para evitar continuar enfileirando mensagens quando o canal está congestionado.
+O diretório `server` continua existindo como backend central PostgreSQL legado/experimental. Ele não faz parte do caminho crítico do Risk Desktop e não é iniciado pelo instalador.
+
+O objetivo do desktop é não exigir PostgreSQL, Docker ou credenciais de banco do usuário final.
+
+## Supabase Realtime
+
+Supabase é rendezvous/signaling efêmero:
+
+- Presence descobre peers;
+- Broadcast transporta offer/answer/ICE e estado efêmero;
+- nenhuma tabela Supabase é necessária para chamadas;
+- SDP, ICE e presença não são persistidos pelo Risk;
+- mídia e DataChannel seguem diretamente pelo WebRTC.
+
+A sala é derivada antes de virar tópico Realtime. O provider rejeita mensagens próprias, mensagens destinadas a outro peer, mensagens duplicadas, antigas ou de peers que não estejam presentes no canal.
+
+Presence ainda usa identidade efêmera escolhida pelo cliente. O protocolo de convites possui identidade ECDSA permanente, mas signaling geral e chat ainda podem ser endurecidos com handshake/assinaturas ligadas à identidade P2P durável.
+
+## WebRTC
+
+`MeshWebRTCTransport` mantém no máximo cinco peers remotos, totalizando seis participantes por cliente.
+
+O transporte implementa:
+
+- Perfect Negotiation;
+- fila ICE até `remoteDescription`;
+- limite de peers;
+- backpressure simples de DataChannel;
+- limpeza de tracks, peer connections e callbacks;
+- diagnóstico sem expor SDP ou credenciais completas.
 
 ## Chat P2P
 
-O chat conectado usa o mesmo `SignalingProvider` para negociar um `RTCDataChannel` ordenado. O conteúdo da mensagem passa diretamente pelo WebRTC e é salvo somente no IndexedDB de cada participante.
+O chat negocia um DataChannel ordenado usando o mesmo modelo de signaling. Mensagens trafegam diretamente pelo WebRTC.
 
-O campo `author` recebido pelo DataChannel não é usado cegamente para definir o nome exibido. A interface associa a mensagem ao `peerId` real da conexão e ao primeiro `peer.profile` observado para esse peer. Isso reduz spoofing simples, mas **não substitui assinatura criptográfica permanente de mensagens**.
-
-Sem peers online, não há entrega remota. O histórico local também não é sincronizado automaticamente entre dispositivos.
+O nome recebido não é confiado cegamente ao campo `author`; o cliente o associa ao peer conectado. Ainda falta ligar cada sessão de chat à identidade criptográfica permanente para uma garantia mais forte contra impersonação.
 
 ## Convites P2P
 
-Amizades e entrada em grupos podem ser concluídas por códigos temporários `risk-XXXX-XXXX-XXXX-XXXX`.
+Convites usam códigos temporários `risk-XXXX-XXXX-XXXX-XXXX` e rendezvous derivado por SHA-256.
 
-O código vira um rendezvous SHA-256 separado por namespace (`friend` ou `group`). Depois que o DataChannel é aberto, identidade pública e decisões usam mensagens ECDSA P-256 assinadas.
+Após conexão WebRTC, as mensagens de convite usam ECDSA P-256 e ACK bilateral:
 
-O fluxo de aceite é bilateral:
-
-1. joiner envia a solicitação assinada;
+1. joiner envia solicitação assinada;
 2. criador aceita ou recusa;
-3. joiner persiste o resultado recebido;
-4. joiner envia `invite.ack` assinado;
-5. somente após o ACK o criador persiste a amizade ou membership local;
-6. ambos limpam signaling e transporte.
+3. joiner persiste a decisão;
+4. joiner envia `invite.ack`;
+5. criador persiste somente depois do ACK;
+6. signaling/transporte temporários são destruídos.
 
-Há timeout de candidato para evitar que um peer ocupe o convite indefinidamente e limite de tentativas compartilhado pela sessão do cliente.
+## TURN
 
-A chave privada local é armazenada no IndexedDB como `CryptoKey` não extraível. Ela nunca é enviada para Supabase ou para outro peer.
+O sidecar local não deve possuir `TURN_SECRET` de um relay público. Qualquer segredo permanente distribuído dentro do aplicativo pode ser extraído.
 
-## Limites de confiança do signaling
+Para redes em que conexão direta/STUN falha, o Risk deve usar:
 
-Mensagens Realtime externas são verificadas quanto a tipo, IDs, sala, idade, tamanho, destino, deduplicação e rate limit. O provider também rejeita mensagens cujo `fromPeerId` não esteja atualmente presente no canal.
+- serviço TURN gerenciado; ou
+- um emissor remoto mínimo de credenciais TURN temporárias.
 
-Isso reduz mensagens forjadas vindas de peers não observados, porém Presence e Broadcast continuam usando uma identidade efêmera escolhida pelo cliente. Não há, hoje, uma assinatura criptográfica ligando cada offer/answer/ICE ao usuário permanente da conta.
-
-Da mesma forma, `room_members` mantém o modelo de autorização do backend coerente, mas não autoriza sozinho um tópico Realtime no Supabase. Se for necessário impedir que qualquer cliente conhecedor de um rendezvous assine o tópico, será preciso adicionar uma camada de autorização/autenticação específica para o Realtime.
+Esse serviço não precisa armazenar amigos, mensagens ou grupos.
 
 ## Electron
 
-O processo desktop mantém:
+O processo desktop usa:
 
 - `contextIsolation: true`;
 - `nodeIntegration: false`;
 - `sandbox: true`;
-- preload CommonJS mínimo (`preload.cjs`);
-- IPC `screen:list` permitido somente para a origem do Risk;
-- novas janelas bloqueadas;
-- navegação para origens externas bloqueada;
-- permissões de mídia/display condicionadas à origem confiável;
-- single-instance lock para impedir colisão do servidor local de assets.
+- preload CommonJS mínimo;
+- navegação externa bloqueada;
+- `window.open` bloqueado;
+- permissões de mídia limitadas à origem Risk;
+- IPC validado por origem;
+- single-instance lock;
+- sidecar iniciado antes da UI ficar disponível.
 
-No pacote, os arquivos estáticos da interface são servidos em uma origem HTTP local previsível. Isso evita depender de `file://` e mantém o modelo de CORS/cookies consistente com o desenvolvimento.
+## Empacotamento
 
-## Backend, CORS e cookies
+O build de produção segue:
 
-`WEB_ORIGINS` aceita uma lista separada por vírgulas. `WEB_ORIGIN` ainda é aceito como fallback de compatibilidade.
+```text
+cargo build --release --manifest-path desktop-backend/Cargo.toml
+        ↓
+apps/desktop/resources/backend/risk-desktop-backend(.exe)
+        ↓
+pnpm build:web
+        ↓
+Electron TypeScript
+        ↓
+electron-builder
+```
 
-Quando `COOKIE_SECURE=false`, o refresh cookie usa `SameSite=Lax`, adequado ao desenvolvimento local. Quando `COOKIE_SECURE=true`, usa `SameSite=None; Secure`, necessário para uma implantação HTTPS na qual frontend e API estejam em sites distintos.
+`extraResources` coloca o sidecar em `resources/backend/`, fora do ASAR. No Linux, o script aplica permissão executável.
 
-O backend também valida os principais limites de entrada, verifica `kind=access` no JWT e possui um limitador de login em memória por e-mail normalizado. Esse limitador é por instância do processo; uma implantação horizontal exigiria armazenamento/limitação compartilhada na borda ou em serviço central.
+## Validação antes de release
 
-## Diagnóstico
+Além da CI, validar manualmente:
 
-`CallController.getDiagnostics()` retorna:
-
-- status do signaling;
-- status do canal;
-- peer/sala derivados;
-- peers observados em Presence;
-- quantidade de mensagens de signaling processadas;
-- `connectionState`, `iceConnectionState`, `signalingState`, fila ICE e estado do DataChannel de cada peer.
-
-SDP, candidatos completos, chaves e credenciais TURN não fazem parte desse diagnóstico.
-
-Use `VITE_DEBUG_SIGNALING=true` apenas em desenvolvimento.
-
-## TURN em produção
-
-As credenciais TURN são temporárias e assinadas pelo backend com `TURN_SECRET`.
-
-Para uma implantação real:
-
-- defina `TURN_HOST` com um hostname/IP alcançável pelos clientes;
-- configure `external-ip` quando o servidor coturn estiver atrás de NAT;
-- publique 3478 UDP/TCP;
-- configure/publice uma faixa UDP de relay;
-- considere 5349/TLS (`turns:`) para redes restritivas;
-- mantenha `TURN_SECRET` apenas no backend/coturn.
-
-O Docker de desenvolvimento publica `49160-49200/udp` como faixa de relay pequena para testes. Dimensione isso separadamente para produção.
+- NSIS em Windows limpo;
+- AppImage em Linux;
+- DEB em Linux;
+- criação e reapertura do SQLite;
+- upgrade sem perda de dados;
+- encerramento do sidecar junto com Electron;
+- dois PCs em redes diferentes;
+- fallback TURN em NAT restritivo;
+- câmera, microfone e compartilhamento de tela/áudio.

@@ -8,32 +8,35 @@ New-Item -ItemType Directory -Force -Path $releasePath | Out-Null
 $publicEnvironment = @{}
 if (Test-Path $environmentPath) {
   foreach ($line in Get-Content -LiteralPath $environmentPath) {
-    if ($line -match '^\s*(VITE_API_URL|VITE_SUPABASE_URL|VITE_SUPABASE_ANON_KEY|VITE_DEBUG_SIGNALING)\s*=\s*(.*)\s*$') {
+    if ($line -match '^\s*(VITE_SUPABASE_URL|VITE_SUPABASE_ANON_KEY|VITE_DEBUG_SIGNALING|VITE_ICE_SERVERS_JSON)\s*=\s*(.*)\s*$') {
       $publicEnvironment[$matches[1]] = $matches[2].Trim().Trim('"').Trim("'")
     }
   }
 }
 
-$required = @("VITE_API_URL", "VITE_SUPABASE_URL", "VITE_SUPABASE_ANON_KEY")
+$required = @("VITE_SUPABASE_URL", "VITE_SUPABASE_ANON_KEY")
 foreach ($name in $required) {
   if (-not $publicEnvironment[$name]) { throw "Defina $name no arquivo .env antes de empacotar o aplicativo." }
 }
 
-Write-Host "Gerando AppImage e DEB dentro de um container Linux..."
+Write-Host "Gerando AppImage e DEB com frontend + backend Rust local dentro de um container Linux..."
 & docker build --file infrastructure/desktop/Dockerfile.linux --tag risk-p2p-linux-builder:local .
 if ($LASTEXITCODE -ne 0) { throw "Não foi possível preparar a imagem Linux." }
 
 $dockerArgs = @(
   "run", "--rm",
-  "--env", "VITE_API_URL=$($publicEnvironment.VITE_API_URL)",
   "--env", "VITE_SUPABASE_URL=$($publicEnvironment.VITE_SUPABASE_URL)",
   "--env", "VITE_SUPABASE_ANON_KEY=$($publicEnvironment.VITE_SUPABASE_ANON_KEY)",
   "--volume", "${releasePath}:/project/apps/desktop/release",
   "--volume", "risk-p2p-electron-cache:/root/.cache/electron",
-  "--volume", "risk-p2p-electron-builder-cache:/root/.cache/electron-builder"
+  "--volume", "risk-p2p-electron-builder-cache:/root/.cache/electron-builder",
+  "--volume", "risk-p2p-cargo-registry:/root/.cargo/registry",
+  "--volume", "risk-p2p-cargo-git:/root/.cargo/git"
 )
-if ($publicEnvironment.VITE_DEBUG_SIGNALING) {
-  $dockerArgs += @("--env", "VITE_DEBUG_SIGNALING=$($publicEnvironment.VITE_DEBUG_SIGNALING)")
+foreach ($name in @("VITE_DEBUG_SIGNALING", "VITE_ICE_SERVERS_JSON")) {
+  if ($publicEnvironment[$name]) {
+    $dockerArgs += @("--env", "$name=$($publicEnvironment[$name])")
+  }
 }
 $dockerArgs += "risk-p2p-linux-builder:local"
 

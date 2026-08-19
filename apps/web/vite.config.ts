@@ -1,7 +1,7 @@
 import http from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { defineConfig, loadEnv, type Plugin } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 
 const envDir = fileURLToPath(new URL("../../", import.meta.url));
@@ -109,18 +109,18 @@ function devBackendProxy(): Plugin {
   };
 }
 
-export default defineConfig(({ command, mode }) => {
-  const env = loadEnv(mode, envDir, "");
-  if (command === "serve" && !env.VITE_API_URL?.trim() && !process.env.VITE_API_URL?.trim()) {
-    // No navegador de desenvolvimento, a API é acessada pelo próprio Vite. O proxy
-    // injeta o token efêmero sem expô-lo ao JavaScript da página.
-    process.env.VITE_API_URL = DEV_API_PREFIX;
-  }
-
+export default defineConfig(({ command }) => {
+  const devApiUrl = process.env.RISK_DEV_API_URL?.trim() || DEV_API_PREFIX;
   return {
     base: "./",
     envDir,
     plugins: [react(), devBackendProxy()],
+    // Durante `vite serve`, o navegador usa o proxy local por padrão mesmo que um
+    // .env antigo ainda contenha VITE_API_URL=http://localhost:8080. Para testar
+    // deliberadamente outra API em desenvolvimento, use RISK_DEV_API_URL.
+    define: command === "serve"
+      ? { "import.meta.env.VITE_API_URL": JSON.stringify(devApiUrl) }
+      : undefined,
     server: { port: 5173 },
   };
 });

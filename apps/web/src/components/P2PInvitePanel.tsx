@@ -28,11 +28,14 @@ export function P2PInvitePanel({ type, token, displayName, group, initialMode = 
   async function cancel() { await service.current?.cancel(); setRequest(undefined); }
   async function copy() {
     if (!state) return;
+    setError("");
     try {
-      await navigator.clipboard.writeText(state.code);
+      await copyText(state.code);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1_500);
-    } catch { setError("Não foi possível copiar o código automaticamente."); }
+    } catch {
+      setError("Não foi possível copiar o código automaticamente. Selecione o código acima e use Ctrl+C.");
+    }
   }
   const remaining = Math.max(0, Math.ceil(((state?.expiresAt ?? now) - now) / 1000));
 
@@ -52,6 +55,32 @@ export function P2PInvitePanel({ type, token, displayName, group, initialMode = 
     {error && <div className="invite-notice error">{error}</div>}
     <small className="privacy-note">O Supabase só ajuda os peers a se encontrarem. A solicitação e os dados sociais passam pelo WebRTC e ficam neste dispositivo.</small>
   </div>;
+}
+
+async function copyText(value: string): Promise<void> {
+  // `navigator.clipboard` pode ser negado no Electron sandboxado e em alguns
+  // navegadores mesmo durante um clique. O caminho legado é síncrono e preserva
+  // a ativação do usuário, então tentamos primeiro e removemos o elemento logo após.
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  textarea.setSelectionRange(0, value.length);
+  try {
+    if (document.execCommand("copy")) return;
+  } finally {
+    textarea.remove();
+  }
+
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  throw new Error("Clipboard indisponível.");
 }
 
 function friendly(cause: unknown): string { return cause instanceof Error ? cause.message : "Não foi possível concluir o convite."; }

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import {
   ensureLocalGroup,
@@ -28,9 +28,18 @@ export function GroupInvitePanel({
   preferredGroupChannels?: LocalGroupChannel[];
   onComplete?(): void;
 }) {
+  const preferredMetadata = useMemo<PublicGroupMetadata | undefined>(() => {
+    if (!preferredGroupId || !preferredGroupName) return undefined;
+    return {
+      groupId: preferredGroupId,
+      name: preferredGroupName,
+      channels: preferredGroupChannels ?? [],
+    };
+  }, [preferredGroupChannels, preferredGroupId, preferredGroupName]);
+
   const [groups, setGroups] = useState<LocalGroup[]>([]);
-  const [selectedId, setSelectedId] = useState("");
-  const [loading, setLoading] = useState(initialMode === "create");
+  const [selectedId, setSelectedId] = useState(preferredGroupId ?? "");
+  const [loading, setLoading] = useState(initialMode === "create" && !preferredMetadata);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -38,35 +47,42 @@ export function GroupInvitePanel({
     let alive = true;
 
     void (async () => {
+      setError("");
       let localGroups = await loadLocalGroups();
 
-      // Grupos criados antes da migração para o armazenamento P2P/SQLite podem
-      // existir apenas na API local de communities. Se o grupo selecionado não
-      // estiver em p2p_groups, recuperamos seus metadados e o promovemos para a
-      // representação P2P local antes de gerar o convite.
-      if (preferredGroupId && !localGroups.some((group) => group.groupId === preferredGroupId)) {
-        let groupName = preferredGroupName;
-        let groupChannels = preferredGroupChannels;
+      if (preferredGroupId) {
+        const existing = localGroups.find((group) => group.groupId === preferredGroupId);
+        if (!existing) {
+          let metadata = preferredMetadata;
+          if (!metadata) {
+            const communities = await api.communities(token);
+            const community = communities.find((group) => group.id === preferredGroupId);
+            if (!community) throw new Error("Grupo selecionado não foi encontrado.");
+            metadata = {
+              groupId: preferredGroupId,
+              name: community.name,
+              channels: await api.channels(token, preferredGroupId).catch(() => []),
+            };
+          }
 
-        if (!groupName) {
-          const communities = await api.communities(token);
-          groupName = communities.find((group) => group.id === preferredGroupId)?.name;
+          // Persistência é desejável para o histórico local, mas não deve bloquear a
+          // criação do código. O convite usa os metadados recebidos diretamente do
+          // grupo selecionado e o grupo será salvo novamente quando o handshake for
+          // aceito/concluído.
+          try {
+            const identity = await getOrCreateLocalIdentity(displayName);
+            await ensureLocalGroup(
+              metadata.groupId,
+              metadata.name,
+              publicIdentity(identity),
+              metadata.channels,
+            );
+            localGroups = await loadLocalGroups();
+            window.dispatchEvent(new Event("risk:social-updated"));
+          } catch (cause) {
+            console.warn("Não foi possível preparar o grupo no armazenamento P2P antes do convite", cause);
+          }
         }
-        if (!groupName) throw new Error("Grupo selecionado não foi encontrado no armazenamento local.");
-
-        if (!groupChannels) {
-          groupChannels = await api.channels(token, preferredGroupId).catch(() => []);
-        }
-
-        const identity = await getOrCreateLocalIdentity(displayName);
-        await ensureLocalGroup(
-          preferredGroupId,
-          groupName,
-          publicIdentity(identity),
-          groupChannels,
-        );
-        localGroups = await loadLocalGroups();
-        window.dispatchEvent(new Event("risk:social-updated"));
       }
 
       if (!alive) return;
@@ -75,6 +91,7 @@ export function GroupInvitePanel({
         : localGroups;
       setGroups(available);
       setSelectedId((current) => {
+        if (preferredGroupId) return preferredGroupId;
         if (current && available.some((group) => group.groupId === current)) return current;
         return available[0]?.groupId ?? "";
       });
@@ -89,7 +106,7 @@ export function GroupInvitePanel({
     return () => {
       alive = false;
     };
-  }, [displayName, initialMode, preferredGroupChannels, preferredGroupId, preferredGroupName, token]);
+  }, [displayName, initialMode, preferredGroupId, preferredMetadata, token]);
 
   if (initialMode === "join") {
     return <div className="group-invite-panel">
@@ -111,26 +128,32 @@ export function GroupInvitePanel({
         avatar: selected.avatar,
         channels: selected.channels,
       }
-    : undefined;
+    : preferredMetadata && selectedId === preferredMetadata.groupId
+      ? preferredMetadata
+      : undefined;
 
   return <div className="group-invite-panel">
     <label>Grupo que receberá o membro</label>
     <select
       value={selectedId}
       onChange={(event) => setSelectedId(event.target.value)}
-      disabled={loading || groups.length === 0 || Boolean(preferredGroupId)}
+      disabled={loading || Boolean(preferredGroupId) || (!preferredMetadata && groups.length === 0)}
     >
       <option value="">{loading ? "Preparando grupo…" : "Selecione um grupo"}</option>
+      {preferredMetadata && !groups.some((group) => group.groupId === preferredMetadata.groupId) && (
+        <option value={preferredMetadata.groupId}>{preferredMetadata.name}</option>
+      )}
       {groups.map((group) => <option key={group.groupId} value={group.groupId}>{group.name}</option>)}
     </select>
-    {!loading && groups.length === 0 && <p className="invite-notice">
+    {!loading && !metadata && <p className="invite-notice">
       {error
         ? "Não foi possível preparar este grupo para convites P2P."
         : "Crie um grupo antes de gerar um convite P2P."}
     </p>}
-    {error && <div className="invite-notice error">{error}</div>}
+    {error && metadata && <div className="invite-notice">O armazenamento local será sincronizado quando o convite for concluído.</div>}
+    {error && !metadata && <div className="invite-notice error">{error}</div>}
     <P2PInvitePanel
-      key={selectedId || "create-unavailable"}
+      key={metadata?.groupId ?? selectedId || "create-unavailable"}
       type="group"
       token={token}
       displayName={displayName}

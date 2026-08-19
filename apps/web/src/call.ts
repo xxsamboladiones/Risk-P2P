@@ -127,6 +127,7 @@ export class CallController {
           echoCancellation: voiceSettings.echoCancellation,
           noiseSuppression: voiceSettings.noiseSuppression === "standard",
           autoGainControl: true,
+          channelCount: 1,
         },
       });
       this.microphoneInputStream = microphoneStream;
@@ -226,6 +227,11 @@ export class CallController {
     if (this.screenStream) { await this.stopScreen(); return; }
     const lifecycle = this.lifecycleId;
     try {
+      // Atualiza a preferência imediatamente antes do getDisplayMedia(). O provider
+      // lê essa configuração de captura para incluir restrictOwnAudio na solicitação
+      // inicial, que é o único momento em que o Electron pode escolher o backend
+      // loopbackWithoutChrome no Windows.
+      const voiceSettings = loadVoiceVideoSettings();
       const stream = await this.screen.startScreenShare();
       const videoTrack = stream.getVideoTracks()[0];
       if (!videoTrack) {
@@ -234,7 +240,6 @@ export class CallController {
       }
 
       const screenAudioTrack = stream.getAudioTracks()[0];
-      const voiceSettings = loadVoiceVideoSettings();
       if (screenAudioTrack && voiceSettings.excludeRiskAudioFromScreenShare) {
         try {
           await screenAudioTrack.applyConstraints({ restrictOwnAudio: true } as DisplayAudioConstraints);

@@ -1,6 +1,6 @@
 import type { LocalIdentity, PublicGroupMetadata, PublicPeerIdentity } from "../offline/social-storage";
 
-export type InviteProtocolType = "friend.request" | "friend.accept" | "friend.reject" | "group.join.request" | "group.join.accept" | "group.join.reject" | "invite.busy";
+export type InviteProtocolType = "friend.request" | "friend.accept" | "friend.reject" | "group.join.request" | "group.join.accept" | "group.join.reject" | "invite.ack" | "invite.busy";
 export type SignedInviteMessage = {
   version: 1; type: InviteProtocolType; requestId: string; timestamp: number;
   identity: PublicPeerIdentity; group?: PublicGroupMetadata; reason?: string; signature: string;
@@ -42,19 +42,27 @@ function publicIdentity(identity: LocalIdentity): PublicPeerIdentity {
 function isMessage(value: unknown): value is SignedInviteMessage {
   if (!value || typeof value !== "object") return false;
   const item = value as Record<string, unknown>; const identity = item.identity as Record<string, unknown> | undefined;
-  const types: InviteProtocolType[] = ["friend.request", "friend.accept", "friend.reject", "group.join.request", "group.join.accept", "group.join.reject", "invite.busy"];
+  const types: InviteProtocolType[] = ["friend.request", "friend.accept", "friend.reject", "group.join.request", "group.join.accept", "group.join.reject", "invite.ack", "invite.busy"];
   const type = item.type as InviteProtocolType;
   return item.version === 1 && types.includes(type) && validId(item.requestId) &&
-    typeof item.timestamp === "number" && typeof item.signature === "string" && item.signature.length < 512 &&
+    typeof item.timestamp === "number" && Number.isFinite(item.timestamp) && typeof item.signature === "string" && item.signature.length < 512 &&
     Boolean(identity && validId(identity.peerId) && typeof identity.displayName === "string" && identity.displayName.length >= 1 && identity.displayName.length <= 80 &&
-      identity.publicKey && typeof identity.publicKey === "object") && (type !== "group.join.accept" || isGroup(item.group));
+      identity.publicKey && typeof identity.publicKey === "object") &&
+    (item.reason === undefined || (typeof item.reason === "string" && item.reason.length <= 200)) &&
+    (type !== "group.join.accept" || isGroup(item.group));
 }
 
 function isGroup(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   const group = value as Record<string, unknown>;
   if (!validId(group.groupId) || typeof group.name !== "string" || group.name.length < 1 || group.name.length > 80 || !Array.isArray(group.channels) || group.channels.length > 100) return false;
-  return group.channels.every((value) => { const channel = value as Record<string, unknown>; return Boolean(channel && typeof channel === "object" && validId(channel.id) && typeof channel.name === "string" && channel.name.length >= 1 && channel.name.length <= 80 && (channel.kind === "text" || channel.kind === "voice") && (channel.voiceRoomId === undefined || channel.voiceRoomId === null || validId(channel.voiceRoomId))); });
+  return group.channels.every((value) => {
+    if (!value || typeof value !== "object") return false;
+    const channel = value as Record<string, unknown>;
+    return validId(channel.id) && typeof channel.name === "string" && channel.name.length >= 1 && channel.name.length <= 80 &&
+      (channel.kind === "text" || channel.kind === "voice") &&
+      (channel.voiceRoomId === undefined || channel.voiceRoomId === null || validId(channel.voiceRoomId));
+  });
 }
 
 function validId(value: unknown): value is string { return typeof value === "string" && /^[a-zA-Z0-9_-]{8,128}$/.test(value); }

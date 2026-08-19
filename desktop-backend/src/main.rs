@@ -377,19 +377,18 @@ async fn send_friend_request(
 ) -> Result<Json<Value>, ApiError> {
     let user = bearer(&headers, &state)?;
     let email = normalize_email(&input.email)?;
-    let recipient = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM users WHERE email=? COLLATE NOCASE",
-    )
-    .bind(email)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(internal)?
-    .ok_or_else(|| {
-        ApiError::Bad(
-            "Usuário local não encontrado. Para outro dispositivo, use convite P2P por código."
-                .into(),
-        )
-    })?;
+    let recipient =
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email=? COLLATE NOCASE")
+            .bind(email)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                ApiError::Bad(
+                    "Usuário local não encontrado. Para outro dispositivo, use convite P2P por código."
+                        .into(),
+                )
+            })?;
     if recipient == user {
         return Err(ApiError::Bad("Você não pode adicionar a si mesmo".into()));
     }

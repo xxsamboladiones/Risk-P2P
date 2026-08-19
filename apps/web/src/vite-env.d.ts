@@ -27,6 +27,7 @@ type RiskDesktopBackendConfig = {
 interface Window {
   desktop?: {
     listScreenSources(): Promise<RiskDesktopSource[]>;
+    chooseScreenSource(): Promise<string | null>;
     selectScreenSource(sourceId: string): Promise<void>;
     getBackendConfig(): Promise<RiskDesktopBackendConfig>;
   };

@@ -7,7 +7,13 @@ export type DesktopSource = {
   thumbnail: string;
 };
 
+export type DesktopBackendConfig = {
+  baseUrl: string;
+  token: string;
+};
+
 contextBridge.exposeInMainWorld("desktop", {
   listScreenSources: (): Promise<DesktopSource[]> => ipcRenderer.invoke("screen:list"),
   selectScreenSource: (sourceId: string): Promise<void> => ipcRenderer.invoke("screen:select", sourceId),
+  getBackendConfig: (): Promise<DesktopBackendConfig> => ipcRenderer.invoke("backend:config"),
 });

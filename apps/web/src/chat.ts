@@ -2,7 +2,12 @@ import { MeshWebRTCTransport } from "@risk/rtc";
 import { SupabaseSignalingProvider } from "./services/supabase/signaling";
 import type { SignalingNamespace, SignalingProvider } from "./services/signaling/types";
 import { loadLocalMessages, saveLocalMessage, type LocalChatMessage } from "./services/offline/chat-storage";
-import type { LocalIdentity, PublicPeerIdentity } from "./services/offline/social-storage";
+import {
+  getOrCreateLocalIdentity,
+  loadLocalGroups,
+  type LocalIdentity,
+  type PublicPeerIdentity,
+} from "./services/offline/social-storage";
 
 export type ChatConnectionStatus = "disconnected" | "connecting" | "connected" | "ready" | "error";
 
@@ -97,19 +102,24 @@ export class ChatController {
   ): Promise<void> {
     await this.disconnect();
     this.setStatus("connecting");
+
+    const inferred = options.identity ? null : await inferLocalGroupSecurity(channelId, displayName);
+    const identity = options.identity ?? inferred?.identity;
+    const trustedPeers = options.trustedPeers ?? inferred?.trustedPeers ?? [];
+
     this.channelId = channelId;
-    this.identity = options.identity;
-    this.peerId = options.identity?.peerId ?? crypto.randomUUID();
+    this.identity = identity;
+    this.peerId = identity?.peerId ?? crypto.randomUUID();
     this.displayName = displayName.trim();
     this.trustedPeers.clear();
     this.verifyKeys.clear();
-    for (const peer of options.trustedPeers ?? []) this.trustedPeers.set(peer.peerId, peer);
-    if (options.identity) {
-      this.trustedPeers.set(options.identity.peerId, {
-        peerId: options.identity.peerId,
-        publicKey: options.identity.publicKey,
-        displayName: options.identity.displayName,
-        avatar: options.identity.avatar,
+    for (const peer of trustedPeers) this.trustedPeers.set(peer.peerId, peer);
+    if (identity) {
+      this.trustedPeers.set(identity.peerId, {
+        peerId: identity.peerId,
+        publicKey: identity.publicKey,
+        displayName: identity.displayName,
+        avatar: identity.avatar,
       });
     }
     this.peerNames.clear();
@@ -375,7 +385,7 @@ export class ChatController {
       return await crypto.subtle.verify(
         { name: "ECDSA", hash: "SHA-256" },
         await key,
-        base64UrlToBytes(message.signature),
+        base64UrlToArrayBuffer(message.signature),
         new TextEncoder().encode(canonicalSignedMessage(message)),
       );
     } catch {
@@ -402,6 +412,18 @@ export async function privateConversationId(peerA: string, peerB: string): Promi
   const pair = [peerA, peerB].sort().join(":");
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`risk-dm-v1:${pair}`));
   return `dm-${[...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, "0")).join("")}`;
+}
+
+async function inferLocalGroupSecurity(
+  channelId: string,
+  displayName: string,
+): Promise<{ identity: LocalIdentity; trustedPeers: PublicPeerIdentity[] } | null> {
+  const group = (await loadLocalGroups()).find((item) => item.channels.some((channel) => channel.kind === "text" && channel.id === channelId));
+  if (!group) return null;
+  return {
+    identity: await getOrCreateLocalIdentity(displayName),
+    trustedPeers: group.members,
+  };
 }
 
 function parseChatWireEnvelope(raw: string, channelId?: string): ChatWireEnvelope | null {
@@ -518,8 +540,11 @@ function bytesToBase64Url(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
-function base64UrlToBytes(value: string): Uint8Array {
+function base64UrlToArrayBuffer(value: string): ArrayBuffer {
   const base64 = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
   const binary = atob(base64);
-  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  const buffer = new ArrayBuffer(binary.length);
+  const bytes = new Uint8Array(buffer);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return buffer;
 }

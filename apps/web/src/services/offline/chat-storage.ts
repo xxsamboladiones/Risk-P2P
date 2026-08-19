@@ -8,9 +8,10 @@ export type LocalChatMessage = {
 
 import { OFFLINE_STORES, openRiskDatabase } from "./database";
 const STORE = OFFLINE_STORES.messages;
-type DesktopBackendConfig = { baseUrl: string; token: string };
+type DesktopBackendConfig = { baseUrl: string; token?: string };
 let configPromise: Promise<DesktopBackendConfig | null> | undefined;
 const migratedChannels = new Set<string>();
+const DEV_BACKEND_PROXY = "/__risk-api";
 
 export async function loadLocalMessages(channelId: string): Promise<LocalChatMessage[]> {
   const config = await desktopConfig();
@@ -38,31 +39,40 @@ export async function saveLocalMessage(message: LocalChatMessage): Promise<void>
 }
 
 async function desktopConfig(): Promise<DesktopBackendConfig | null> {
-  if (!window.desktop?.getBackendConfig) return null;
-  if (!configPromise) {
-    configPromise = window.desktop.getBackendConfig()
-      .then((config) => ({ baseUrl: config.baseUrl.replace(/\/$/, ""), token: config.token }))
-      .catch((error) => {
-        configPromise = undefined;
-        throw error;
-      });
+  if (window.desktop?.getBackendConfig) {
+    if (!configPromise) {
+      configPromise = window.desktop.getBackendConfig()
+        .then((config) => ({ baseUrl: config.baseUrl.replace(/\/$/, ""), token: config.token }))
+        .catch((error) => {
+          configPromise = undefined;
+          throw error;
+        });
+    }
+    return configPromise;
   }
-  return configPromise;
+
+  if (import.meta.env.DEV && import.meta.env.VITE_API_URL === DEV_BACKEND_PROXY) {
+    return { baseUrl: DEV_BACKEND_PROXY };
+  }
+
+  return null;
 }
 
 async function backendRequest<T>(config: DesktopBackendConfig, channelId: string, init: RequestInit): Promise<T> {
   const perform = async (accessToken: string | null) => {
     const headers = new Headers({ "content-type": "application/json", ...init.headers });
-    headers.set("x-risk-desktop-token", config.token);
+    if (config.token) headers.set("x-risk-desktop-token", config.token);
     if (accessToken) headers.set("authorization", `Bearer ${accessToken}`);
     return fetch(`${config.baseUrl}/p2p/messages/${encodeURIComponent(channelId)}`, { ...init, headers });
   };
   let accessToken = sessionStorage.getItem("accessToken");
   let response = await perform(accessToken);
   if (response.status === 401) {
+    const refreshHeaders = new Headers();
+    if (config.token) refreshHeaders.set("x-risk-desktop-token", config.token);
     const refresh = await fetch(`${config.baseUrl}/auth/refresh`, {
       method: "POST",
-      headers: { "x-risk-desktop-token": config.token },
+      headers: refreshHeaders,
     });
     if (refresh.ok) {
       const session = await refresh.json() as { accessToken: string };

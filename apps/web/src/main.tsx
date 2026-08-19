@@ -11,6 +11,7 @@ import {
   PhoneOff,
   Plus,
   Send,
+  Settings2,
   Sparkles,
   UserPlus,
   Users,
@@ -24,6 +25,7 @@ import { CallController } from "./call";
 import { ChatController, privateConversationId, type ChatConnectionStatus } from "./chat";
 import { GroupInvitePanel } from "./components/GroupInvitePanel";
 import { P2PInvitePanel } from "./components/P2PInvitePanel";
+import { VoiceVideoSettingsPanel } from "./components/VoiceVideoSettingsPanel";
 import {
   addLocalGroupChannel,
   createLocalGroup,
@@ -194,7 +196,7 @@ function Modal({ title, children, onClose }: { title: string; children: React.Re
   </div>;
 }
 
-type SocialModal = "friend" | "group" | "channel" | "member" | "joinGroup" | null;
+type SocialModal = "friend" | "group" | "channel" | "member" | "joinGroup" | "settings" | null;
 
 function SocialHome() {
   const token = useCallStore((state) => state.token)!;
@@ -404,6 +406,7 @@ function SocialHome() {
         <div className="account-bar">
           <div className="avatar">{currentUser?.displayName.slice(0, 2).toUpperCase() ?? "EU"}</div>
           <div><strong>{currentUser?.displayName ?? "Carregando…"}</strong><small>Disponível</small></div>
+          <button onClick={() => setModal("settings")} title="Voz e vídeo"><Settings2/></button>
           <button onClick={() => void logout()} title="Sair"><LogOut/></button>
         </div>
       </aside>
@@ -436,6 +439,7 @@ function SocialHome() {
       </section>
 
       {modal === "friend" && <Modal title="Adicionar amigo" onClose={() => setModal(null)}>{currentUser ? <P2PInvitePanel type="friend" token={token} displayName={currentUser.displayName} onComplete={() => void loadSocial()}/> : <p>Carregando sua identidade…</p>}</Modal>}
+      {modal === "settings" && <Modal title="Voz e vídeo" onClose={() => setModal(null)}><VoiceVideoSettingsPanel/></Modal>}
       {modal === "group" && <Modal title="Criar um grupo" onClose={() => setModal(null)}><form onSubmit={(event) => {
         event.preventDefault();
         const name = String(new FormData(event.currentTarget).get("name")).trim();

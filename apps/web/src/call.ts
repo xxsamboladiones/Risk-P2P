@@ -2,6 +2,8 @@ import { MeshWebRTCTransport, WebScreenShareProvider, type PeerConnectionDiagnos
 import type { PeerState } from "@risk/protocol";
 import { useCallStore, type Participant } from "./store";
 import { api } from "./api";
+import { createRnnoiseMicrophone, type RnnoiseMicrophone } from "./services/audio/rnnoise";
+import { loadVoiceVideoSettings } from "./services/audio/settings";
 import { SupabaseSignalingProvider } from "./services/supabase/signaling";
 import type { SignalingDiagnostics, SignalingProvider } from "./services/signaling/types";
 
@@ -9,6 +11,8 @@ export type CallDiagnostics = {
   signaling: SignalingDiagnostics | null;
   peerConnections: PeerConnectionDiagnostics[];
 };
+
+type DisplayAudioSettings = MediaTrackSettings & { restrictOwnAudio?: boolean };
 
 export function reconcileRemoteMediaState(
   streamsById: Participant["streams"],
@@ -61,6 +65,9 @@ export class CallController {
   private transport?: MeshWebRTCTransport;
   private local = new MediaStream();
   private readonly screen = new WebScreenShareProvider();
+  private microphoneInputStream?: MediaStream;
+  private microphoneTrack?: MediaStreamTrack;
+  private rnnoiseMicrophone?: RnnoiseMicrophone;
   private cameraTrack?: MediaStreamTrack;
   private screenStream?: MediaStream;
   private roomId?: string;
@@ -75,9 +82,13 @@ export class CallController {
   async join(token: string, roomId: string, iceServers: RTCIceServer[]): Promise<MediaStream> {
     if (this.roomId) await this.leave(this.roomId);
     const lifecycle = ++this.lifecycleId;
+    const voiceSettings = loadVoiceVideoSettings();
     this.roomId = roomId;
     this.peerId = crypto.randomUUID();
     this.local = new MediaStream();
+    this.microphoneInputStream = undefined;
+    this.microphoneTrack = undefined;
+    this.rnnoiseMicrophone = undefined;
     this.cameraTrack = undefined;
     this.screenStream = undefined;
     this.state = { microphone: true, camera: false, screenShare: false };
@@ -109,16 +120,45 @@ export class CallController {
       const profile = await api.me(token);
       if (!this.isActive(lifecycle)) throw new DOMException("Entrada na chamada cancelada.", "AbortError");
       this.displayName = profile.displayName;
-      const microphoneStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+
+      const microphoneStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: voiceSettings.echoCancellation,
+          noiseSuppression: voiceSettings.noiseSuppression === "standard",
+          autoGainControl: true,
+          channelCount: 1,
+        },
+      });
+      this.microphoneInputStream = microphoneStream;
       if (!this.isActive(lifecycle)) {
         microphoneStream.getTracks().forEach((track) => track.stop());
         throw new DOMException("Entrada na chamada cancelada.", "AbortError");
       }
-      const microphone = microphoneStream.getAudioTracks()[0];
-      if (!microphone) {
+      const microphoneInput = microphoneStream.getAudioTracks()[0];
+      if (!microphoneInput) {
         microphoneStream.getTracks().forEach((track) => track.stop());
         throw new Error("Nenhum microfone foi disponibilizado pelo navegador.");
       }
+
+      let microphone = microphoneInput;
+      if (voiceSettings.noiseSuppression === "rnnoise") {
+        try {
+          const rnnoise = await createRnnoiseMicrophone(microphoneStream);
+          if (!this.isActive(lifecycle)) {
+            await rnnoise.stop();
+            microphoneStream.getTracks().forEach((track) => track.stop());
+            throw new DOMException("Entrada na chamada cancelada.", "AbortError");
+          }
+          this.rnnoiseMicrophone = rnnoise;
+          microphone = rnnoise.track;
+        } catch (error) {
+          if (error instanceof DOMException && error.name === "AbortError") throw error;
+          console.warn("RNNoise indisponível; usando supressão de ruído padrão do WebRTC.", error);
+          await microphoneInput.applyConstraints({ noiseSuppression: true }).catch(() => undefined);
+        }
+      }
+
+      this.microphoneTrack = microphone;
       this.local.addTrack(microphone);
       await this.transport.publishTrack(microphone, this.local);
       if (!this.isActive(lifecycle)) throw new DOMException("Entrada na chamada cancelada.", "AbortError");
@@ -136,9 +176,10 @@ export class CallController {
 
   async toggleMicrophone(_roomId: string): Promise<void> {
     try {
-      const track = this.local.getAudioTracks()[0];
+      const track = this.microphoneTrack ?? this.local.getAudioTracks()[0];
       if (!track) return;
       track.enabled = !track.enabled;
+      this.microphoneInputStream?.getAudioTracks().forEach((input) => { input.enabled = track.enabled; });
       this.state.microphone = track.enabled;
       this.updateLocalPreview();
       await this.signaling?.sendPeerState(this.state);
@@ -185,12 +226,36 @@ export class CallController {
     if (this.screenStream) { await this.stopScreen(); return; }
     const lifecycle = this.lifecycleId;
     try {
+      // Sincroniza a preferência antes da captura. No desktop Windows a exclusão
+      // principal é feita nativamente pelo device loopbackWithoutChrome; em um
+      // navegador comum o provider ainda usa restrictOwnAudio quando disponível.
+      const voiceSettings = loadVoiceVideoSettings();
       const stream = await this.screen.startScreenShare();
       const videoTrack = stream.getVideoTracks()[0];
       if (!videoTrack) {
         stream.getTracks().forEach((track) => track.stop());
         throw new Error("A fonte selecionada não forneceu vídeo");
       }
+
+      const screenAudioTrack = stream.getAudioTracks()[0];
+      if (screenAudioTrack && voiceSettings.excludeRiskAudioFromScreenShare) {
+        const settings = screenAudioTrack.getSettings() as DisplayAudioSettings;
+        const nativeRiskExclusion = settings.deviceId === "loopbackWithoutChrome";
+        const browserRiskExclusion = settings.restrictOwnAudio === true;
+        if (nativeRiskExclusion || browserRiskExclusion) {
+          console.info("Risk screen audio exclusion active", {
+            deviceId: settings.deviceId ?? "unknown",
+            restrictOwnAudio: settings.restrictOwnAudio ?? false,
+            mode: nativeRiskExclusion ? "native-process-loopback" : "restrictOwnAudio",
+          });
+        } else {
+          console.warn("A captura de tela não confirmou a exclusão do áudio do Risk.", {
+            deviceId: settings.deviceId ?? "unknown",
+            restrictOwnAudio: settings.restrictOwnAudio ?? false,
+          });
+        }
+      }
+
       if (!this.isActive(lifecycle)) {
         stream.getTracks().forEach((track) => track.stop());
         return;
@@ -318,7 +383,12 @@ export class CallController {
     await this.signaling?.disconnect().catch(() => undefined);
     await this.transport?.disconnect().catch(() => undefined);
     this.local.getTracks().forEach((track) => track.stop());
+    await this.rnnoiseMicrophone?.stop().catch(() => undefined);
+    this.microphoneInputStream?.getTracks().forEach((track) => track.stop());
     await this.screen.stopScreenShare().catch(() => undefined);
+    this.microphoneInputStream = undefined;
+    this.microphoneTrack = undefined;
+    this.rnnoiseMicrophone = undefined;
     this.cameraTrack = undefined;
     this.screenStream = undefined;
     this.signaling = undefined;

@@ -119,13 +119,17 @@ pnpm dev:desktop
 
 O comando compila o `risk-desktop-backend` em modo debug antes de iniciar Electron. O Electron então sobe o sidecar automaticamente.
 
+Enquanto `pnpm dev:desktop` estiver rodando, **a mesma UI também pode ser aberta diretamente em `http://localhost:5173` no navegador**. Em desenvolvimento, o Vite usa `/__risk-api` como proxy para o sidecar ativo e injeta `X-Risk-Desktop-Token` no processo Node, sem expor o token ao JavaScript da página. Assim Electron e navegador usam o mesmo backend e o mesmo `risk.sqlite3`.
+
+O arquivo temporário de descoberta fica em `.risk/dev-backend.json`, é ignorado pelo Git e removido pelo Electron ao encerrar. O proxy só aceita clientes loopback; abrir a UI pelo endereço LAN do Vite não concede acesso ao backend local autenticado.
+
 Para desenvolver somente a interface web:
 
 ```powershell
 pnpm dev:web
 ```
 
-O modo web pode continuar usando `VITE_API_URL` quando um servidor HTTP externo for desejado. Essa variável não é necessária para o desktop empacotado.
+Sem o Electron/sidecar ativo, chamadas a `/__risk-api` retornam 503. Para apontar deliberadamente o Vite para outra API durante desenvolvimento, defina `RISK_DEV_API_URL`. Em builds web de produção, `VITE_API_URL` continua disponível para uma API HTTP externa. Essa variável não é necessária para o desktop empacotado.
 
 ## Build desktop
 

@@ -10,7 +10,7 @@ export interface ScreenShareProvider {
 
 type DesktopScreenBridge = {
   listScreenSources(): Promise<Array<{ id: string; name: string; thumbnail?: string; displayId?: string }>>;
-  chooseScreenSource(): Promise<string | null>;
+  chooseScreenSource?(): Promise<string | null>;
   selectScreenSource(sourceId: string): Promise<void>;
 };
 
@@ -29,7 +29,16 @@ export class WebScreenShareProvider implements ScreenShareProvider {
   async startScreenShare(sourceId?: string): Promise<MediaStream> {
     const desktop = desktopScreenBridge();
     if (desktop) {
-      const selectedSourceId = sourceId ?? await desktop.chooseScreenSource();
+      let selectedSourceId = sourceId;
+      if (!selectedSourceId) {
+        if (desktop.chooseScreenSource) {
+          selectedSourceId = await desktop.chooseScreenSource() ?? undefined;
+        } else {
+          const sources = await desktop.listScreenSources();
+          if (sources.length === 1) selectedSourceId = sources[0]?.id;
+          else if (sources.length > 1) throw new Error("O seletor de tela do Electron não está disponível nesta versão do desktop.");
+        }
+      }
       if (!selectedSourceId) throw new DOMException("Compartilhamento cancelado.", "NotAllowedError");
       await desktop.selectScreenSource(selectedSourceId);
     }

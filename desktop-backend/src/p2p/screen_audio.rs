@@ -173,7 +173,7 @@ async fn stop_pipewire() {
 #[cfg(target_os = "linux")]
 async fn ensure_command(command: &str) -> anyhow::Result<()> {
     let status = Command::new(command)
-        .arg("--version")
+        .arg("--help")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

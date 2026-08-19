@@ -10,6 +10,7 @@ export interface ScreenShareProvider {
 
 type DesktopScreenBridge = {
   listScreenSources(): Promise<Array<{ id: string; name: string; thumbnail?: string; displayId?: string }>>;
+  chooseScreenSource(): Promise<string | null>;
   selectScreenSource(sourceId: string): Promise<void>;
 };
 
@@ -28,23 +29,8 @@ export class WebScreenShareProvider implements ScreenShareProvider {
   async startScreenShare(sourceId?: string): Promise<MediaStream> {
     const desktop = desktopScreenBridge();
     if (desktop) {
-      let selectedSourceId = sourceId;
-      if (!selectedSourceId) {
-        const sources = await desktop.listScreenSources();
-        if (sources.length === 0) throw new Error("Nenhuma tela ou janela está disponível para compartilhamento.");
-        if (sources.length === 1) {
-          selectedSourceId = sources[0]!.id;
-        } else {
-          const options = sources.map((source, index) => `${index + 1}. ${source.name}`).join("\n");
-          const answer = window.prompt(`Escolha a fonte para compartilhar:\n\n${options}`, "1");
-          if (answer === null) throw new DOMException("Compartilhamento cancelado.", "NotAllowedError");
-          const selectedIndex = Number.parseInt(answer.trim(), 10) - 1;
-          if (!Number.isInteger(selectedIndex) || selectedIndex < 0 || selectedIndex >= sources.length) {
-            throw new Error("Fonte de compartilhamento inválida.");
-          }
-          selectedSourceId = sources[selectedIndex]!.id;
-        }
-      }
+      const selectedSourceId = sourceId ?? await desktop.chooseScreenSource();
+      if (!selectedSourceId) throw new DOMException("Compartilhamento cancelado.", "NotAllowedError");
       await desktop.selectScreenSource(selectedSourceId);
     }
     this.stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });

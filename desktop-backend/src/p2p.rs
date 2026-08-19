@@ -2,7 +2,7 @@ use super::{bearer, internal, ApiError, AppState};
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
-    routing::{get, post},
+    routing::get,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};

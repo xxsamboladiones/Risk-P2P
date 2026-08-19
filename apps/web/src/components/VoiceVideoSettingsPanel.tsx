@@ -5,6 +5,7 @@ import {
   type NoiseSuppressionMode,
   type VoiceVideoSettings,
 } from "../services/audio/settings";
+import "./voice-video-settings.css";
 
 export function VoiceVideoSettingsPanel() {
   const [settings, setSettings] = useState<VoiceVideoSettings>(() => loadVoiceVideoSettings());

@@ -7,11 +7,14 @@ import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const DEVELOPMENT_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:5173"]);
-const DESKTOP_HOST = "127.0.0.1";
+const DESKTOP_HOST = "localhost";
 const DESKTOP_PORT = 5173;
-const DESKTOP_ORIGIN = "http://localhost:5173";
+const DESKTOP_ORIGIN = `http://${DESKTOP_HOST}:${DESKTOP_PORT}`;
 let assetServer: Server | undefined;
 let pageUrl = DESKTOP_ORIGIN;
+
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) app.quit();
 
 function isTrustedRendererUrl(value: string): boolean {
   try {
@@ -118,19 +121,28 @@ function createWindow(): void {
   });
 }
 
-app.whenReady().then(async () => {
-  pageUrl = app.isPackaged ? await startPackagedWebServer() : DESKTOP_ORIGIN;
-  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-    callback(isTrustedRendererUrl(webContents.getURL()) && ["media", "display-capture"].includes(permission));
+if (hasSingleInstanceLock) {
+  app.on("second-instance", () => {
+    const window = BrowserWindow.getAllWindows()[0];
+    if (!window) return;
+    if (window.isMinimized()) window.restore();
+    window.focus();
   });
-  createWindow();
-  app.on("activate", () => {
-    if (!BrowserWindow.getAllWindows().length) createWindow();
+
+  app.whenReady().then(async () => {
+    pageUrl = app.isPackaged ? await startPackagedWebServer() : DESKTOP_ORIGIN;
+    session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+      callback(isTrustedRendererUrl(webContents.getURL()) && ["media", "display-capture"].includes(permission));
+    });
+    createWindow();
+    app.on("activate", () => {
+      if (!BrowserWindow.getAllWindows().length) createWindow();
+    });
+  }).catch((error) => {
+    console.error("Falha ao iniciar o Risk", error);
+    app.quit();
   });
-}).catch((error) => {
-  console.error("Falha ao iniciar o Risk", error);
-  app.quit();
-});
+}
 
 app.on("before-quit", () => {
   assetServer?.close();

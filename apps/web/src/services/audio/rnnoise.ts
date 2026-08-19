@@ -1,4 +1,3 @@
-import { loadRnnoise, RnnoiseWorkletNode } from "@sapphi-red/web-noise-suppressor";
 import rnnoiseWorkletPath from "@sapphi-red/web-noise-suppressor/rnnoiseWorklet.js?url";
 import rnnoiseWasmPath from "@sapphi-red/web-noise-suppressor/rnnoise.wasm?url";
 import rnnoiseWasmSimdPath from "@sapphi-red/web-noise-suppressor/rnnoise_simd.wasm?url";
@@ -8,13 +7,26 @@ export type RnnoiseMicrophone = {
   stop(): Promise<void>;
 };
 
+type RnnoiseNode = AudioWorkletNode & { destroy(): void };
+type RnnoiseModule = typeof import("@sapphi-red/web-noise-suppressor");
+
+let modulePromise: Promise<RnnoiseModule> | undefined;
 let wasmBinaryPromise: Promise<ArrayBuffer> | undefined;
 
-function loadWasmBinary(): Promise<ArrayBuffer> {
-  wasmBinaryPromise ??= loadRnnoise({
-    url: rnnoiseWasmPath,
-    simdUrl: rnnoiseWasmSimdPath,
-  });
+function loadModule(): Promise<RnnoiseModule> {
+  // Importação lazy: os testes Vitest rodam em Node, onde AudioWorkletNode não
+  // existe. O módulo só deve ser avaliado no renderer quando RNNoise for usado.
+  modulePromise ??= import("@sapphi-red/web-noise-suppressor");
+  return modulePromise;
+}
+
+async function loadWasmBinary(): Promise<ArrayBuffer> {
+  if (!wasmBinaryPromise) {
+    wasmBinaryPromise = loadModule().then(({ loadRnnoise }) => loadRnnoise({
+      url: rnnoiseWasmPath,
+      simdUrl: rnnoiseWasmSimdPath,
+    }));
+  }
   return wasmBinaryPromise;
 }
 
@@ -28,7 +40,7 @@ function loadWasmBinary(): Promise<ArrayBuffer> {
 export async function createRnnoiseMicrophone(inputStream: MediaStream): Promise<RnnoiseMicrophone> {
   const context = new AudioContext({ sampleRate: 48_000, latencyHint: "interactive" });
   let source: MediaStreamAudioSourceNode | undefined;
-  let suppressor: RnnoiseWorkletNode | undefined;
+  let suppressor: RnnoiseNode | undefined;
   let destination: MediaStreamAudioDestinationNode | undefined;
 
   try {
@@ -36,7 +48,8 @@ export async function createRnnoiseMicrophone(inputStream: MediaStream): Promise
       throw new Error(`RNNoise requer AudioContext a 48 kHz; recebido ${context.sampleRate} Hz.`);
     }
 
-    const [wasmBinary] = await Promise.all([
+    const [{ RnnoiseWorkletNode }, wasmBinary] = await Promise.all([
+      loadModule(),
       loadWasmBinary(),
       context.audioWorklet.addModule(rnnoiseWorkletPath),
     ]);

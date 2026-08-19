@@ -7,24 +7,26 @@ export type LocalGroupChannel = { id: string; name: string; kind: "text" | "voic
 export type PublicGroupMetadata = { groupId: string; name: string; avatar?: string; channels: LocalGroupChannel[] };
 export type LocalGroup = PublicGroupMetadata & { members: PublicPeerIdentity[]; joinedAt: number };
 
-export async function getOrCreateLocalIdentity(displayName: string): Promise<LocalIdentity> {
+export async function loadLocalIdentity(): Promise<LocalIdentity | null> {
   const database = await openRiskDatabase();
-  let existing: LocalIdentity | undefined;
   try {
     const store = database.transaction(OFFLINE_STORES.identity, "readonly").objectStore(OFFLINE_STORES.identity);
-    existing = await request<LocalIdentity | undefined>(store.get("self"));
+    const identity = await request<LocalIdentity | undefined>(store.get("self"));
+    if (!identity) return null;
+    if (!identity.privateKey.extractable) return identity;
+    const migrated = { ...identity, privateKey: await makePrivateKeyNonExtractable(identity.privateKey) };
+    await putInStore(OFFLINE_STORES.identity, migrated);
+    return migrated;
   } finally { database.close(); }
+}
+
+export async function getOrCreateLocalIdentity(displayName: string): Promise<LocalIdentity> {
+  let existing = await loadLocalIdentity();
   if (existing) {
-    let changed = false;
-    if (existing.privateKey.extractable) {
-      existing = { ...existing, privateKey: await makePrivateKeyNonExtractable(existing.privateKey) };
-      changed = true;
-    }
     if (existing.displayName !== displayName) {
       existing = { ...existing, displayName };
-      changed = true;
+      await putInStore(OFFLINE_STORES.identity, existing);
     }
-    if (changed) await putInStore(OFFLINE_STORES.identity, existing);
     return existing;
   }
   const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);

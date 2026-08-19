@@ -43,7 +43,10 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/p2p/friends", get(list_friends).post(save_friend))
         .route("/p2p/groups", get(list_groups).post(save_group))
-        .route("/p2p/messages/{channel_id}", get(list_messages).post(save_message))
+        .route(
+            "/p2p/messages/{channel_id}",
+            get(list_messages).post(save_message),
+        )
 }
 
 async fn list_friends(
@@ -62,7 +65,13 @@ async fn list_friends(
     for (peer_id, display_name, public_key_json, avatar, added_at) in rows {
         let public_key = serde_json::from_str(&public_key_json)
             .map_err(|error| ApiError::Internal(error.into()))?;
-        result.push(P2pFriend { peer_id, display_name, public_key, avatar, added_at });
+        result.push(P2pFriend {
+            peer_id,
+            display_name,
+            public_key,
+            avatar,
+            added_at,
+        });
     }
     Ok(Json(result))
 }
@@ -112,7 +121,14 @@ async fn list_groups(
             .map_err(|error| ApiError::Internal(error.into()))?;
         let members = serde_json::from_str(&members_json)
             .map_err(|error| ApiError::Internal(error.into()))?;
-        result.push(P2pGroup { group_id, name, avatar, channels, members, joined_at });
+        result.push(P2pGroup {
+            group_id,
+            name,
+            avatar,
+            channels,
+            members,
+            joined_at,
+        });
     }
     Ok(Json(result))
 }
@@ -123,18 +139,27 @@ async fn save_group(
     Json(group): Json<P2pGroup>,
 ) -> Result<Json<P2pGroup>, ApiError> {
     let owner = bearer(&headers, &state)?;
-    if !valid_id(&group.group_id) || group.name.trim().is_empty() || group.name.chars().count() > 80 {
+    if !valid_id(&group.group_id) || group.name.trim().is_empty() || group.name.chars().count() > 80
+    {
         return Err(ApiError::Bad("Grupo P2P inválido".into()));
     }
-    let channels = group.channels.as_array().ok_or_else(|| ApiError::Bad("Canais P2P inválidos".into()))?;
-    let members = group.members.as_array().ok_or_else(|| ApiError::Bad("Membros P2P inválidos".into()))?;
+    let channels = group
+        .channels
+        .as_array()
+        .ok_or_else(|| ApiError::Bad("Canais P2P inválidos".into()))?;
+    let members = group
+        .members
+        .as_array()
+        .ok_or_else(|| ApiError::Bad("Membros P2P inválidos".into()))?;
     if channels.len() > 100 || members.len() > 256 || group.joined_at <= 0 {
-        return Err(ApiError::Bad("Metadados do grupo P2P excedem os limites".into()));
+        return Err(ApiError::Bad(
+            "Metadados do grupo P2P excedem os limites".into(),
+        ));
     }
-    let channels_json = serde_json::to_string(&group.channels)
-        .map_err(|error| ApiError::Internal(error.into()))?;
-    let members_json = serde_json::to_string(&group.members)
-        .map_err(|error| ApiError::Internal(error.into()))?;
+    let channels_json =
+        serde_json::to_string(&group.channels).map_err(|error| ApiError::Internal(error.into()))?;
+    let members_json =
+        serde_json::to_string(&group.members).map_err(|error| ApiError::Internal(error.into()))?;
     sqlx::query(
         "INSERT INTO p2p_groups(owner_user_id,group_id,name,avatar,channels_json,members_json,joined_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(owner_user_id,group_id) DO UPDATE SET name=excluded.name,avatar=excluded.avatar,channels_json=excluded.channels_json,members_json=excluded.members_json,joined_at=excluded.joined_at",
     )
@@ -168,13 +193,18 @@ async fn list_messages(
     .fetch_all(&state.db)
     .await
     .map_err(internal)?;
-    Ok(Json(rows.into_iter().rev().map(|(id, author, content, created_at)| P2pMessage {
-        id,
-        channel_id: channel_id.clone(),
-        author,
-        content,
-        created_at,
-    }).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .rev()
+            .map(|(id, author, content, created_at)| P2pMessage {
+                id,
+                channel_id: channel_id.clone(),
+                author,
+                content,
+                created_at,
+            })
+            .collect(),
+    ))
 }
 
 async fn save_message(
@@ -223,5 +253,7 @@ fn validate_peer(peer_id: &str, display_name: &str, public_key: &Value) -> Resul
 
 fn valid_id(value: &str) -> bool {
     (8..=128).contains(&value.len())
-        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }

@@ -36,6 +36,10 @@ async function loadWasmBinary(): Promise<ArrayBuffer> {
  * O RNNoise usado pelo worklet opera a 48 kHz. O MediaStreamAudioSourceNode
  * faz a conversão da entrada para a taxa do AudioContext e o WebRTC recebe
  * apenas a track produzida pelo MediaStreamAudioDestinationNode.
+ *
+ * Toda a cadeia é explicitamente mono. MediaStreamAudioDestinationNode nasce
+ * estéreo por padrão; sem este downmix, o RNNoise (maxChannels: 1) pode preencher
+ * somente o primeiro canal e a voz chegar ao peer em apenas um lado do fone.
  */
 export async function createRnnoiseMicrophone(inputStream: MediaStream): Promise<RnnoiseMicrophone> {
   const context = new AudioContext({ sampleRate: 48_000, latencyHint: "interactive" });
@@ -59,13 +63,31 @@ export async function createRnnoiseMicrophone(inputStream: MediaStream): Promise
       wasmBinary,
       maxChannels: 1,
     });
+
+    // O input pode ser entregue como estéreo por alguns drivers/Chromium mesmo
+    // quando o microfone físico é mono. "speakers" faz o downmix correto para um
+    // único canal antes de o RNNoise processar os frames de 480 amostras.
+    suppressor.channelCount = 1;
+    suppressor.channelCountMode = "explicit";
+    suppressor.channelInterpretation = "speakers";
+
     destination = context.createMediaStreamDestination();
+    destination.channelCount = 1;
+    destination.channelCountMode = "explicit";
+    destination.channelInterpretation = "speakers";
+
     source.connect(suppressor).connect(destination);
 
     await context.resume();
     const outputTrack = destination.stream.getAudioTracks()[0];
     if (!outputTrack) throw new Error("RNNoise não produziu uma track de áudio.");
     outputTrack.contentHint = "speech";
+
+    const outputSettings = outputTrack.getSettings();
+    console.info("Risk RNNoise microphone", {
+      sampleRate: context.sampleRate,
+      channelCount: outputSettings.channelCount ?? 1,
+    });
 
     let stopped = false;
     return {

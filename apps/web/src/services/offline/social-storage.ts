@@ -7,9 +7,11 @@ export type LocalGroupChannel = { id: string; name: string; kind: "text" | "voic
 export type PublicGroupMetadata = { groupId: string; name: string; avatar?: string; channels: LocalGroupChannel[] };
 export type LocalGroup = PublicGroupMetadata & { members: PublicPeerIdentity[]; joinedAt: number };
 
-type DesktopBackendConfig = { baseUrl: string; token: string };
+type DesktopBackendConfig = { baseUrl: string; token?: string };
 let desktopConfigPromise: Promise<DesktopBackendConfig | null> | undefined;
 let migrationPromise: Promise<void> | undefined;
+
+const DEV_BACKEND_PROXY = "/__risk-api";
 
 export async function loadLocalIdentity(): Promise<LocalIdentity | null> {
   const database = await openRiskDatabase();
@@ -122,29 +124,40 @@ export function publicIdentity(identity: LocalIdentity): PublicPeerIdentity {
 }
 
 async function desktopConfig(): Promise<DesktopBackendConfig | null> {
-  if (!window.desktop?.getBackendConfig) return null;
-  if (!desktopConfigPromise) {
-    desktopConfigPromise = window.desktop.getBackendConfig()
-      .then((config) => ({ baseUrl: config.baseUrl.replace(/\/$/, ""), token: config.token }))
-      .catch((error) => {
-        desktopConfigPromise = undefined;
-        throw error;
-      });
+  if (window.desktop?.getBackendConfig) {
+    if (!desktopConfigPromise) {
+      desktopConfigPromise = window.desktop.getBackendConfig()
+        .then((config) => ({ baseUrl: config.baseUrl.replace(/\/$/, ""), token: config.token }))
+        .catch((error) => {
+          desktopConfigPromise = undefined;
+          throw error;
+        });
+    }
+    return desktopConfigPromise;
   }
-  return desktopConfigPromise;
+
+  // Quando localhost:5173 é aberto diretamente no navegador durante `pnpm dev:desktop`,
+  // ele não possui o preload do Electron. O Vite fornece /__risk-api e injeta o token
+  // efêmero no processo Node, permitindo usar o MESMO SQLite do sidecar sem expor o token.
+  if (import.meta.env.DEV && import.meta.env.VITE_API_URL === DEV_BACKEND_PROXY) {
+    return { baseUrl: DEV_BACKEND_PROXY };
+  }
+
+  return null;
 }
 
 async function desktopRequest<T>(config: DesktopBackendConfig, path: string, init: RequestInit): Promise<T> {
   const perform = async (accessToken: string | null) => {
     const headers = new Headers({ "content-type": "application/json", ...init.headers });
-    headers.set("x-risk-desktop-token", config.token);
+    if (config.token) headers.set("x-risk-desktop-token", config.token);
     if (accessToken) headers.set("authorization", `Bearer ${accessToken}`);
     return fetch(`${config.baseUrl}${path}`, { ...init, headers });
   };
   let accessToken = sessionStorage.getItem("accessToken");
   let response = await perform(accessToken);
   if (response.status === 401) {
-    const refreshHeaders = new Headers({ "x-risk-desktop-token": config.token });
+    const refreshHeaders = new Headers();
+    if (config.token) refreshHeaders.set("x-risk-desktop-token", config.token);
     const refresh = await fetch(`${config.baseUrl}/auth/refresh`, { method: "POST", headers: refreshHeaders });
     if (refresh.ok) {
       const session = await refresh.json() as { accessToken: string };

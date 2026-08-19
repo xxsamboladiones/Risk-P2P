@@ -101,6 +101,7 @@ type PeerEntry = {
   pc: RTCPeerConnection;
   canNegotiate: boolean;
   makingOffer: boolean;
+  needsNegotiation: boolean;
   ignoreOffer: boolean;
   settingRemoteAnswer: boolean;
   pendingIceCandidates: RTCIceCandidateInit[];
@@ -125,11 +126,14 @@ export class MeshWebRTCTransport implements CallTransport {
 
   async connect(peerId: string, initiator: boolean): Promise<void> {
     const entry = this.peers.get(peerId) ?? this.createPeer(peerId);
-    entry.canNegotiate = initiator;
+    if (initiator) entry.canNegotiate = true;
     if (initiator && this.events.onDataMessage && !entry.dataChannel) {
       this.bindDataChannel(peerId, entry, entry.pc.createDataChannel("risk.chat", { ordered: true }));
     }
-    if (initiator) await this.negotiate(peerId, entry);
+    if (initiator) {
+      entry.needsNegotiation = true;
+      await this.negotiateIfNeeded(peerId, entry);
+    }
   }
 
   async acceptOffer(peerId: string, description: RTCSessionDescriptionInit): Promise<void> {
@@ -154,17 +158,27 @@ export class MeshWebRTCTransport implements CallTransport {
 
   async publishTrack(track: MediaStreamTrack, stream: MediaStream): Promise<void> {
     this.localTracks.set(track.id, { track, stream });
-    this.peers.forEach(({ pc }) => {
-      if (!pc.getSenders().some((sender) => sender.track?.id === track.id)) pc.addTrack(track, stream);
-    });
+    const negotiations: Promise<void>[] = [];
+    for (const [peerId, entry] of this.peers) {
+      if (entry.pc.getSenders().some((sender) => sender.track?.id === track.id)) continue;
+      entry.pc.addTrack(track, stream);
+      entry.needsNegotiation = true;
+      negotiations.push(this.negotiateIfNeeded(peerId, entry));
+    }
+    await Promise.all(negotiations);
   }
 
   async unpublishTrack(track: MediaStreamTrack): Promise<void> {
     this.localTracks.delete(track.id);
-    this.peers.forEach(({ pc }) => {
-      const sender = pc.getSenders().find((item) => item.track === track);
-      if (sender) pc.removeTrack(sender);
-    });
+    const negotiations: Promise<void>[] = [];
+    for (const [peerId, entry] of this.peers) {
+      const sender = entry.pc.getSenders().find((item) => item.track === track || item.track?.id === track.id);
+      if (!sender) continue;
+      entry.pc.removeTrack(sender);
+      entry.needsNegotiation = true;
+      negotiations.push(this.negotiateIfNeeded(peerId, entry));
+    }
+    await Promise.all(negotiations);
   }
 
   async replaceTrack(kind: "audio" | "video", track: MediaStreamTrack | null): Promise<void> {
@@ -231,7 +245,15 @@ export class MeshWebRTCTransport implements CallTransport {
       throw new Error(`Sala cheia: este cliente aceita no máximo ${this.maxRemotePeers + 1} participantes no Mesh.`);
     }
     const pc = new RTCPeerConnection({ iceServers: this.iceServers });
-    const entry: PeerEntry = { pc, canNegotiate: false, makingOffer: false, ignoreOffer: false, settingRemoteAnswer: false, pendingIceCandidates: [] };
+    const entry: PeerEntry = {
+      pc,
+      canNegotiate: false,
+      makingOffer: false,
+      needsNegotiation: false,
+      ignoreOffer: false,
+      settingRemoteAnswer: false,
+      pendingIceCandidates: [],
+    };
     this.peers.set(peerId, entry);
     this.localTracks.forEach(({ track, stream }) => pc.addTrack(track, stream));
     pc.onicecandidate = ({ candidate }) => {
@@ -242,7 +264,18 @@ export class MeshWebRTCTransport implements CallTransport {
       if (stream) this.events.onRemoteStream(peerId, stream);
     };
     pc.ondatachannel = ({ channel }) => this.bindDataChannel(peerId, entry, channel);
-    pc.onnegotiationneeded = () => { if (entry.canNegotiate) void this.negotiate(peerId, entry); };
+    pc.onnegotiationneeded = () => {
+      // publishTrack/unpublishTrack marcam a negociação explicitamente. Este handler
+      // continua como fallback para mudanças feitas pelo próprio navegador, mas não
+      // cria uma segunda offer enquanto outra negociação já está em andamento.
+      if (!entry.canNegotiate) {
+        entry.needsNegotiation = true;
+        return;
+      }
+      if (entry.makingOffer || entry.pc.signalingState !== "stable") return;
+      entry.needsNegotiation = true;
+      void this.negotiateIfNeeded(peerId, entry);
+    };
     pc.onconnectionstatechange = () => {
       this.events.onConnectionState(peerId, pc.connectionState);
       if (pc.connectionState === "failed" && this.localPeerId < peerId) {
@@ -282,9 +315,16 @@ export class MeshWebRTCTransport implements CallTransport {
     await this.flushPendingIce(entry);
     entry.canNegotiate = true;
     if (description.type === "offer") {
+      // A resposta já descreve todas as tracks locais existentes neste instante.
+      entry.needsNegotiation = false;
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       if (pc.localDescription) await this.events.sendAnswer(peerId, pc.localDescription.toJSON());
+    } else {
+      // Uma câmera/tela pode ter sido ligada enquanto a offer anterior estava em voo.
+      // Assim que a answer devolve o PeerConnection para stable, enviamos a próxima
+      // negociação pendente sem exigir refresh/reentrada na sala.
+      await this.negotiateIfNeeded(peerId, entry);
     }
   }
 
@@ -299,15 +339,28 @@ export class MeshWebRTCTransport implements CallTransport {
     return entry;
   }
 
+  private async negotiateIfNeeded(peerId: string, entry: PeerEntry): Promise<void> {
+    if (!entry.needsNegotiation || !entry.canNegotiate || entry.makingOffer || entry.pc.signalingState !== "stable") return;
+    entry.needsNegotiation = false;
+    await this.negotiate(peerId, entry);
+  }
+
   private async negotiate(peerId: string, entry: PeerEntry, iceRestart = false): Promise<void> {
-    if (entry.makingOffer || entry.pc.signalingState !== "stable") return;
+    if (entry.makingOffer || entry.pc.signalingState !== "stable") {
+      if (!iceRestart) entry.needsNegotiation = true;
+      return;
+    }
     entry.makingOffer = true;
     try {
       const offer = await entry.pc.createOffer({ iceRestart });
-      if (entry.pc.signalingState !== "stable") return;
+      if (entry.pc.signalingState !== "stable") {
+        if (!iceRestart) entry.needsNegotiation = true;
+        return;
+      }
       await entry.pc.setLocalDescription(offer);
       if (entry.pc.localDescription) await this.events.sendOffer(peerId, entry.pc.localDescription.toJSON());
     } catch (error) {
+      if (!iceRestart) entry.needsNegotiation = true;
       logger.warn("WebRTC renegotiation failed", { peerId, error: String(error) });
     } finally { entry.makingOffer = false; }
   }

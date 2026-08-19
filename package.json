@@ -9,8 +9,9 @@
     "build": "pnpm -r --filter '!@risk/desktop' build && pnpm build:desktop",
     "build:web": "pnpm --filter @risk/web build",
     "build:desktop": "pnpm build:web && pnpm --filter @risk/desktop build",
-    "package:win": "pnpm build:web && pnpm --filter @risk/desktop build:win",
-    "package:linux": "pnpm build:web && pnpm --filter @risk/desktop build:linux",
+    "verify:build-env": "node scripts/verify-build-env.mjs",
+    "package:win": "pnpm verify:build-env && pnpm build:web && pnpm --filter @risk/desktop build:win",
+    "package:linux": "pnpm verify:build-env && pnpm build:web && pnpm --filter @risk/desktop build:linux",
     "package:linux:docker": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-linux-docker.ps1",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test"

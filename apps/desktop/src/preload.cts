@@ -9,4 +9,5 @@ export type DesktopSource = {
 
 contextBridge.exposeInMainWorld("desktop", {
   listScreenSources: (): Promise<DesktopSource[]> => ipcRenderer.invoke("screen:list"),
+  selectScreenSource: (sourceId: string): Promise<void> => ipcRenderer.invoke("screen:select", sourceId),
 });

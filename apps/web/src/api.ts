@@ -1,5 +1,11 @@
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8080";
-export class ApiRequestError extends Error { constructor(message: string, public readonly status: number) { super(message); } }
+const configuredApiUrl = import.meta.env.VITE_API_URL?.trim().replace(/\/$/, "");
+const API_URL = configuredApiUrl || (import.meta.env.DEV ? "http://localhost:8080" : "");
+let refreshInFlight: Promise<string | null> | undefined;
+
+export class ApiRequestError extends Error {
+  constructor(message: string, public readonly status: number) { super(message); }
+}
+
 export type Friend = { id: string; displayName: string; local?: boolean };
 export type PendingFriend = Friend & { requestId: string };
 export type Community = { id: string; name: string; local?: boolean };
@@ -7,18 +13,58 @@ export type Channel = { id: string; name: string; kind: "text" | "voice"; voiceR
 export type ChatMessage = { id: string; author: string; content: string; createdAt: string };
 export type CommunityInvite = { id: string; communityId: string; communityName: string; inviter: string };
 export type CurrentUser = { id: string; displayName: string; email: string };
+
+function requireApiUrl(): string {
+  if (!API_URL) {
+    throw new ApiRequestError(
+      "A API do Risk não foi configurada neste build. Defina VITE_API_URL antes de empacotar o aplicativo.",
+      0,
+    );
+  }
+  return API_URL;
+}
+
+async function refreshAccessToken(): Promise<string | null> {
+  if (refreshInFlight) return refreshInFlight;
+  refreshInFlight = (async () => {
+    try {
+      const response = await fetch(`${requireApiUrl()}/auth/refresh`, { method: "POST", credentials: "include" });
+      if (!response.ok) {
+        sessionStorage.removeItem("accessToken");
+        return null;
+      }
+      const session = await response.json() as { accessToken: string };
+      sessionStorage.setItem("accessToken", session.accessToken);
+      return session.accessToken;
+    } catch {
+      return null;
+    } finally {
+      refreshInFlight = undefined;
+    }
+  })();
+  return refreshInFlight;
+}
+
 async function request<T>(path: string, init: RequestInit): Promise<T> {
+  const baseUrl = requireApiUrl();
   const headers = new Headers({ "content-type": "application/json", ...init.headers });
-  if (headers.has("authorization")) { const current = sessionStorage.getItem("accessToken"); if (current) headers.set("authorization", `Bearer ${current}`); }
-  let response = await fetch(`${API_URL}${path}`, { ...init, credentials: "include", headers });
+  if (headers.has("authorization")) {
+    const current = sessionStorage.getItem("accessToken");
+    if (current) headers.set("authorization", `Bearer ${current}`);
+  }
+  let response = await fetch(`${baseUrl}${path}`, { ...init, credentials: "include", headers });
   if (response.status === 401 && path !== "/auth/refresh") {
-    const refreshed = await fetch(`${API_URL}/auth/refresh`, { method: "POST", credentials: "include" });
-    if (refreshed.ok) { const session = await refreshed.json() as { accessToken: string }; sessionStorage.setItem("accessToken", session.accessToken); headers.set("authorization", `Bearer ${session.accessToken}`); response = await fetch(`${API_URL}${path}`, { ...init, credentials: "include", headers }); }
+    const accessToken = await refreshAccessToken();
+    if (accessToken) {
+      headers.set("authorization", `Bearer ${accessToken}`);
+      response = await fetch(`${baseUrl}${path}`, { ...init, credentials: "include", headers });
+    }
   }
   const body = await response.json() as T & { message?: string };
   if (!response.ok) throw new ApiRequestError(body.message ?? "A operação falhou", response.status);
   return body;
 }
+
 export const api = {
   register: (displayName: string, email: string, password: string) => request<{ accessToken: string }>("/auth/register", { method: "POST", body: JSON.stringify({ displayName, email, password }) }),
   login: (email: string, password: string) => request<{ accessToken: string }>("/auth/login", { method: "POST", body: JSON.stringify({ email, password }) }),
@@ -41,5 +87,5 @@ export const api = {
   messages: (token: string, channelId: string) => request<ChatMessage[]>(`/channels/${channelId}/messages`, { method: "GET", headers: { authorization: `Bearer ${token}` } }),
   sendMessage: (token: string, channelId: string, content: string) => request<ChatMessage>(`/channels/${channelId}/messages`, { method: "POST", headers: { authorization: `Bearer ${token}` }, body: JSON.stringify({ content }) }),
   createRoom: (token: string, name: string) => request<{ id: string }>("/rooms", { method: "POST", headers: { authorization: `Bearer ${token}` }, body: JSON.stringify({ name }) }),
-  turnCredentials: (token: string) => request<{ iceServers: RTCIceServer[] }>("/rtc/credentials", { method: "GET", headers: { authorization: `Bearer ${token}` } })
+  turnCredentials: (token: string) => request<{ iceServers: RTCIceServer[] }>("/rtc/credentials", { method: "GET", headers: { authorization: `Bearer ${token}` } }),
 };

@@ -12,6 +12,7 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 const DEVELOPMENT_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:5173"]);
 const DESKTOP_HOST = "127.0.0.1";
 const DEV_BACKEND_BRIDGE_FILE = path.resolve(root, "../../../.risk/dev-backend.json");
+const WINDOWS_LOOPBACK_WITHOUT_RISK = "loopbackWithoutChrome";
 let assetServer: Server | undefined;
 let pageUrl = "http://localhost:5173";
 let packagedOrigin = "";
@@ -341,9 +342,26 @@ if (hasSingleInstanceLock) {
           callback({});
           return;
         }
+
+        // Electron 43.4.0 aceita internamente o device id de áudio como string.
+        // Em Windows usamos diretamente loopbackWithoutChrome para acionar o
+        // process-loopback nativo do Chromium e excluir toda a reprodução da
+        // árvore do próprio Risk. Isso evita depender da propagação de
+        // restrictOwnAudio, que nos testes reais do Electron estava chegando
+        // como false mesmo quando solicitado pelo renderer.
+        const audioDevice = process.platform === "win32"
+          ? WINDOWS_LOOPBACK_WITHOUT_RISK
+          : "loopback";
+        if (request.audioRequested) {
+          console.info(
+            `[risk-screen-audio] Electron ${process.versions.electron}; device=${audioDevice}; source=${selected.name}`,
+          );
+        }
         callback({
           video: selected,
-          audio: request.audioRequested ? "loopback" : undefined,
+          ...(request.audioRequested
+            ? { audio: audioDevice as unknown as "loopback" }
+            : {}),
         });
       } catch (error) {
         console.error("Falha ao autorizar compartilhamento de tela", error);

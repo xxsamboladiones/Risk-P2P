@@ -39,14 +39,14 @@ export function GroupInvitePanel({
 
   const [groups, setGroups] = useState<LocalGroup[]>([]);
   const [selectedId, setSelectedId] = useState(preferredGroupId ?? "");
-  const [loading, setLoading] = useState(initialMode === "create" && !preferredMetadata);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (initialMode !== "create") return;
     let alive = true;
 
     void (async () => {
+      setLoading(true);
       setError("");
       let localGroups = await loadLocalGroups();
 
@@ -102,19 +102,7 @@ export function GroupInvitePanel({
     return () => {
       alive = false;
     };
-  }, [displayName, initialMode, preferredGroupId, preferredMetadata, token]);
-
-  if (initialMode === "join") {
-    return <div className="group-invite-panel">
-      <P2PInvitePanel
-        type="group"
-        token={token}
-        displayName={displayName}
-        initialMode="join"
-        onComplete={onComplete}
-      />
-    </div>;
-  }
+  }, [displayName, preferredGroupId, preferredMetadata, token]);
 
   const selected = groups.find((group) => group.groupId === selectedId);
   const metadata: PublicGroupMetadata | undefined = selected
@@ -129,32 +117,33 @@ export function GroupInvitePanel({
       : undefined;
 
   return <div className="group-invite-panel">
-    <label>Grupo que receberá o membro</label>
+    <label>Grupo para criar convite</label>
     <select
       value={selectedId}
       onChange={(event) => setSelectedId(event.target.value)}
       disabled={loading || Boolean(preferredGroupId) || (!preferredMetadata && groups.length === 0)}
     >
-      <option value="">{loading ? "Preparando grupo…" : "Selecione um grupo"}</option>
+      <option value="">{loading ? "Carregando seus grupos…" : "Selecione um grupo"}</option>
       {preferredMetadata && !groups.some((group) => group.groupId === preferredMetadata.groupId) && (
         <option value={preferredMetadata.groupId}>{preferredMetadata.name}</option>
       )}
       {groups.map((group) => <option key={group.groupId} value={group.groupId}>{group.name}</option>)}
     </select>
+
     {!loading && !metadata && <p className="invite-notice">
       {error
-        ? "Não foi possível preparar este grupo para convites P2P."
-        : "Crie um grupo antes de gerar um convite P2P."}
+        ? "Não foi possível preparar seus grupos para convites P2P."
+        : "Você ainda não possui um grupo neste dispositivo. Crie ou entre em um grupo antes de gerar um convite."}
     </p>}
     {error && metadata && <div className="invite-notice">O armazenamento local será sincronizado quando o convite for concluído.</div>}
     {error && !metadata && <div className="invite-notice error">{error}</div>}
+
     <P2PInvitePanel
-      key={(metadata?.groupId ?? selectedId) || "create-unavailable"}
       type="group"
       token={token}
       displayName={displayName}
       group={metadata}
-      initialMode="create"
+      initialMode={initialMode}
       onComplete={onComplete}
     />
   </div>;

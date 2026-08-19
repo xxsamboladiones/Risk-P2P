@@ -97,6 +97,10 @@ function headersFor(config: ApiRuntimeConfig, init?: HeadersInit): Headers {
   return headers;
 }
 
+function credentialsFor(config: ApiRuntimeConfig): RequestCredentials {
+  return config.desktopToken ? "omit" : "include";
+}
+
 async function refreshAccessToken(): Promise<string | null> {
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {
@@ -106,7 +110,7 @@ async function refreshAccessToken(): Promise<string | null> {
       const response = await fetch(`${config.baseUrl}/auth/refresh`, {
         method: "POST",
         headers: headersFor(config),
-        credentials: "include",
+        credentials: credentialsFor(config),
       });
       if (!response.ok) {
         sessionStorage.removeItem("accessToken");
@@ -132,12 +136,12 @@ async function request<T>(path: string, init: RequestInit): Promise<T> {
     const current = sessionStorage.getItem("accessToken");
     if (current && !isLocalSessionToken(current)) headers.set("authorization", `Bearer ${current}`);
   }
-  let response = await fetch(`${config.baseUrl}${path}`, { ...init, credentials: "include", headers });
+  let response = await fetch(`${config.baseUrl}${path}`, { ...init, credentials: credentialsFor(config), headers });
   if (response.status === 401 && path !== "/auth/refresh" && path !== "/auth/login" && path !== "/auth/register") {
     const accessToken = await refreshAccessToken();
     if (accessToken && !isLocalSessionToken(accessToken)) {
       headers.set("authorization", `Bearer ${accessToken}`);
-      response = await fetch(`${config.baseUrl}${path}`, { ...init, credentials: "include", headers });
+      response = await fetch(`${config.baseUrl}${path}`, { ...init, credentials: credentialsFor(config), headers });
     }
   }
   let body: T & { message?: string };

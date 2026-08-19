@@ -7,6 +7,10 @@ export type LocalGroupChannel = { id: string; name: string; kind: "text" | "voic
 export type PublicGroupMetadata = { groupId: string; name: string; avatar?: string; channels: LocalGroupChannel[] };
 export type LocalGroup = PublicGroupMetadata & { members: PublicPeerIdentity[]; joinedAt: number };
 
+type DesktopBackendConfig = { baseUrl: string; token: string };
+let desktopConfigPromise: Promise<DesktopBackendConfig | null> | undefined;
+let migrationPromise: Promise<void> | undefined;
+
 export async function loadLocalIdentity(): Promise<LocalIdentity | null> {
   const database = await openRiskDatabase();
   try {
@@ -41,10 +45,37 @@ export async function getOrCreateLocalIdentity(displayName: string): Promise<Loc
   return identity;
 }
 
-export function loadLocalFriends(): Promise<LocalFriend[]> { return getAllFromStore<LocalFriend>(OFFLINE_STORES.friends); }
-export function saveLocalFriend(friend: LocalFriend): Promise<void> { return putInStore(OFFLINE_STORES.friends, friend); }
-export function loadLocalGroups(): Promise<LocalGroup[]> { return getAllFromStore<LocalGroup>(OFFLINE_STORES.groups); }
-export function saveLocalGroup(group: LocalGroup): Promise<void> { return putInStore(OFFLINE_STORES.groups, group); }
+export async function loadLocalFriends(): Promise<LocalFriend[]> {
+  const config = await desktopConfig();
+  if (!config) return legacyFriends();
+  await migrateLegacySocial(config);
+  return desktopRequest<LocalFriend[]>(config, "/p2p/friends", { method: "GET" });
+}
+
+export async function saveLocalFriend(friend: LocalFriend): Promise<void> {
+  const config = await desktopConfig();
+  if (!config) {
+    await putInStore(OFFLINE_STORES.friends, friend);
+    return;
+  }
+  await desktopRequest(config, "/p2p/friends", { method: "POST", body: JSON.stringify(friend) });
+}
+
+export async function loadLocalGroups(): Promise<LocalGroup[]> {
+  const config = await desktopConfig();
+  if (!config) return legacyGroups();
+  await migrateLegacySocial(config);
+  return desktopRequest<LocalGroup[]>(config, "/p2p/groups", { method: "GET" });
+}
+
+export async function saveLocalGroup(group: LocalGroup): Promise<void> {
+  const config = await desktopConfig();
+  if (!config) {
+    await putInStore(OFFLINE_STORES.groups, group);
+    return;
+  }
+  await desktopRequest(config, "/p2p/groups", { method: "POST", body: JSON.stringify(group) });
+}
 
 export async function createLocalGroup(name: string, owner: PublicPeerIdentity): Promise<LocalGroup> {
   const trimmedName = name.trim();
@@ -89,6 +120,67 @@ export async function addLocalGroupMember(group: PublicGroupMetadata, member: Pu
 export function publicIdentity(identity: LocalIdentity): PublicPeerIdentity {
   return { peerId: identity.peerId, publicKey: identity.publicKey, displayName: identity.displayName, avatar: identity.avatar };
 }
+
+async function desktopConfig(): Promise<DesktopBackendConfig | null> {
+  if (!window.desktop?.getBackendConfig) return null;
+  if (!desktopConfigPromise) {
+    desktopConfigPromise = window.desktop.getBackendConfig()
+      .then((config) => ({ baseUrl: config.baseUrl.replace(/\/$/, ""), token: config.token }))
+      .catch((error) => {
+        desktopConfigPromise = undefined;
+        throw error;
+      });
+  }
+  return desktopConfigPromise;
+}
+
+async function desktopRequest<T>(config: DesktopBackendConfig, path: string, init: RequestInit): Promise<T> {
+  const perform = async (accessToken: string | null) => {
+    const headers = new Headers({ "content-type": "application/json", ...init.headers });
+    headers.set("x-risk-desktop-token", config.token);
+    if (accessToken) headers.set("authorization", `Bearer ${accessToken}`);
+    return fetch(`${config.baseUrl}${path}`, { ...init, headers });
+  };
+  let accessToken = sessionStorage.getItem("accessToken");
+  let response = await perform(accessToken);
+  if (response.status === 401) {
+    const refreshHeaders = new Headers({ "x-risk-desktop-token": config.token });
+    const refresh = await fetch(`${config.baseUrl}/auth/refresh`, { method: "POST", headers: refreshHeaders });
+    if (refresh.ok) {
+      const session = await refresh.json() as { accessToken: string };
+      sessionStorage.setItem("accessToken", session.accessToken);
+      accessToken = session.accessToken;
+      response = await perform(accessToken);
+    }
+  }
+  const body = await response.json().catch(() => ({})) as T & { message?: string };
+  if (!response.ok) throw new Error(body.message ?? `Falha no armazenamento local (HTTP ${response.status}).`);
+  return body;
+}
+
+async function migrateLegacySocial(config: DesktopBackendConfig): Promise<void> {
+  if (migrationPromise) return migrationPromise;
+  migrationPromise = (async () => {
+    const [remoteFriends, remoteGroups] = await Promise.all([
+      desktopRequest<LocalFriend[]>(config, "/p2p/friends", { method: "GET" }),
+      desktopRequest<LocalGroup[]>(config, "/p2p/groups", { method: "GET" }),
+    ]);
+    const [friends, groups] = await Promise.all([legacyFriends(), legacyGroups()]);
+    const missingFriends = friends.filter((friend) => !remoteFriends.some((item) => item.peerId === friend.peerId));
+    const missingGroups = groups.filter((group) => !remoteGroups.some((item) => item.groupId === group.groupId));
+    await Promise.all([
+      ...missingFriends.map((friend) => desktopRequest(config, "/p2p/friends", { method: "POST", body: JSON.stringify(friend) })),
+      ...missingGroups.map((group) => desktopRequest(config, "/p2p/groups", { method: "POST", body: JSON.stringify(group) })),
+    ]);
+  })().catch((error) => {
+    migrationPromise = undefined;
+    throw error;
+  });
+  return migrationPromise;
+}
+
+function legacyFriends(): Promise<LocalFriend[]> { return getAllFromStore<LocalFriend>(OFFLINE_STORES.friends); }
+function legacyGroups(): Promise<LocalGroup[]> { return getAllFromStore<LocalGroup>(OFFLINE_STORES.groups); }
 
 async function makePrivateKeyNonExtractable(privateKey: CryptoKey): Promise<CryptoKey> {
   if (!privateKey.extractable) return privateKey;

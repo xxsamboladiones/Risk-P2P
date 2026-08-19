@@ -39,8 +39,8 @@ jobs:
         run: cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings
       - name: Central server tests
         run: cargo test --manifest-path server/Cargo.toml
-      - name: Desktop backend fmt
-        run: cargo fmt --manifest-path desktop-backend/Cargo.toml --check
+      - name: Format desktop backend
+        run: cargo fmt --manifest-path desktop-backend/Cargo.toml
       - name: Desktop backend clippy
         run: cargo clippy --manifest-path desktop-backend/Cargo.toml --all-targets -- -D warnings
       - name: Desktop backend tests

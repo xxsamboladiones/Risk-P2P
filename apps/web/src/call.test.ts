@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { PeerState } from "@risk/protocol";
-import { reconcileRemoteMediaState } from "./call";
+
+type ReconcileRemoteMediaState = typeof import("./call")["reconcileRemoteMediaState"];
+let reconcileRemoteMediaState: ReconcileRemoteMediaState;
 
 function fakeStream(id: string, video = true): MediaStream {
   return {
@@ -8,6 +10,19 @@ function fakeStream(id: string, video = true): MediaStream {
     getVideoTracks: () => video ? [{} as MediaStreamTrack] : [],
   } as unknown as MediaStream;
 }
+
+beforeAll(async () => {
+  const values = new Map<string, string>();
+  vi.stubGlobal("sessionStorage", {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => { values.set(key, value); },
+    removeItem: (key: string) => { values.delete(key); },
+    clear: () => { values.clear(); },
+  });
+  ({ reconcileRemoteMediaState } = await import("./call"));
+});
+
+afterAll(() => vi.unstubAllGlobals());
 
 describe("reconcileRemoteMediaState", () => {
   it("mapeia screen share quando o MediaStream.id remoto difere do id anunciado", () => {

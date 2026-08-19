@@ -119,8 +119,34 @@ export async function addLocalGroupMember(group: PublicGroupMetadata, member: Pu
   await saveLocalGroup({ ...group, members, joinedAt: current?.joinedAt ?? Date.now() });
 }
 
+export async function mergeLocalGroupMembers(groupId: string, incoming: PublicPeerIdentity[]): Promise<LocalGroup> {
+  const group = (await loadLocalGroups()).find((item) => item.groupId === groupId);
+  if (!group) throw new Error("Grupo local não encontrado para sincronizar membros.");
+  const byPeerId = new Map(group.members.map((member) => [member.peerId, member]));
+  for (const member of incoming) {
+    if (!validPublicPeerIdentity(member)) continue;
+    const existing = byPeerId.get(member.peerId);
+    if (!existing) byPeerId.set(member.peerId, member);
+    else if (samePublicKey(existing.publicKey, member.publicKey)) byPeerId.set(member.peerId, { ...existing, displayName: member.displayName, avatar: member.avatar });
+  }
+  const merged = { ...group, members: [...byPeerId.values()] };
+  await saveLocalGroup(merged);
+  return merged;
+}
+
 export function publicIdentity(identity: LocalIdentity): PublicPeerIdentity {
   return { peerId: identity.peerId, publicKey: identity.publicKey, displayName: identity.displayName, avatar: identity.avatar };
+}
+
+function validPublicPeerIdentity(identity: PublicPeerIdentity): boolean {
+  return /^[A-Za-z0-9_-]{8,128}$/.test(identity.peerId)
+    && identity.displayName.trim().length >= 2
+    && identity.displayName.length <= 80
+    && Boolean(identity.publicKey && typeof identity.publicKey === "object");
+}
+
+function samePublicKey(left: JsonWebKey, right: JsonWebKey): boolean {
+  return left.kty === right.kty && left.crv === right.crv && left.x === right.x && left.y === right.y;
 }
 
 async function desktopConfig(): Promise<DesktopBackendConfig | null> {

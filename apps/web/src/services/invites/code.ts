@@ -15,7 +15,6 @@ export function normalizeRiskInviteCode(input: string): string {
   const deepLink = value.match(/^risk:\/\/(?:invite|friend|group)\/(.+)$/i);
   if (deepLink) value = deepLink[1]!;
   value = value.toUpperCase().replace(/\s+/g, "").replace(/^RISK-?/, "").replace(/-/g, "");
-  if (value.length > 16) value = value.slice(0, 16);
   const groups = value.match(/.{1,4}/g)?.join("-") ?? "";
   return `risk-${groups}`;
 }

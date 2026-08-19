@@ -2,7 +2,7 @@ import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, session } from "e
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { constants as fsConstants, createReadStream } from "node:fs";
-import { access, stat } from "node:fs/promises";
+import { access, mkdir, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 const root = path.dirname(fileURLToPath(import.meta.url));
 const DEVELOPMENT_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:5173"]);
 const DESKTOP_HOST = "127.0.0.1";
+const DEV_BACKEND_BRIDGE_FILE = path.resolve(root, "../../../.risk/dev-backend.json");
 let assetServer: Server | undefined;
 let pageUrl = "http://localhost:5173";
 let packagedOrigin = "";
@@ -28,6 +29,22 @@ function isTrustedRendererUrl(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+async function publishDevBackendBridge(config: { baseUrl: string; token: string }): Promise<void> {
+  if (app.isPackaged) return;
+  await mkdir(path.dirname(DEV_BACKEND_BRIDGE_FILE), { recursive: true });
+  await writeFile(DEV_BACKEND_BRIDGE_FILE, JSON.stringify(config), {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+}
+
+async function clearDevBackendBridge(): Promise<void> {
+  if (app.isPackaged) return;
+  await unlink(DEV_BACKEND_BRIDGE_FILE).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") console.warn("Falha ao remover bridge temporário do backend", error);
+  });
 }
 
 function contentType(filePath: string): string {
@@ -264,8 +281,10 @@ if (hasSingleInstanceLock) {
   });
 
   app.whenReady().then(async () => {
+    if (!app.isPackaged) await clearDevBackendBridge();
     pageUrl = app.isPackaged ? await startPackagedWebServer() : "http://localhost:5173";
     backendConfig = await startBackend(pageUrl);
+    await publishDevBackendBridge(backendConfig);
     session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
       callback(isTrustedRendererUrl(webContents.getURL()) && ["media", "display-capture"].includes(permission));
     });
@@ -303,6 +322,7 @@ if (hasSingleInstanceLock) {
   }).catch((error) => {
     console.error("Falha ao iniciar o Risk", error);
     dialog.showErrorBox("Risk não conseguiu iniciar", error instanceof Error ? error.message : String(error));
+    void clearDevBackendBridge();
     stopBackend();
     app.quit();
   });
@@ -310,6 +330,7 @@ if (hasSingleInstanceLock) {
 
 app.on("before-quit", () => {
   pendingDisplaySourceId = undefined;
+  void clearDevBackendBridge();
   stopBackend();
   assetServer?.close();
   assetServer = undefined;

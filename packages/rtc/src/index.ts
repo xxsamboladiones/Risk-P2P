@@ -14,8 +14,16 @@ type DesktopScreenBridge = {
   selectScreenSource(sourceId: string): Promise<void>;
 };
 
+type DisplayAudioConstraints = MediaTrackConstraints & { restrictOwnAudio?: boolean };
+type DisplayAudioSettings = MediaTrackSettings & { restrictOwnAudio?: boolean };
+type RiskMediaCaptureOptions = { restrictOwnAudio?: boolean };
+
 function desktopScreenBridge(): DesktopScreenBridge | undefined {
   return (globalThis as typeof globalThis & { desktop?: DesktopScreenBridge }).desktop;
+}
+
+function riskMediaCaptureOptions(): RiskMediaCaptureOptions | undefined {
+  return (globalThis as typeof globalThis & { __riskMediaCaptureOptions?: RiskMediaCaptureOptions }).__riskMediaCaptureOptions;
 }
 
 export class WebScreenShareProvider implements ScreenShareProvider {
@@ -42,7 +50,28 @@ export class WebScreenShareProvider implements ScreenShareProvider {
       if (!selectedSourceId) throw new DOMException("Compartilhamento cancelado.", "NotAllowedError");
       await desktop.selectScreenSource(selectedSourceId);
     }
-    this.stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+
+    // No Electron, restrictOwnAudio precisa fazer parte da solicitação inicial.
+    // Aplicar a constraint depois que a track de loopback já foi criada é tarde
+    // demais para escolher o backend loopbackWithoutChrome no Windows.
+    const restrictOwnAudio = riskMediaCaptureOptions()?.restrictOwnAudio === true;
+    const audio: true | DisplayAudioConstraints = restrictOwnAudio ? { restrictOwnAudio: true } : true;
+    this.stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio });
+
+    if (restrictOwnAudio) {
+      const audioTrack = this.stream.getAudioTracks()[0];
+      if (audioTrack) {
+        const settings = audioTrack.getSettings() as DisplayAudioSettings;
+        console.info("Risk screen audio capture", {
+          deviceId: settings.deviceId ?? "unknown",
+          restrictOwnAudio: settings.restrictOwnAudio ?? "unknown",
+        });
+        if (desktop && settings.deviceId === "loopback") {
+          console.warn("A captura ainda está usando loopback completo; o áudio do Risk pode retornar na transmissão.");
+        }
+      }
+    }
+
     return this.stream;
   }
 

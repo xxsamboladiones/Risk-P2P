@@ -4,6 +4,8 @@ export type LocalChatMessage = {
   author: string;
   content: string;
   createdAt: string;
+  authorPeerId?: string | null;
+  signature?: string | null;
 };
 
 import { OFFLINE_STORES, openRiskDatabase } from "./database";

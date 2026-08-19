@@ -15,16 +15,25 @@ export async function getOrCreateLocalIdentity(displayName: string): Promise<Loc
     existing = await request<LocalIdentity | undefined>(store.get("self"));
   } finally { database.close(); }
   if (existing) {
+    let changed = false;
+    if (existing.privateKey.extractable) {
+      existing = { ...existing, privateKey: await makePrivateKeyNonExtractable(existing.privateKey) };
+      changed = true;
+    }
     if (existing.displayName !== displayName) {
       existing = { ...existing, displayName };
-      await putInStore(OFFLINE_STORES.identity, existing);
+      changed = true;
     }
+    if (changed) await putInStore(OFFLINE_STORES.identity, existing);
     return existing;
   }
   const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
   const identity: LocalIdentity = {
-    id: "self", peerId: crypto.randomUUID(), displayName,
-    publicKey: await crypto.subtle.exportKey("jwk", pair.publicKey), privateKey: pair.privateKey,
+    id: "self",
+    peerId: crypto.randomUUID(),
+    displayName,
+    publicKey: await crypto.subtle.exportKey("jwk", pair.publicKey),
+    privateKey: await makePrivateKeyNonExtractable(pair.privateKey),
   };
   await putInStore(OFFLINE_STORES.identity, identity);
   return identity;
@@ -36,9 +45,11 @@ export function loadLocalGroups(): Promise<LocalGroup[]> { return getAllFromStor
 export function saveLocalGroup(group: LocalGroup): Promise<void> { return putInStore(OFFLINE_STORES.groups, group); }
 
 export async function createLocalGroup(name: string, owner: PublicPeerIdentity): Promise<LocalGroup> {
+  const trimmedName = name.trim();
+  if (trimmedName.length < 2 || trimmedName.length > 80) throw new Error("O nome do grupo deve ter entre 2 e 80 caracteres.");
   const groupId = crypto.randomUUID();
   const group: LocalGroup = {
-    groupId, name: name.trim(), members: [owner], joinedAt: Date.now(),
+    groupId, name: trimmedName, members: [owner], joinedAt: Date.now(),
     channels: [
       { id: crypto.randomUUID(), name: "geral", kind: "text" },
       { id: crypto.randomUUID(), name: "Geral", kind: "voice", voiceRoomId: crypto.randomUUID() },
@@ -51,7 +62,10 @@ export async function createLocalGroup(name: string, owner: PublicPeerIdentity):
 export async function addLocalGroupChannel(groupId: string, channel: LocalGroupChannel): Promise<void> {
   const group = (await loadLocalGroups()).find((item) => item.groupId === groupId);
   if (!group) throw new Error("Grupo local não encontrado.");
-  if (!group.channels.some((item) => item.id === channel.id)) group.channels.push(channel);
+  const name = channel.name.trim();
+  if (name.length < 2 || name.length > 80) throw new Error("O nome do canal deve ter entre 2 e 80 caracteres.");
+  const normalized = { ...channel, name };
+  if (!group.channels.some((item) => item.id === normalized.id)) group.channels.push(normalized);
   await saveLocalGroup(group);
 }
 
@@ -72,6 +86,12 @@ export async function addLocalGroupMember(group: PublicGroupMetadata, member: Pu
 
 export function publicIdentity(identity: LocalIdentity): PublicPeerIdentity {
   return { peerId: identity.peerId, publicKey: identity.publicKey, displayName: identity.displayName, avatar: identity.avatar };
+}
+
+async function makePrivateKeyNonExtractable(privateKey: CryptoKey): Promise<CryptoKey> {
+  if (!privateKey.extractable) return privateKey;
+  const jwk = await crypto.subtle.exportKey("jwk", privateKey);
+  return crypto.subtle.importKey("jwk", jwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
 }
 
 function request<T>(value: IDBRequest<T>): Promise<T> {

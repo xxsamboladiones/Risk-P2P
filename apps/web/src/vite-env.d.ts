@@ -19,9 +19,15 @@ type RiskDesktopSource = {
   thumbnail: string;
 };
 
+type RiskDesktopBackendConfig = {
+  baseUrl: string;
+  token: string;
+};
+
 interface Window {
   desktop?: {
     listScreenSources(): Promise<RiskDesktopSource[]>;
     selectScreenSource(sourceId: string): Promise<void>;
+    getBackendConfig(): Promise<RiskDesktopBackendConfig>;
   };
 }

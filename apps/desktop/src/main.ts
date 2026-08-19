@@ -8,10 +8,10 @@ import { fileURLToPath } from "node:url";
 const root = path.dirname(fileURLToPath(import.meta.url));
 const DEVELOPMENT_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:5173"]);
 const DESKTOP_HOST = "127.0.0.1";
-const DESKTOP_PORT = 5190;
-const DESKTOP_ORIGIN = `http://${DESKTOP_HOST}:${DESKTOP_PORT}`;
+const DESKTOP_PORT = 5173;
+const DESKTOP_ORIGIN = "http://localhost:5173";
 let assetServer: Server | undefined;
-let pageUrl = "http://localhost:5173";
+let pageUrl = DESKTOP_ORIGIN;
 
 function isTrustedRendererUrl(value: string): boolean {
   try {
@@ -119,7 +119,7 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
-  pageUrl = app.isPackaged ? await startPackagedWebServer() : "http://localhost:5173";
+  pageUrl = app.isPackaged ? await startPackagedWebServer() : DESKTOP_ORIGIN;
   session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
     callback(isTrustedRendererUrl(webContents.getURL()) && ["media", "display-capture"].includes(permission));
   });

@@ -3,6 +3,7 @@ import type { PeerState } from "@risk/protocol";
 import { useCallStore, type Participant } from "./store";
 import { api } from "./api";
 import { createRnnoiseMicrophone, type RnnoiseMicrophone } from "./services/audio/rnnoise";
+import { loadVoiceVideoSettings } from "./services/audio/settings";
 import { SupabaseSignalingProvider } from "./services/supabase/signaling";
 import type { SignalingDiagnostics, SignalingProvider } from "./services/signaling/types";
 
@@ -82,6 +83,7 @@ export class CallController {
   async join(token: string, roomId: string, iceServers: RTCIceServer[]): Promise<MediaStream> {
     if (this.roomId) await this.leave(this.roomId);
     const lifecycle = ++this.lifecycleId;
+    const voiceSettings = loadVoiceVideoSettings();
     this.roomId = roomId;
     this.peerId = crypto.randomUUID();
     this.local = new MediaStream();
@@ -120,13 +122,10 @@ export class CallController {
       if (!this.isActive(lifecycle)) throw new DOMException("Entrada na chamada cancelada.", "AbortError");
       this.displayName = profile.displayName;
 
-      // O cancelamento de eco continua no pipeline WebRTC/Chromium, mas desligamos
-      // a supressão padrão quando o RNNoise está ativo para não processar a voz duas
-      // vezes. Se o AudioWorklet/WASM falhar, reativamos a supressão padrão na track.
       const microphoneStream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          echoCancellation: true,
-          noiseSuppression: false,
+          echoCancellation: voiceSettings.echoCancellation,
+          noiseSuppression: voiceSettings.noiseSuppression === "standard",
           autoGainControl: true,
         },
       });
@@ -142,19 +141,21 @@ export class CallController {
       }
 
       let microphone = microphoneInput;
-      try {
-        const rnnoise = await createRnnoiseMicrophone(microphoneStream);
-        if (!this.isActive(lifecycle)) {
-          await rnnoise.stop();
-          microphoneStream.getTracks().forEach((track) => track.stop());
-          throw new DOMException("Entrada na chamada cancelada.", "AbortError");
+      if (voiceSettings.noiseSuppression === "rnnoise") {
+        try {
+          const rnnoise = await createRnnoiseMicrophone(microphoneStream);
+          if (!this.isActive(lifecycle)) {
+            await rnnoise.stop();
+            microphoneStream.getTracks().forEach((track) => track.stop());
+            throw new DOMException("Entrada na chamada cancelada.", "AbortError");
+          }
+          this.rnnoiseMicrophone = rnnoise;
+          microphone = rnnoise.track;
+        } catch (error) {
+          if (error instanceof DOMException && error.name === "AbortError") throw error;
+          console.warn("RNNoise indisponível; usando supressão de ruído padrão do WebRTC.", error);
+          await microphoneInput.applyConstraints({ noiseSuppression: true }).catch(() => undefined);
         }
-        this.rnnoiseMicrophone = rnnoise;
-        microphone = rnnoise.track;
-      } catch (error) {
-        if (error instanceof DOMException && error.name === "AbortError") throw error;
-        console.warn("RNNoise indisponível; usando supressão de ruído padrão do WebRTC.", error);
-        await microphoneInput.applyConstraints({ noiseSuppression: true }).catch(() => undefined);
       }
 
       this.microphoneTrack = microphone;
@@ -232,12 +233,9 @@ export class CallController {
         throw new Error("A fonte selecionada não forneceu vídeo");
       }
 
-      // Chromium 141+ consegue remover da captura de áudio do sistema o áudio
-      // produzido pelo próprio documento que chamou getDisplayMedia(). No Risk isso
-      // significa que a voz dos outros participantes, reproduzida pelo renderer,
-      // não deve voltar para eles através do compartilhamento da tela.
       const screenAudioTrack = stream.getAudioTracks()[0];
-      if (screenAudioTrack) {
+      const voiceSettings = loadVoiceVideoSettings();
+      if (screenAudioTrack && voiceSettings.excludeRiskAudioFromScreenShare) {
         try {
           await screenAudioTrack.applyConstraints({ restrictOwnAudio: true } as DisplayAudioConstraints);
           const settings = screenAudioTrack.getSettings() as DisplayAudioSettings;

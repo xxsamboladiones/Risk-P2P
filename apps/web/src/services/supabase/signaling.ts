@@ -173,6 +173,7 @@ export class SupabaseSignalingProvider implements SignalingProvider {
   private acceptMessage(message: OfferMessage | AnswerMessage | IceCandidateMessage | PeerStateMessage | PeerProfileMessage): boolean {
     if (!this.peerId || !this.roomId || message.roomId !== this.roomId || message.fromPeerId === this.peerId) return false;
     if (message.targetPeerId !== undefined && message.targetPeerId !== this.peerId) return false;
+    if (!this.presencePeers.has(message.fromPeerId)) this.reconcilePresence();
     if (!this.presencePeers.has(message.fromPeerId)) return false;
     this.pruneCaches();
     if (this.processedMessageIds.has(message.messageId)) return false;

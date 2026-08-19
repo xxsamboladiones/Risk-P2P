@@ -1,6 +1,6 @@
 import { MeshWebRTCTransport, WebScreenShareProvider, type PeerConnectionDiagnostics } from "@risk/rtc";
 import type { PeerState } from "@risk/protocol";
-import { useCallStore } from "./store";
+import { useCallStore, type Participant } from "./store";
 import { api } from "./api";
 import { SupabaseSignalingProvider } from "./services/supabase/signaling";
 import type { SignalingDiagnostics, SignalingProvider } from "./services/signaling/types";
@@ -9,6 +9,52 @@ export type CallDiagnostics = {
   signaling: SignalingDiagnostics | null;
   peerConnections: PeerConnectionDiagnostics[];
 };
+
+export function reconcileRemoteMediaState(
+  streamsById: Participant["streams"],
+  state: PeerState,
+): PeerState {
+  const streams = Object.values(streamsById ?? {});
+  const videoStreams = streams.filter((stream) => stream.getVideoTracks().length > 0);
+  if (!videoStreams.length) return state;
+
+  const next = { ...state };
+  const exactCamera = next.cameraStreamId ? streamsById?.[next.cameraStreamId] : undefined;
+  const exactScreen = next.screenStreamId ? streamsById?.[next.screenStreamId] : undefined;
+
+  // O msid/MediaStream.id não é garantido como uma identidade de aplicação entre
+  // implementações WebRTC. Firefox/Chromium podem entregar o mesmo conjunto de
+  // tracks com um id de MediaStream diferente do id anunciado pelo outro peer.
+  // Quando isso acontecer, reconciliamos pela ordem/quantidade dos streams de
+  // vídeo. O stream principal (microfone/câmera) chega primeiro; screen share é
+  // publicado depois e portanto aparece como o último stream de vídeo.
+  if (next.screenShare && !exactScreen) {
+    let candidate: MediaStream | undefined;
+    if (exactCamera) {
+      candidate = videoStreams.findLast((stream) => stream.id !== exactCamera.id);
+    } else if (!next.camera) {
+      candidate = videoStreams.at(-1);
+    } else if (videoStreams.length >= 2) {
+      candidate = videoStreams.at(-1);
+    }
+    if (candidate) next.screenStreamId = candidate.id;
+  }
+
+  const normalizedScreen = next.screenStreamId ? streamsById?.[next.screenStreamId] : undefined;
+  if (next.camera && !exactCamera) {
+    let candidate: MediaStream | undefined;
+    if (normalizedScreen) {
+      candidate = videoStreams.find((stream) => stream.id !== normalizedScreen.id);
+    } else if (!next.screenShare) {
+      candidate = videoStreams[0];
+    } else if (videoStreams.length >= 2) {
+      candidate = videoStreams[0];
+    }
+    if (candidate) next.cameraStreamId = candidate.id;
+  }
+
+  return next;
+}
 
 export class CallController {
   private signaling?: SignalingProvider;
@@ -45,8 +91,12 @@ export class CallController {
       sendAnswer: (targetPeerId, description) => this.signaling!.sendAnswer(targetPeerId, description),
       sendIce: (targetPeerId, candidate) => this.signaling!.sendIceCandidate(targetPeerId, candidate),
       onRemoteStream: (remotePeerId, stream) => {
-        const participant = useCallStore.getState().participants[remotePeerId];
-        if (participant) useCallStore.getState().upsert({ ...participant, streams: { ...participant.streams, [stream.id]: stream } });
+        const store = useCallStore.getState();
+        const participant = store.participants[remotePeerId];
+        if (!participant) return;
+        const streams = { ...participant.streams, [stream.id]: stream };
+        const state = reconcileRemoteMediaState(streams, participant.state);
+        store.upsert({ ...participant, streams, state });
       },
       onConnectionState: (remotePeerId, connection) => {
         const participant = useCallStore.getState().participants[remotePeerId];
@@ -212,7 +262,8 @@ export class CallController {
           displayName: `Peer ${message.fromPeerId.slice(0, 6)}`,
           streams: {},
         };
-        store.upsert({ ...participant, state: message.payload.state });
+        const state = reconcileRemoteMediaState(participant.streams, message.payload.state);
+        store.upsert({ ...participant, state });
       }),
       signaling.onPeerProfile((message) => {
         const store = useCallStore.getState();

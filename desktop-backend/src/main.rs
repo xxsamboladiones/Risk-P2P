@@ -170,12 +170,21 @@ async fn main() -> anyhow::Result<()> {
         .route("/friends/requests", post(send_friend_request))
         .route("/friends/requests/{id}/accept", post(accept_friend_request))
         .route("/communities", get(list_communities).post(create_community))
-        .route("/communities/{id}/channels", get(list_channels).post(create_channel))
-        .route("/channels/{id}/messages", get(list_messages).post(create_message))
+        .route(
+            "/communities/{id}/channels",
+            get(list_channels).post(create_channel),
+        )
+        .route(
+            "/channels/{id}/messages",
+            get(list_messages).post(create_message),
+        )
         .route("/rooms", post(create_room))
         .route("/rtc/credentials", get(rtc_credentials))
         .merge(p2p::router())
-        .route_layer(middleware::from_fn_with_state(state.clone(), local_token_guard));
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            local_token_guard,
+        ));
 
     let web_origin = env::var("RISK_WEB_ORIGIN").unwrap_or_else(|_| "http://localhost:5173".into());
     let app = Router::new()
@@ -267,7 +276,9 @@ async fn register(
     .await
     .map_err(map_unique("Este e-mail já está cadastrado"))?;
     set_current_user(&state.db, user_id).await?;
-    Ok(Json(TokenResponse { access_token: issue(&state, user_id)? }))
+    Ok(Json(TokenResponse {
+        access_token: issue(&state, user_id)?,
+    }))
 }
 
 async fn login(
@@ -290,11 +301,15 @@ async fn login(
         )
         .map_err(|_| ApiError::Unauthorized)?;
     set_current_user(&state.db, user.0).await?;
-    Ok(Json(TokenResponse { access_token: issue(&state, user.0)? }))
+    Ok(Json(TokenResponse {
+        access_token: issue(&state, user.0)?,
+    }))
 }
 
 async fn refresh(State(state): State<AppState>) -> Result<Json<TokenResponse>, ApiError> {
-    let user_id = current_user(&state.db).await?.ok_or(ApiError::Unauthorized)?;
+    let user_id = current_user(&state.db)
+        .await?
+        .ok_or(ApiError::Unauthorized)?;
     let exists = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE id=?)")
         .bind(user_id)
         .fetch_one(&state.db)
@@ -304,7 +319,9 @@ async fn refresh(State(state): State<AppState>) -> Result<Json<TokenResponse>, A
         clear_current_user(&state.db).await?;
         return Err(ApiError::Unauthorized);
     }
-    Ok(Json(TokenResponse { access_token: issue(&state, user_id)? }))
+    Ok(Json(TokenResponse {
+        access_token: issue(&state, user_id)?,
+    }))
 }
 
 async fn logout(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -322,7 +339,9 @@ async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Va
     .await
     .map_err(internal)?
     .ok_or(ApiError::Unauthorized)?;
-    Ok(Json(json!({ "id": row.0, "displayName": row.1, "email": row.2 })))
+    Ok(Json(
+        json!({ "id": row.0, "displayName": row.1, "email": row.2 }),
+    ))
 }
 
 async fn list_friends(
@@ -359,12 +378,19 @@ async fn send_friend_request(
 ) -> Result<Json<Value>, ApiError> {
     let user = bearer(&headers, &state)?;
     let email = normalize_email(&input.email)?;
-    let recipient = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email=? COLLATE NOCASE")
-        .bind(email)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(internal)?
-        .ok_or_else(|| ApiError::Bad("Usuário local não encontrado. Para outro dispositivo, use convite P2P por código.".into()))?;
+    let recipient = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM users WHERE email=? COLLATE NOCASE",
+    )
+    .bind(email)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(internal)?
+    .ok_or_else(|| {
+        ApiError::Bad(
+            "Usuário local não encontrado. Para outro dispositivo, use convite P2P por código."
+                .into(),
+        )
+    })?;
     if recipient == user {
         return Err(ApiError::Bad("Você não pode adicionar a si mesmo".into()));
     }
@@ -443,7 +469,10 @@ async fn list_communities(
     .fetch_all(&state.db)
     .await
     .map_err(internal)?;
-    Ok(Json(json!(rows.into_iter().map(|(id, name)| json!({ "id": id, "name": name })).collect::<Vec<_>>())))
+    Ok(Json(json!(rows
+        .into_iter()
+        .map(|(id, name)| json!({ "id": id, "name": name }))
+        .collect::<Vec<_>>())))
 }
 
 async fn create_community(
@@ -525,9 +554,12 @@ async fn list_channels(
     .fetch_all(&state.db)
     .await
     .map_err(internal)?;
-    Ok(Json(json!(rows.into_iter().map(|(id, name, kind, voice_room_id)| json!({
-        "id": id, "name": name, "kind": kind, "voiceRoomId": voice_room_id
-    })).collect::<Vec<_>>())))
+    Ok(Json(json!(rows
+        .into_iter()
+        .map(|(id, name, kind, voice_room_id)| json!({
+            "id": id, "name": name, "kind": kind, "voiceRoomId": voice_room_id
+        }))
+        .collect::<Vec<_>>())))
 }
 
 async fn create_channel(
@@ -586,7 +618,9 @@ async fn create_channel(
         .await
         .map_err(internal)?;
     transaction.commit().await.map_err(internal)?;
-    Ok(Json(json!({ "id": channel_id, "name": name, "kind": input.kind, "voiceRoomId": voice_room_id })))
+    Ok(Json(
+        json!({ "id": channel_id, "name": name, "kind": input.kind, "voiceRoomId": voice_room_id }),
+    ))
 }
 
 async fn list_messages(
@@ -611,9 +645,13 @@ async fn list_messages(
     .fetch_all(&state.db)
     .await
     .map_err(internal)?;
-    Ok(Json(json!(rows.into_iter().rev().map(|(id, author, content, created_at)| json!({
-        "id": id, "author": author, "content": content, "createdAt": iso_timestamp(created_at)
-    })).collect::<Vec<_>>())))
+    Ok(Json(json!(rows
+        .into_iter()
+        .rev()
+        .map(|(id, author, content, created_at)| json!({
+            "id": id, "author": author, "content": content, "createdAt": iso_timestamp(created_at)
+        }))
+        .collect::<Vec<_>>())))
 }
 
 async fn create_message(
@@ -638,21 +676,25 @@ async fn create_message(
     }
     let id = Uuid::new_v4();
     let created_at = now_seconds();
-    sqlx::query("INSERT INTO messages(id,channel_id,author_id,content,created_at) VALUES(?,?,?,?,?)")
-        .bind(id)
-        .bind(channel_id)
-        .bind(user)
-        .bind(content)
-        .bind(created_at)
-        .execute(&state.db)
-        .await
-        .map_err(internal)?;
+    sqlx::query(
+        "INSERT INTO messages(id,channel_id,author_id,content,created_at) VALUES(?,?,?,?,?)",
+    )
+    .bind(id)
+    .bind(channel_id)
+    .bind(user)
+    .bind(content)
+    .bind(created_at)
+    .execute(&state.db)
+    .await
+    .map_err(internal)?;
     let author = sqlx::query_scalar::<_, String>("SELECT display_name FROM users WHERE id=?")
         .bind(user)
         .fetch_one(&state.db)
         .await
         .map_err(internal)?;
-    Ok(Json(json!({ "id": id, "author": author, "content": content, "createdAt": iso_timestamp(created_at) })))
+    Ok(Json(
+        json!({ "id": id, "author": author, "content": content, "createdAt": iso_timestamp(created_at) }),
+    ))
 }
 
 async fn create_room(
@@ -703,7 +745,11 @@ async fn require_member(db: &SqlitePool, community: Uuid, user: Uuid) -> Result<
     .fetch_one(db)
     .await
     .map_err(internal)?;
-    if allowed { Ok(()) } else { Err(ApiError::Unauthorized) }
+    if allowed {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized)
+    }
 }
 
 fn issue(state: &AppState, user_id: Uuid) -> Result<String, ApiError> {
@@ -748,10 +794,11 @@ async fn set_current_user(db: &SqlitePool, user_id: Uuid) -> Result<(), ApiError
 }
 
 async fn current_user(db: &SqlitePool) -> Result<Option<Uuid>, ApiError> {
-    let value = sqlx::query_scalar::<_, String>("SELECT value FROM app_state WHERE key='current_user_id'")
-        .fetch_optional(db)
-        .await
-        .map_err(internal)?;
+    let value =
+        sqlx::query_scalar::<_, String>("SELECT value FROM app_state WHERE key='current_user_id'")
+            .fetch_optional(db)
+            .await
+            .map_err(internal)?;
     Ok(value.and_then(|value| Uuid::parse_str(&value).ok()))
 }
 
@@ -764,13 +811,20 @@ async fn clear_current_user(db: &SqlitePool) -> Result<(), ApiError> {
 }
 
 fn canonical_pair(left: Uuid, right: Uuid) -> (Uuid, Uuid) {
-    if left.as_bytes() <= right.as_bytes() { (left, right) } else { (right, left) }
+    if left.as_bytes() <= right.as_bytes() {
+        (left, right)
+    } else {
+        (right, left)
+    }
 }
 
 fn normalize_email(value: &str) -> Result<String, ApiError> {
     let email = value.trim().to_lowercase();
     let length = email.chars().count();
-    if !(3..=320).contains(&length) || !email.contains('@') || email.chars().any(char::is_whitespace) {
+    if !(3..=320).contains(&length)
+        || !email.contains('@')
+        || email.chars().any(char::is_whitespace)
+    {
         return Err(ApiError::Bad("E-mail inválido".into()));
     }
     Ok(email)
@@ -779,7 +833,9 @@ fn normalize_email(value: &str) -> Result<String, ApiError> {
 fn validate_password(value: &str) -> Result<(), ApiError> {
     let length = value.chars().count();
     if !(8..=256).contains(&length) {
-        return Err(ApiError::Bad("Senha deve ter entre 8 e 256 caracteres".into()));
+        return Err(ApiError::Bad(
+            "Senha deve ter entre 8 e 256 caracteres".into(),
+        ));
     }
     Ok(())
 }
@@ -792,7 +848,9 @@ fn validate_name(value: &str, maximum: usize, message: &str) -> Result<(), ApiEr
     Ok(())
 }
 
-fn now_seconds() -> i64 { Utc::now().timestamp() }
+fn now_seconds() -> i64 {
+    Utc::now().timestamp()
+}
 
 fn iso_timestamp(value: i64) -> String {
     chrono::DateTime::<Utc>::from_timestamp(value, 0)
@@ -800,7 +858,9 @@ fn iso_timestamp(value: i64) -> String {
         .to_rfc3339()
 }
 
-fn internal(error: sqlx::Error) -> ApiError { ApiError::Internal(error.into()) }
+fn internal(error: sqlx::Error) -> ApiError {
+    ApiError::Internal(error.into())
+}
 
 fn map_unique(message: &'static str) -> impl FnOnce(sqlx::Error) -> ApiError {
     move |error| {

@@ -8,6 +8,13 @@ import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+if (process.platform === "linux") {
+  // pipewire-pulse pode expor o PID do daemon em vez do PID do cliente. Marcar
+  // o cliente Pulse permite que o mixer Linux identifique o Risk mesmo nesse caminho.
+  process.env["PULSE_PROP_application.name"] = "Risk";
+  process.env["PULSE_PROP_application.id"] = "com.risk.calls";
+}
+
 const root = path.dirname(fileURLToPath(import.meta.url));
 const DEVELOPMENT_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:5173"]);
 const DESKTOP_HOST = "127.0.0.1";

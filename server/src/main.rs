@@ -319,14 +319,13 @@ async fn login(
     let email = normalize_email(&input.email)?;
     check_login_limit(&state, &email).await?;
 
-    let row = sqlx::query_as::<_, (Uuid, String)>(
-        "SELECT id,password_hash FROM users WHERE email=$1",
-    )
-    .bind(&email)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|error| ApiError::Internal(error.into()))?
-    .ok_or(ApiError::Unauthorized)?;
+    let row =
+        sqlx::query_as::<_, (Uuid, String)>("SELECT id,password_hash FROM users WHERE email=$1")
+            .bind(&email)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|error| ApiError::Internal(error.into()))?
+            .ok_or(ApiError::Unauthorized)?;
 
     Argon2::default()
         .verify_password(
@@ -365,15 +364,13 @@ async fn clear_login_limit(state: &AppState, email: &str) {
 
 async fn create_session(state: &AppState, user_id: Uuid) -> Result<AuthResponse, ApiError> {
     let (token, hash, expires) = new_refresh(&state.config);
-    sqlx::query(
-        "INSERT INTO sessions(user_id,refresh_token_hash,expires_at) VALUES($1,$2,$3)",
-    )
-    .bind(user_id)
-    .bind(hash)
-    .bind(expires)
-    .execute(&state.db)
-    .await
-    .map_err(|error| ApiError::Internal(error.into()))?;
+    sqlx::query("INSERT INTO sessions(user_id,refresh_token_hash,expires_at) VALUES($1,$2,$3)")
+        .bind(user_id)
+        .bind(hash)
+        .bind(expires)
+        .execute(&state.db)
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
     auth_response(&state.config, user_id, token)
 }
 
@@ -411,15 +408,13 @@ async fn refresh(
         .await
         .map_err(|error| ApiError::Internal(error.into()))?;
     let (new_token, new_hash, expires) = new_refresh(&state.config);
-    sqlx::query(
-        "INSERT INTO sessions(user_id,refresh_token_hash,expires_at) VALUES($1,$2,$3)",
-    )
-    .bind(session.1)
-    .bind(new_hash)
-    .bind(expires)
-    .execute(&mut *transaction)
-    .await
-    .map_err(|error| ApiError::Internal(error.into()))?;
+    sqlx::query("INSERT INTO sessions(user_id,refresh_token_hash,expires_at) VALUES($1,$2,$3)")
+        .bind(session.1)
+        .bind(new_hash)
+        .bind(expires)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| ApiError::Internal(error.into()))?;
     transaction
         .commit()
         .await
@@ -445,10 +440,7 @@ async fn logout(
     Ok((response, Json(json!({"ok": true}))))
 }
 
-async fn me(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
+async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
     let user = bearer(&headers, &state.config)?;
     let row = sqlx::query_as::<_, (Uuid, String, String)>(
         "SELECT id,display_name,email FROM users WHERE id=$1",
@@ -458,7 +450,9 @@ async fn me(
     .await
     .map_err(|error| ApiError::Internal(error.into()))?
     .ok_or(ApiError::Unauthorized)?;
-    Ok(Json(json!({"id": row.0, "displayName": row.1, "email": row.2})))
+    Ok(Json(
+        json!({"id": row.0, "displayName": row.1, "email": row.2}),
+    ))
 }
 
 fn new_refresh(config: &Config) -> (String, String, DateTime<Utc>) {
@@ -564,7 +558,7 @@ fn bearer(headers: &HeaderMap, config: &Config) -> Result<Uuid, ApiError> {
 fn normalize_email(value: &str) -> Result<String, ApiError> {
     let email = value.trim().to_lowercase();
     let length = email.chars().count();
-    if length < 3 || length > 320 || !email.contains('@') || email.contains(char::is_whitespace) {
+    if !(3..=320).contains(&length) || !email.contains('@') || email.contains(char::is_whitespace) {
         return Err(ApiError::Bad("E-mail inválido".into()));
     }
     Ok(email)
@@ -573,7 +567,9 @@ fn normalize_email(value: &str) -> Result<String, ApiError> {
 fn validate_display_name(value: &str) -> Result<(), ApiError> {
     let length = value.chars().count();
     if !(2..=80).contains(&length) {
-        return Err(ApiError::Bad("Nome deve ter entre 2 e 80 caracteres".into()));
+        return Err(ApiError::Bad(
+            "Nome deve ter entre 2 e 80 caracteres".into(),
+        ));
     }
     Ok(())
 }
@@ -581,7 +577,9 @@ fn validate_display_name(value: &str) -> Result<(), ApiError> {
 fn validate_password(value: &str) -> Result<(), ApiError> {
     let length = value.chars().count();
     if !(8..=256).contains(&length) {
-        return Err(ApiError::Bad("Senha deve ter entre 8 e 256 caracteres".into()));
+        return Err(ApiError::Bad(
+            "Senha deve ter entre 8 e 256 caracteres".into(),
+        ));
     }
     Ok(())
 }
@@ -799,7 +797,9 @@ async fn add_community_member(
     .await
     .map_err(|error| ApiError::Internal(error.into()))?;
     if !friend {
-        return Err(ApiError::Bad("Adicione essa pessoa como amiga primeiro".into()));
+        return Err(ApiError::Bad(
+            "Adicione essa pessoa como amiga primeiro".into(),
+        ));
     }
     sqlx::query(
         "INSERT INTO community_members(community_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
@@ -974,7 +974,11 @@ async fn require_member(db: &PgPool, community: Uuid, user: Uuid) -> Result<(), 
     .fetch_one(db)
     .await
     .map_err(|error| ApiError::Internal(error.into()))?;
-    if ok { Ok(()) } else { Err(ApiError::Unauthorized) }
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized)
+    }
 }
 
 async fn add_user_to_community_voice_rooms(

@@ -14,7 +14,7 @@ try {
   // Variáveis podem ter sido fornecidas pelo ambiente do CI.
 }
 
-const required = ["VITE_API_URL", "VITE_SUPABASE_URL", "VITE_SUPABASE_ANON_KEY"];
+const required = ["VITE_SUPABASE_URL", "VITE_SUPABASE_ANON_KEY"];
 const missing = required.filter((name) => !values[name]?.trim());
 if (missing.length) {
   console.error(`Build interrompido: configure ${missing.join(", ")} no .env ou no ambiente.`);
@@ -22,6 +22,7 @@ if (missing.length) {
 }
 
 for (const name of ["VITE_API_URL", "VITE_SUPABASE_URL"]) {
+  if (!values[name]?.trim()) continue;
   try { new URL(values[name]); }
   catch {
     console.error(`Build interrompido: ${name} precisa ser uma URL válida.`);
@@ -29,4 +30,14 @@ for (const name of ["VITE_API_URL", "VITE_SUPABASE_URL"]) {
   }
 }
 
-console.log("Variáveis públicas do build validadas.");
+if (values.VITE_ICE_SERVERS_JSON?.trim()) {
+  try {
+    const servers = JSON.parse(values.VITE_ICE_SERVERS_JSON);
+    if (!Array.isArray(servers) || servers.length === 0) throw new Error("array vazio");
+  } catch {
+    console.error("Build interrompido: VITE_ICE_SERVERS_JSON precisa conter um array JSON válido de servidores ICE.");
+    process.exit(1);
+  }
+}
+
+console.log(`Variáveis públicas do build validadas. Modo: ${values.VITE_API_URL?.trim() ? "híbrido (API + P2P)" : "P2P local"}.`);

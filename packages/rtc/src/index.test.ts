@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MeshWebRTCTransport } from "./index";
+import { MeshWebRTCTransport, WebScreenShareProvider } from "./index";
 
 class FakePeerConnection {
   static instances: FakePeerConnection[] = [];
@@ -55,6 +55,37 @@ class FakeDataChannel {
 function descriptionWithJson(value: RTCSessionDescriptionInit): RTCSessionDescription {
   return { type: value.type!, sdp: value.sdp ?? "", toJSON: () => value } as RTCSessionDescription;
 }
+
+describe("WebScreenShareProvider", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("seleciona a única fonte Electron antes de chamar getDisplayMedia", async () => {
+    const selectScreenSource = vi.fn(async () => undefined);
+    const getDisplayMedia = vi.fn(async () => ({ getTracks: () => [] }) as unknown as MediaStream);
+    vi.stubGlobal("desktop", {
+      listScreenSources: vi.fn(async () => [{ id: "screen:1:0", name: "Tela 1" }]),
+      selectScreenSource,
+    });
+    vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia } });
+
+    const provider = new WebScreenShareProvider();
+    const stream = await provider.startScreenShare();
+
+    expect(selectScreenSource).toHaveBeenCalledWith("screen:1:0");
+    expect(getDisplayMedia).toHaveBeenCalledWith({ video: true, audio: true });
+    expect(stream).toBeDefined();
+  });
+
+  it("mantém o picker nativo do navegador quando não há bridge Electron", async () => {
+    const getDisplayMedia = vi.fn(async () => ({ getTracks: () => [] }) as unknown as MediaStream);
+    vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia } });
+
+    const provider = new WebScreenShareProvider();
+    await provider.startScreenShare();
+
+    expect(getDisplayMedia).toHaveBeenCalledOnce();
+  });
+});
 
 describe("MeshWebRTCTransport", () => {
   beforeEach(() => {

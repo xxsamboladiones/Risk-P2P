@@ -12,6 +12,7 @@ const DESKTOP_PORT = 5190;
 const DESKTOP_ORIGIN = `http://${DESKTOP_HOST}:${DESKTOP_PORT}`;
 let assetServer: Server | undefined;
 let pageUrl = DESKTOP_ORIGIN;
+let pendingDisplaySourceId: string | undefined;
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) app.quit();
@@ -94,6 +95,22 @@ ipcMain.handle("screen:list", async (event) => {
   }));
 });
 
+ipcMain.handle("screen:select", async (event, sourceId: unknown) => {
+  if (!isTrustedRendererUrl(event.sender.getURL())) throw new Error("Origem do renderer não autorizada.");
+  if (typeof sourceId !== "string" || sourceId.length === 0 || sourceId.length > 512) {
+    throw new Error("Fonte de compartilhamento inválida.");
+  }
+  const sources = await desktopCapturer.getSources({
+    types: ["screen", "window"],
+    thumbnailSize: { width: 0, height: 0 },
+    fetchWindowIcons: false,
+  });
+  if (!sources.some((source) => source.id === sourceId)) {
+    throw new Error("A fonte selecionada não está mais disponível.");
+  }
+  pendingDisplaySourceId = sourceId;
+});
+
 function createWindow(): void {
   const window = new BrowserWindow({
     width: 1280,
@@ -134,6 +151,33 @@ if (hasSingleInstanceLock) {
     session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
       callback(isTrustedRendererUrl(webContents.getURL()) && ["media", "display-capture"].includes(permission));
     });
+    session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
+      const sourceId = pendingDisplaySourceId;
+      pendingDisplaySourceId = undefined;
+      if (!sourceId || !isTrustedRendererUrl(request.securityOrigin)) {
+        callback({});
+        return;
+      }
+      try {
+        const sources = await desktopCapturer.getSources({
+          types: ["screen", "window"],
+          thumbnailSize: { width: 0, height: 0 },
+          fetchWindowIcons: false,
+        });
+        const selected = sources.find((source) => source.id === sourceId);
+        if (!selected) {
+          callback({});
+          return;
+        }
+        callback({
+          video: selected,
+          audio: request.audioRequested ? "loopback" : undefined,
+        });
+      } catch (error) {
+        console.error("Falha ao autorizar compartilhamento de tela", error);
+        callback({});
+      }
+    });
     createWindow();
     app.on("activate", () => {
       if (!BrowserWindow.getAllWindows().length) createWindow();
@@ -145,6 +189,7 @@ if (hasSingleInstanceLock) {
 }
 
 app.on("before-quit", () => {
+  pendingDisplaySourceId = undefined;
   assetServer?.close();
   assetServer = undefined;
 });

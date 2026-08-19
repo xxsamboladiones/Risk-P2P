@@ -65,10 +65,6 @@ export function GroupInvitePanel({
             };
           }
 
-          // Persistência é desejável para o histórico local, mas não deve bloquear a
-          // criação do código. O convite usa os metadados recebidos diretamente do
-          // grupo selecionado e o grupo será salvo novamente quando o handshake for
-          // aceito/concluído.
           try {
             const identity = await getOrCreateLocalIdentity(displayName);
             await ensureLocalGroup(
@@ -153,7 +149,7 @@ export function GroupInvitePanel({
     {error && metadata && <div className="invite-notice">O armazenamento local será sincronizado quando o convite for concluído.</div>}
     {error && !metadata && <div className="invite-notice error">{error}</div>}
     <P2PInvitePanel
-      key={metadata?.groupId ?? selectedId || "create-unavailable"}
+      key={(metadata?.groupId ?? selectedId) || "create-unavailable"}
       type="group"
       token={token}
       displayName={displayName}

@@ -8,4 +8,5 @@ target/
 coverage/
 *.tsbuildinfo
 release/
+apps/desktop/resources/backend/
 .DS_Store

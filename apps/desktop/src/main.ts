@@ -229,6 +229,40 @@ ipcMain.handle("screen:list", async (event) => {
   }));
 });
 
+ipcMain.handle("screen:choose", async (event) => {
+  if (!isTrustedRendererUrl(event.sender.getURL())) throw new Error("Origem do renderer não autorizada.");
+  const allSources = await desktopCapturer.getSources({
+    types: ["screen", "window"],
+    thumbnailSize: { width: 0, height: 0 },
+    fetchWindowIcons: false,
+  });
+  if (!allSources.length) return null;
+
+  // O dialog nativo substitui window.prompt(), que não é suportado no renderer
+  // sandboxed do Electron. Limitamos a lista para evitar um dialog impraticável
+  // quando o usuário possui dezenas de janelas abertas.
+  const sources = allSources.slice(0, 20);
+  const buttons = [...sources.map((source) => source.name.slice(0, 80)), "Cancelar"];
+  const owner = BrowserWindow.fromWebContents(event.sender);
+  const options = {
+    type: "question" as const,
+    title: "Compartilhar tela",
+    message: "Escolha uma tela ou janela para compartilhar",
+    detail: allSources.length > sources.length
+      ? `Mostrando as primeiras ${sources.length} fontes disponíveis.`
+      : "O áudio do sistema será incluído quando o sistema operacional permitir.",
+    buttons,
+    defaultId: 0,
+    cancelId: sources.length,
+    noLink: true,
+  };
+  const result = owner
+    ? await dialog.showMessageBox(owner, options)
+    : await dialog.showMessageBox(options);
+  if (result.response < 0 || result.response >= sources.length) return null;
+  return sources[result.response]?.id ?? null;
+});
+
 ipcMain.handle("screen:select", async (event, sourceId: unknown) => {
   if (!isTrustedRendererUrl(event.sender.getURL())) throw new Error("Origem do renderer não autorizada.");
   if (typeof sourceId !== "string" || sourceId.length === 0 || sourceId.length > 512) {

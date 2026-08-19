@@ -10,3 +10,17 @@ interface ImportMetaEnv {
 interface ImportMeta {
   readonly env: ImportMetaEnv;
 }
+
+type RiskDesktopSource = {
+  id: string;
+  name: string;
+  displayId: string;
+  thumbnail: string;
+};
+
+interface Window {
+  desktop?: {
+    listScreenSources(): Promise<RiskDesktopSource[]>;
+    selectScreenSource(sourceId: string): Promise<void>;
+  };
+}

@@ -1,25 +1,47 @@
 name: CI
 on: [push, pull_request]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   web:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: pnpm/action-setup@v4
-        with: { version: 10 }
+        with: { version: 10.15.0 }
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: pnpm }
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build:web
+      - name: Build desktop Rust sidecar
+        run: pnpm build:backend:desktop
+      - name: Validate Electron bundle with sidecar
+        run: |
+          pnpm --filter @risk/desktop exec tsc
+          pnpm --filter @risk/desktop exec electron-builder --dir
+
   rust:
     runs-on: ubuntu-latest
-    defaults: { run: { working-directory: server } }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with: { components: rustfmt, clippy }
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+        with:
+          components: rustfmt,clippy
+      - name: Central server fmt
+        run: cargo fmt --manifest-path server/Cargo.toml --check
+      - name: Central server clippy
+        run: cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings
+      - name: Central server tests
+        run: cargo test --manifest-path server/Cargo.toml
+      - name: Format desktop backend
+        run: cargo fmt --manifest-path desktop-backend/Cargo.toml
+      - name: Desktop backend clippy
+        run: cargo clippy --manifest-path desktop-backend/Cargo.toml --all-targets -- -D warnings
+      - name: Desktop backend tests
+        run: cargo test --manifest-path desktop-backend/Cargo.toml

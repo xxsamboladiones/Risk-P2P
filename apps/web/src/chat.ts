@@ -23,6 +23,7 @@ export class ChatController {
   private status: ChatConnectionStatus = "disconnected";
   private readonly processed = new Set<string>();
   private readonly openDataPeers = new Set<string>();
+  private readonly peerNames = new Map<string, string>();
   private readonly messageCallbacks = new Set<(message: LocalChatMessage) => void>();
   private readonly statusCallbacks = new Set<(status: ChatConnectionStatus) => void>();
   private unsubscribers: Array<() => void> = [];
@@ -43,8 +44,13 @@ export class ChatController {
       sendAnswer: (targetPeerId, description) => this.signaling!.sendAnswer(targetPeerId, description),
       sendIce: (targetPeerId, candidate) => this.signaling!.sendIceCandidate(targetPeerId, candidate),
       onRemoteStream: () => undefined,
-      onConnectionState: (_remotePeerId, state) => { if (state === "failed") this.setStatus("error"); },
-      onDataMessage: (_remotePeerId, data) => { void this.receive(data); },
+      onConnectionState: (remotePeerId, state) => {
+        if (state === "failed" || state === "closed") {
+          this.openDataPeers.delete(remotePeerId);
+          this.setStatus(this.openDataPeers.size > 0 ? "ready" : "connected");
+        }
+      },
+      onDataMessage: (remotePeerId, data) => { void this.receive(remotePeerId, data); },
       onDataState: (remotePeerId, state) => {
         if (state === "open") this.openDataPeers.add(remotePeerId); else this.openDataPeers.delete(remotePeerId);
         this.setStatus(this.openDataPeers.size > 0 ? "ready" : "connected");
@@ -54,6 +60,7 @@ export class ChatController {
     try {
       await this.signaling.connect(channelId, this.peerId, "chat");
       this.setStatus("connected");
+      await this.signaling.sendPeerProfile(this.displayName);
     } catch (error) { await this.disconnect(); this.setStatus("error"); throw error; }
   }
 
@@ -62,18 +69,22 @@ export class ChatController {
     await this.signaling?.disconnect().catch(() => undefined);
     await this.transport?.disconnect().catch(() => undefined);
     this.signaling = undefined; this.transport = undefined; this.channelId = undefined; this.peerId = undefined;
-    this.openDataPeers.clear(); this.processed.clear(); this.setStatus("disconnected");
+    this.openDataPeers.clear(); this.peerNames.clear(); this.processed.clear(); this.setStatus("disconnected");
   }
 
   async send(content: string): Promise<LocalChatMessage> {
-    if (!this.channelId || !this.transport || this.status === "disconnected" || this.status === "error") throw new Error("Conecte o chat primeiro.");
+    if (!this.channelId || !this.transport) throw new Error("Conecte o chat primeiro.");
     if (this.openDataPeers.size === 0) throw new Error("Aguardando outro participante conectar o chat.");
     const trimmed = content.trim();
     if (!trimmed || trimmed.length > 4_000) throw new Error("Mensagem inválida.");
     const timestamp = Date.now();
     const wire: ChatWireMessage = { version: 1, type: "chat.message", channelId: this.channelId, id: crypto.randomUUID(), author: this.displayName, content: trimmed, timestamp };
-    if (this.transport.sendData(JSON.stringify(wire)) === 0) throw new Error("Nenhuma conexão P2P disponível.");
-    const local = toLocal(wire); this.processed.add(local.id); await saveLocalMessage(local); this.emitMessage(local); return local;
+    if (this.transport.sendData(JSON.stringify(wire)) === 0) throw new Error("Nenhuma conexão P2P disponível ou os canais estão congestionados.");
+    const local = toLocal(wire, this.displayName);
+    this.remember(local.id);
+    await saveLocalMessage(local);
+    this.emitMessage(local);
+    return local;
   }
 
   onMessage(callback: (message: LocalChatMessage) => void): () => void { this.messageCallbacks.add(callback); return () => this.messageCallbacks.delete(callback); }
@@ -81,22 +92,44 @@ export class ChatController {
 
   private bindSignaling(signaling: SignalingProvider, peerId: string): void {
     this.unsubscribers.push(
-      signaling.onPeerJoined((peer) => { void this.transport?.connect(peer.peerId, peerId < peer.peerId).catch(() => this.setStatus("error")); }),
-      signaling.onPeerLeft((remotePeerId) => { this.openDataPeers.delete(remotePeerId); void this.transport?.disconnect(remotePeerId); this.setStatus(this.openDataPeers.size ? "ready" : "connected"); }),
-      signaling.onOffer((message) => { void this.transport?.acceptOffer(message.fromPeerId, message.payload.sdp).catch(() => this.setStatus("error")); }),
-      signaling.onAnswer((message) => { void this.transport?.acceptAnswer(message.fromPeerId, message.payload.sdp).catch(() => this.setStatus("error")); }),
-      signaling.onIceCandidate((message) => { void this.transport?.addIceCandidate(message.fromPeerId, message.payload.candidate).catch(() => this.setStatus("error")); }),
-      signaling.onStatusChange((status) => { if (status === "reconnecting") this.setStatus("connecting"); if (status === "error") this.setStatus("error"); }),
+      signaling.onPeerJoined((peer) => {
+        void this.transport?.connect(peer.peerId, peerId < peer.peerId).catch(() => this.setStatus(this.openDataPeers.size ? "ready" : "connected"));
+        void signaling.sendPeerProfile(this.displayName).catch(() => undefined);
+      }),
+      signaling.onPeerLeft((remotePeerId) => {
+        this.openDataPeers.delete(remotePeerId);
+        this.peerNames.delete(remotePeerId);
+        void this.transport?.disconnect(remotePeerId);
+        this.setStatus(this.openDataPeers.size ? "ready" : "connected");
+      }),
+      signaling.onOffer((message) => { void this.transport?.acceptOffer(message.fromPeerId, message.payload.sdp).catch(() => this.setStatus(this.openDataPeers.size ? "ready" : "connected")); }),
+      signaling.onAnswer((message) => { void this.transport?.acceptAnswer(message.fromPeerId, message.payload.sdp).catch(() => this.setStatus(this.openDataPeers.size ? "ready" : "connected")); }),
+      signaling.onIceCandidate((message) => { void this.transport?.addIceCandidate(message.fromPeerId, message.payload.candidate).catch(() => undefined); }),
+      signaling.onPeerProfile((message) => {
+        if (!this.peerNames.has(message.fromPeerId)) this.peerNames.set(message.fromPeerId, message.payload.displayName);
+      }),
+      signaling.onStatusChange((status) => {
+        if (status === "reconnecting" && this.openDataPeers.size === 0) this.setStatus("connecting");
+        if (status === "error" && this.openDataPeers.size === 0) this.setStatus("error");
+      }),
     );
   }
 
-  private async receive(raw: string): Promise<void> {
+  private async receive(remotePeerId: string, raw: string): Promise<void> {
     const wire = parseChatWireMessage(raw, this.channelId);
     if (!wire || this.processed.has(wire.id)) return;
-    this.processed.add(wire.id);
-    if (this.processed.size > 2_048) this.processed.delete(this.processed.values().next().value!);
-    const local = toLocal(wire); await saveLocalMessage(local); this.emitMessage(local);
+    this.remember(wire.id);
+    const trustedDisplayName = this.peerNames.get(remotePeerId) ?? `Peer ${remotePeerId.slice(0, 6)}`;
+    const local = toLocal(wire, trustedDisplayName);
+    await saveLocalMessage(local);
+    this.emitMessage(local);
   }
+
+  private remember(messageId: string): void {
+    this.processed.add(messageId);
+    while (this.processed.size > 2_048) this.processed.delete(this.processed.values().next().value!);
+  }
+
   private emitMessage(message: LocalChatMessage): void { this.messageCallbacks.forEach((callback) => callback(message)); }
   private setStatus(status: ChatConnectionStatus): void { if (this.status === status) return; this.status = status; this.statusCallbacks.forEach((callback) => callback(status)); }
 }
@@ -110,10 +143,10 @@ export function parseChatWireMessage(raw: string, channelId?: string): ChatWireM
     && typeof message.id === "string" && /^[0-9a-f-]{36}$/i.test(message.id)
     && typeof message.author === "string" && message.author.trim().length >= 2 && message.author.length <= 80
     && typeof message.content === "string" && message.content.trim().length > 0 && message.content.length <= 4_000
-    && typeof message.timestamp === "number" && message.timestamp >= now - 120_000 && message.timestamp <= now + 30_000
+    && typeof message.timestamp === "number" && Number.isFinite(message.timestamp) && message.timestamp >= now - 120_000 && message.timestamp <= now + 30_000
     ? message as ChatWireMessage : null;
 }
 
-function toLocal(message: ChatWireMessage): LocalChatMessage {
-  return { id: message.id, channelId: message.channelId, author: message.author, content: message.content, createdAt: new Date(message.timestamp).toISOString() };
+function toLocal(message: ChatWireMessage, author: string): LocalChatMessage {
+  return { id: message.id, channelId: message.channelId, author, content: message.content, createdAt: new Date(message.timestamp).toISOString() };
 }

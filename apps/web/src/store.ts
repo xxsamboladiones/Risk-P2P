@@ -9,11 +9,15 @@ type CallState = {
 };
 export const useCallStore = create<CallState>((set) => ({
   token: sessionStorage.getItem("accessToken"), roomId: null, selfPeerId: null, participants: {}, localPreviews: { camera: null, screen: null }, localState: { microphone: true, camera: false, screenShare: false }, error: null,
-  setSession: (token) => { sessionStorage.setItem("accessToken", token); set({ token }); },
+  setSession: (token) => { sessionStorage.setItem("accessToken", token); set({ token, error: null }); },
   setRoom: (roomId) => set({ roomId }), setSelf: (selfPeerId) => set({ selfPeerId }),
   setLocalMedia: (localPreviews, localState) => set({ localPreviews, localState: { ...localState } }),
   upsert: (participant) => set((state) => ({ participants: { ...state.participants, [participant.peerId]: { ...state.participants[participant.peerId], ...participant } } })),
   remove: (peerId) => set((state) => { const participants = { ...state.participants }; delete participants[peerId]; return { participants }; }),
   clearParticipants: () => set({ participants: {}, selfPeerId: null }),
-  setError: (error) => set({ error }), reset: () => { sessionStorage.removeItem("accessToken"); set({ token: null, roomId: null, selfPeerId: null, participants: {}, localPreviews: { camera: null, screen: null }, localState: { microphone: true, camera: false, screenShare: false } }); }
+  setError: (error) => set({ error }),
+  reset: () => {
+    sessionStorage.removeItem("accessToken");
+    set({ token: null, roomId: null, selfPeerId: null, participants: {}, localPreviews: { camera: null, screen: null }, localState: { microphone: true, camera: false, screenShare: false }, error: null });
+  },
 }));

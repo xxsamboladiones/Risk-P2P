@@ -173,6 +173,8 @@ export class SupabaseSignalingProvider implements SignalingProvider {
   private acceptMessage(message: OfferMessage | AnswerMessage | IceCandidateMessage | PeerStateMessage | PeerProfileMessage): boolean {
     if (!this.peerId || !this.roomId || message.roomId !== this.roomId || message.fromPeerId === this.peerId) return false;
     if (message.targetPeerId !== undefined && message.targetPeerId !== this.peerId) return false;
+    if (!this.presencePeers.has(message.fromPeerId)) this.reconcilePresence();
+    if (!this.presencePeers.has(message.fromPeerId)) return false;
     this.pruneCaches();
     if (this.processedMessageIds.has(message.messageId)) return false;
     if (!this.withinRateLimit(message.fromPeerId, message.type)) return false;
@@ -188,8 +190,10 @@ export class SupabaseSignalingProvider implements SignalingProvider {
   }
 
   private pruneCaches(): void {
-    const threshold = Date.now() - 120_000;
+    const now = Date.now();
+    const threshold = now - 120_000;
     for (const [id, timestamp] of this.processedMessageIds) if (timestamp < threshold) this.processedMessageIds.delete(id);
+    for (const [key, window] of this.rateWindows) if (now - window.startedAt > 60_000) this.rateWindows.delete(key);
     if (this.processedMessageIds.size > 2_048) {
       const overflow = this.processedMessageIds.size - 2_048;
       [...this.processedMessageIds.keys()].slice(0, overflow).forEach((id) => this.processedMessageIds.delete(id));

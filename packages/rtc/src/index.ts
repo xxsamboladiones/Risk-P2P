@@ -8,13 +8,44 @@ export interface ScreenShareProvider {
   stopScreenShare(): Promise<void>;
 }
 
+type DesktopScreenBridge = {
+  listScreenSources(): Promise<Array<{ id: string; name: string; thumbnail?: string; displayId?: string }>>;
+  chooseScreenSource?(): Promise<string | null>;
+  selectScreenSource(sourceId: string): Promise<void>;
+};
+
+function desktopScreenBridge(): DesktopScreenBridge | undefined {
+  return (globalThis as typeof globalThis & { desktop?: DesktopScreenBridge }).desktop;
+}
+
 export class WebScreenShareProvider implements ScreenShareProvider {
   private stream?: MediaStream;
-  async getSources(): Promise<ScreenSource[]> { return []; }
-  async startScreenShare(): Promise<MediaStream> {
+
+  async getSources(): Promise<ScreenSource[]> {
+    const desktop = desktopScreenBridge();
+    return desktop ? desktop.listScreenSources() : [];
+  }
+
+  async startScreenShare(sourceId?: string): Promise<MediaStream> {
+    const desktop = desktopScreenBridge();
+    if (desktop) {
+      let selectedSourceId = sourceId;
+      if (!selectedSourceId) {
+        if (desktop.chooseScreenSource) {
+          selectedSourceId = await desktop.chooseScreenSource() ?? undefined;
+        } else {
+          const sources = await desktop.listScreenSources();
+          if (sources.length === 1) selectedSourceId = sources[0]?.id;
+          else if (sources.length > 1) throw new Error("O seletor de tela do Electron não está disponível nesta versão do desktop.");
+        }
+      }
+      if (!selectedSourceId) throw new DOMException("Compartilhamento cancelado.", "NotAllowedError");
+      await desktop.selectScreenSource(selectedSourceId);
+    }
     this.stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
     return this.stream;
   }
+
   async stopScreenShare(): Promise<void> {
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = undefined;
@@ -70,11 +101,15 @@ type PeerEntry = {
   pc: RTCPeerConnection;
   canNegotiate: boolean;
   makingOffer: boolean;
+  needsNegotiation: boolean;
   ignoreOffer: boolean;
   settingRemoteAnswer: boolean;
   pendingIceCandidates: RTCIceCandidateInit[];
   dataChannel?: RTCDataChannel;
 };
+
+const DEFAULT_MAX_REMOTE_PEERS = 5;
+const MAX_DATA_BUFFER_BYTES = 512 * 1024;
 
 export class MeshWebRTCTransport implements CallTransport {
   private readonly peers = new Map<string, PeerEntry>();
@@ -84,15 +119,21 @@ export class MeshWebRTCTransport implements CallTransport {
     private readonly localPeerId: string,
     private readonly iceServers: RTCIceServer[],
     private readonly events: TransportEvents,
-  ) {}
+    private readonly maxRemotePeers = DEFAULT_MAX_REMOTE_PEERS,
+  ) {
+    if (!Number.isInteger(maxRemotePeers) || maxRemotePeers < 1) throw new Error("maxRemotePeers deve ser maior que zero.");
+  }
 
   async connect(peerId: string, initiator: boolean): Promise<void> {
     const entry = this.peers.get(peerId) ?? this.createPeer(peerId);
-    entry.canNegotiate = initiator;
+    if (initiator) entry.canNegotiate = true;
     if (initiator && this.events.onDataMessage && !entry.dataChannel) {
       this.bindDataChannel(peerId, entry, entry.pc.createDataChannel("risk.chat", { ordered: true }));
     }
-    if (initiator) await this.negotiate(peerId, entry);
+    if (initiator) {
+      entry.needsNegotiation = true;
+      await this.negotiateIfNeeded(peerId, entry);
+    }
   }
 
   async acceptOffer(peerId: string, description: RTCSessionDescriptionInit): Promise<void> {
@@ -117,17 +158,27 @@ export class MeshWebRTCTransport implements CallTransport {
 
   async publishTrack(track: MediaStreamTrack, stream: MediaStream): Promise<void> {
     this.localTracks.set(track.id, { track, stream });
-    this.peers.forEach(({ pc }) => {
-      if (!pc.getSenders().some((sender) => sender.track?.id === track.id)) pc.addTrack(track, stream);
-    });
+    const negotiations: Promise<void>[] = [];
+    for (const [peerId, entry] of this.peers) {
+      if (entry.pc.getSenders().some((sender) => sender.track?.id === track.id)) continue;
+      entry.pc.addTrack(track, stream);
+      entry.needsNegotiation = true;
+      negotiations.push(this.negotiateIfNeeded(peerId, entry));
+    }
+    await Promise.all(negotiations);
   }
 
   async unpublishTrack(track: MediaStreamTrack): Promise<void> {
     this.localTracks.delete(track.id);
-    this.peers.forEach(({ pc }) => {
-      const sender = pc.getSenders().find((item) => item.track === track);
-      if (sender) pc.removeTrack(sender);
-    });
+    const negotiations: Promise<void>[] = [];
+    for (const [peerId, entry] of this.peers) {
+      const sender = entry.pc.getSenders().find((item) => item.track === track || item.track?.id === track.id);
+      if (!sender) continue;
+      entry.pc.removeTrack(sender);
+      entry.needsNegotiation = true;
+      negotiations.push(this.negotiateIfNeeded(peerId, entry));
+    }
+    await Promise.all(negotiations);
   }
 
   async replaceTrack(kind: "audio" | "video", track: MediaStreamTrack | null): Promise<void> {
@@ -142,7 +193,14 @@ export class MeshWebRTCTransport implements CallTransport {
     let sent = 0;
     for (const [peerId, entry] of this.peers) {
       if (targetPeerId && peerId !== targetPeerId) continue;
-      if (entry.dataChannel?.readyState === "open") { entry.dataChannel.send(data); sent += 1; }
+      const channel = entry.dataChannel;
+      if (channel?.readyState !== "open") continue;
+      if (channel.bufferedAmount > MAX_DATA_BUFFER_BYTES) {
+        logger.warn("DataChannel congestionado; mensagem não enviada", { peerId, bufferedAmount: channel.bufferedAmount });
+        continue;
+      }
+      channel.send(data);
+      sent += 1;
     }
     return sent;
   }
@@ -183,8 +241,19 @@ export class MeshWebRTCTransport implements CallTransport {
   private createPeer(peerId: string): PeerEntry {
     const existing = this.peers.get(peerId);
     if (existing) return existing;
+    if (this.peers.size >= this.maxRemotePeers) {
+      throw new Error(`Sala cheia: este cliente aceita no máximo ${this.maxRemotePeers + 1} participantes no Mesh.`);
+    }
     const pc = new RTCPeerConnection({ iceServers: this.iceServers });
-    const entry: PeerEntry = { pc, canNegotiate: false, makingOffer: false, ignoreOffer: false, settingRemoteAnswer: false, pendingIceCandidates: [] };
+    const entry: PeerEntry = {
+      pc,
+      canNegotiate: false,
+      makingOffer: false,
+      needsNegotiation: false,
+      ignoreOffer: false,
+      settingRemoteAnswer: false,
+      pendingIceCandidates: [],
+    };
     this.peers.set(peerId, entry);
     this.localTracks.forEach(({ track, stream }) => pc.addTrack(track, stream));
     pc.onicecandidate = ({ candidate }) => {
@@ -195,7 +264,18 @@ export class MeshWebRTCTransport implements CallTransport {
       if (stream) this.events.onRemoteStream(peerId, stream);
     };
     pc.ondatachannel = ({ channel }) => this.bindDataChannel(peerId, entry, channel);
-    pc.onnegotiationneeded = () => { if (entry.canNegotiate) void this.negotiate(peerId, entry); };
+    pc.onnegotiationneeded = () => {
+      // publishTrack/unpublishTrack marcam a negociação explicitamente. Este handler
+      // continua como fallback para mudanças feitas pelo próprio navegador, mas não
+      // cria uma segunda offer enquanto outra negociação já está em andamento.
+      if (!entry.canNegotiate) {
+        entry.needsNegotiation = true;
+        return;
+      }
+      if (entry.makingOffer || entry.pc.signalingState !== "stable") return;
+      entry.needsNegotiation = true;
+      void this.negotiateIfNeeded(peerId, entry);
+    };
     pc.onconnectionstatechange = () => {
       this.events.onConnectionState(peerId, pc.connectionState);
       if (pc.connectionState === "failed" && this.localPeerId < peerId) {
@@ -235,9 +315,16 @@ export class MeshWebRTCTransport implements CallTransport {
     await this.flushPendingIce(entry);
     entry.canNegotiate = true;
     if (description.type === "offer") {
+      // A resposta já descreve todas as tracks locais existentes neste instante.
+      entry.needsNegotiation = false;
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       if (pc.localDescription) await this.events.sendAnswer(peerId, pc.localDescription.toJSON());
+    } else {
+      // Uma câmera/tela pode ter sido ligada enquanto a offer anterior estava em voo.
+      // Assim que a answer devolve o PeerConnection para stable, enviamos a próxima
+      // negociação pendente sem exigir refresh/reentrada na sala.
+      await this.negotiateIfNeeded(peerId, entry);
     }
   }
 
@@ -252,15 +339,28 @@ export class MeshWebRTCTransport implements CallTransport {
     return entry;
   }
 
+  private async negotiateIfNeeded(peerId: string, entry: PeerEntry): Promise<void> {
+    if (!entry.needsNegotiation || !entry.canNegotiate || entry.makingOffer || entry.pc.signalingState !== "stable") return;
+    entry.needsNegotiation = false;
+    await this.negotiate(peerId, entry);
+  }
+
   private async negotiate(peerId: string, entry: PeerEntry, iceRestart = false): Promise<void> {
-    if (entry.makingOffer || entry.pc.signalingState !== "stable") return;
+    if (entry.makingOffer || entry.pc.signalingState !== "stable") {
+      if (!iceRestart) entry.needsNegotiation = true;
+      return;
+    }
     entry.makingOffer = true;
     try {
       const offer = await entry.pc.createOffer({ iceRestart });
-      if (entry.pc.signalingState !== "stable") return;
+      if (entry.pc.signalingState !== "stable") {
+        if (!iceRestart) entry.needsNegotiation = true;
+        return;
+      }
       await entry.pc.setLocalDescription(offer);
       if (entry.pc.localDescription) await this.events.sendOffer(peerId, entry.pc.localDescription.toJSON());
     } catch (error) {
+      if (!iceRestart) entry.needsNegotiation = true;
       logger.warn("WebRTC renegotiation failed", { peerId, error: String(error) });
     } finally { entry.makingOffer = false; }
   }

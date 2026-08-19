@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MeshWebRTCTransport } from "./index";
+import { MeshWebRTCTransport, WebScreenShareProvider } from "./index";
 
 class FakePeerConnection {
   static instances: FakePeerConnection[] = [];
@@ -39,6 +39,7 @@ class FakePeerConnection {
 
 class FakeDataChannel {
   readyState: RTCDataChannelState = "connecting";
+  bufferedAmount = 0;
   sent: string[] = [];
   onopen: (() => void) | null = null;
   onclose: (() => void) | null = null;
@@ -54,6 +55,37 @@ class FakeDataChannel {
 function descriptionWithJson(value: RTCSessionDescriptionInit): RTCSessionDescription {
   return { type: value.type!, sdp: value.sdp ?? "", toJSON: () => value } as RTCSessionDescription;
 }
+
+describe("WebScreenShareProvider", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("seleciona a única fonte Electron antes de chamar getDisplayMedia", async () => {
+    const selectScreenSource = vi.fn(async () => undefined);
+    const getDisplayMedia = vi.fn(async () => ({ getTracks: () => [] }) as unknown as MediaStream);
+    vi.stubGlobal("desktop", {
+      listScreenSources: vi.fn(async () => [{ id: "screen:1:0", name: "Tela 1" }]),
+      selectScreenSource,
+    });
+    vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia } });
+
+    const provider = new WebScreenShareProvider();
+    const stream = await provider.startScreenShare();
+
+    expect(selectScreenSource).toHaveBeenCalledWith("screen:1:0");
+    expect(getDisplayMedia).toHaveBeenCalledWith({ video: true, audio: true });
+    expect(stream).toBeDefined();
+  });
+
+  it("mantém o picker nativo do navegador quando não há bridge Electron", async () => {
+    const getDisplayMedia = vi.fn(async () => ({ getTracks: () => [] }) as unknown as MediaStream);
+    vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia } });
+
+    const provider = new WebScreenShareProvider();
+    await provider.startScreenShare();
+
+    expect(getDisplayMedia).toHaveBeenCalledOnce();
+  });
+});
 
 describe("MeshWebRTCTransport", () => {
   beforeEach(() => {
@@ -79,6 +111,8 @@ describe("MeshWebRTCTransport", () => {
     }
     expect(FakePeerConnection.instances).toHaveLength(5);
     expect(transport.getDiagnostics()).toHaveLength(5);
+    await expect(transport.connect("00000000-0000-4000-8000-000000000007", false)).rejects.toThrow("Sala cheia");
+    expect(transport.getDiagnostics()).toHaveLength(5);
     await transport.disconnect();
   });
 
@@ -95,6 +129,37 @@ describe("MeshWebRTCTransport", () => {
     expect(transport.getDiagnostics()[0]?.pendingIceCandidates).toBe(0);
   });
 
+  it("renegocia imediatamente quando uma track é publicada após a conexão", async () => {
+    const callbacks = events();
+    const peerId = "00000000-0000-4000-8000-000000000002";
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
+    await transport.connect(peerId, true);
+    expect(callbacks.sendOffer).toHaveBeenCalledTimes(1);
+    await transport.acceptAnswer(peerId, { type: "answer", sdp: "answer-1" });
+
+    const track = { id: "camera-track", kind: "video" } as MediaStreamTrack;
+    const stream = { id: "camera-stream" } as MediaStream;
+    await transport.publishTrack(track, stream);
+
+    expect(callbacks.sendOffer).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserva renegociação pendente se a câmera/tela ligar enquanto uma offer está em voo", async () => {
+    const callbacks = events();
+    const peerId = "00000000-0000-4000-8000-000000000002";
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
+    await transport.connect(peerId, true);
+    expect(callbacks.sendOffer).toHaveBeenCalledTimes(1);
+
+    const track = { id: "screen-track", kind: "video" } as MediaStreamTrack;
+    const stream = { id: "screen-stream" } as MediaStream;
+    await transport.publishTrack(track, stream);
+    expect(callbacks.sendOffer).toHaveBeenCalledTimes(1);
+
+    await transport.acceptAnswer(peerId, { type: "answer", sdp: "answer-1" });
+    expect(callbacks.sendOffer).toHaveBeenCalledTimes(2);
+  });
+
   it("abre um DataChannel por peer e entrega mensagens sem servidor", async () => {
     const callbacks = { ...events(), onDataMessage: vi.fn(), onDataState: vi.fn() };
     const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
@@ -106,6 +171,17 @@ describe("MeshWebRTCTransport", () => {
     expect(callbacks.onDataMessage).toHaveBeenCalledWith("00000000-0000-4000-8000-000000000002", "mensagem recebida");
     await transport.disconnect();
     expect(channel.readyState).toBe("closed");
+  });
+
+  it("não envia em DataChannel congestionado", async () => {
+    const callbacks = { ...events(), onDataMessage: vi.fn(), onDataState: vi.fn() };
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
+    await transport.connect("00000000-0000-4000-8000-000000000002", true);
+    const channel = FakePeerConnection.dataChannels[0]!;
+    channel.open();
+    channel.bufferedAmount = 600 * 1024;
+    expect(transport.sendData("mensagem")).toBe(0);
+    expect(channel.sent).toHaveLength(0);
   });
 });
 

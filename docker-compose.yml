@@ -5,18 +5,16 @@ services:
     ports: ["5432:5432"]
     volumes: [postgres_data:/var/lib/postgresql/data]
     healthcheck: { test: ["CMD-SHELL", "pg_isready -U risk"], interval: 5s, timeout: 3s, retries: 10 }
-  redis:
-    image: redis:7.4-alpine
-    ports: ["6379:6379"]
-    command: redis-server --appendonly yes
-    volumes: [redis_data:/data]
+
   coturn:
     image: coturn/coturn:4.6-alpine
     ports:
       - "3478:3478/tcp"
       - "3478:3478/udp"
+      - "49160-49200:49160-49200/udp"
     volumes: ["./infrastructure/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro"]
-    command: ["-c", "/etc/coturn/turnserver.conf"]
+    command: ["-c", "/etc/coturn/turnserver.conf", "--static-auth-secret=${TURN_SECRET:?Defina TURN_SECRET no arquivo .env}"]
+
   backend:
     image: rust:1.88-bookworm
     working_dir: /app/server
@@ -25,9 +23,8 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgres://risk:risk_dev@postgres:5432/risk
-      REDIS_URL: redis://redis:6379
     ports: ["8080:8080"]
     depends_on:
       postgres: { condition: service_healthy }
-      redis: { condition: service_started }
-volumes: { postgres_data: {}, redis_data: {}, cargo_cache: {} }
+
+volumes: { postgres_data: {}, cargo_cache: {} }

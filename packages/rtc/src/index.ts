@@ -76,6 +76,9 @@ type PeerEntry = {
   dataChannel?: RTCDataChannel;
 };
 
+const DEFAULT_MAX_REMOTE_PEERS = 5;
+const MAX_DATA_BUFFER_BYTES = 512 * 1024;
+
 export class MeshWebRTCTransport implements CallTransport {
   private readonly peers = new Map<string, PeerEntry>();
   private readonly localTracks = new Map<string, { track: MediaStreamTrack; stream: MediaStream }>();
@@ -84,7 +87,10 @@ export class MeshWebRTCTransport implements CallTransport {
     private readonly localPeerId: string,
     private readonly iceServers: RTCIceServer[],
     private readonly events: TransportEvents,
-  ) {}
+    private readonly maxRemotePeers = DEFAULT_MAX_REMOTE_PEERS,
+  ) {
+    if (!Number.isInteger(maxRemotePeers) || maxRemotePeers < 1) throw new Error("maxRemotePeers deve ser maior que zero.");
+  }
 
   async connect(peerId: string, initiator: boolean): Promise<void> {
     const entry = this.peers.get(peerId) ?? this.createPeer(peerId);
@@ -142,7 +148,14 @@ export class MeshWebRTCTransport implements CallTransport {
     let sent = 0;
     for (const [peerId, entry] of this.peers) {
       if (targetPeerId && peerId !== targetPeerId) continue;
-      if (entry.dataChannel?.readyState === "open") { entry.dataChannel.send(data); sent += 1; }
+      const channel = entry.dataChannel;
+      if (channel?.readyState !== "open") continue;
+      if (channel.bufferedAmount > MAX_DATA_BUFFER_BYTES) {
+        logger.warn("DataChannel congestionado; mensagem não enviada", { peerId, bufferedAmount: channel.bufferedAmount });
+        continue;
+      }
+      channel.send(data);
+      sent += 1;
     }
     return sent;
   }
@@ -183,6 +196,9 @@ export class MeshWebRTCTransport implements CallTransport {
   private createPeer(peerId: string): PeerEntry {
     const existing = this.peers.get(peerId);
     if (existing) return existing;
+    if (this.peers.size >= this.maxRemotePeers) {
+      throw new Error(`Sala cheia: este cliente aceita no máximo ${this.maxRemotePeers + 1} participantes no Mesh.`);
+    }
     const pc = new RTCPeerConnection({ iceServers: this.iceServers });
     const entry: PeerEntry = { pc, canNegotiate: false, makingOffer: false, ignoreOffer: false, settingRemoteAnswer: false, pendingIceCandidates: [] };
     this.peers.set(peerId, entry);

@@ -39,6 +39,7 @@ class FakePeerConnection {
 
 class FakeDataChannel {
   readyState: RTCDataChannelState = "connecting";
+  bufferedAmount = 0;
   sent: string[] = [];
   onopen: (() => void) | null = null;
   onclose: (() => void) | null = null;
@@ -79,6 +80,8 @@ describe("MeshWebRTCTransport", () => {
     }
     expect(FakePeerConnection.instances).toHaveLength(5);
     expect(transport.getDiagnostics()).toHaveLength(5);
+    await expect(transport.connect("00000000-0000-4000-8000-000000000007", false)).rejects.toThrow("Sala cheia");
+    expect(transport.getDiagnostics()).toHaveLength(5);
     await transport.disconnect();
   });
 
@@ -106,6 +109,17 @@ describe("MeshWebRTCTransport", () => {
     expect(callbacks.onDataMessage).toHaveBeenCalledWith("00000000-0000-4000-8000-000000000002", "mensagem recebida");
     await transport.disconnect();
     expect(channel.readyState).toBe("closed");
+  });
+
+  it("não envia em DataChannel congestionado", async () => {
+    const callbacks = { ...events(), onDataMessage: vi.fn(), onDataState: vi.fn() };
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
+    await transport.connect("00000000-0000-4000-8000-000000000002", true);
+    const channel = FakePeerConnection.dataChannels[0]!;
+    channel.open();
+    channel.bufferedAmount = 600 * 1024;
+    expect(transport.sendData("mensagem")).toBe(0);
+    expect(channel.sent).toHaveLength(0);
   });
 });
 

@@ -1,3 +1,5 @@
+mod p2p;
+
 use anyhow::Context;
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -22,6 +24,7 @@ use sqlx::{
     SqlitePool,
 };
 use std::{env, path::PathBuf, time::Duration};
+use tokio::io::AsyncReadExt;
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 use uuid::Uuid;
 
@@ -171,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/channels/{id}/messages", get(list_messages).post(create_message))
         .route("/rooms", post(create_room))
         .route("/rtc/credentials", get(rtc_credentials))
+        .merge(p2p::router())
         .route_layer(middleware::from_fn_with_state(state.clone(), local_token_guard));
 
     let web_origin = env::var("RISK_WEB_ORIGIN").unwrap_or_else(|_| "http://localhost:5173".into());
@@ -201,7 +205,19 @@ async fn main() -> anyhow::Result<()> {
     use std::io::Write;
     std::io::stdout().flush()?;
     tracing::info!(%address, database = %db_path.display(), "desktop backend ready");
-    axum::serve(listener, app).await?;
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let mut input = tokio::io::stdin();
+        let mut buffer = Vec::new();
+        let _ = input.read_to_end(&mut buffer).await;
+        let _ = shutdown_tx.send(());
+    });
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.await;
+        })
+        .await?;
     Ok(())
 }
 

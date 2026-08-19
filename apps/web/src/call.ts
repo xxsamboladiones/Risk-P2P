@@ -12,7 +12,6 @@ export type CallDiagnostics = {
   peerConnections: PeerConnectionDiagnostics[];
 };
 
-type DisplayAudioConstraints = MediaTrackConstraints & { restrictOwnAudio?: boolean };
 type DisplayAudioSettings = MediaTrackSettings & { restrictOwnAudio?: boolean };
 
 export function reconcileRemoteMediaState(
@@ -227,10 +226,9 @@ export class CallController {
     if (this.screenStream) { await this.stopScreen(); return; }
     const lifecycle = this.lifecycleId;
     try {
-      // Atualiza a preferência imediatamente antes do getDisplayMedia(). O provider
-      // lê essa configuração de captura para incluir restrictOwnAudio na solicitação
-      // inicial, que é o único momento em que o Electron pode escolher o backend
-      // loopbackWithoutChrome no Windows.
+      // Sincroniza a preferência antes da captura. No desktop Windows a exclusão
+      // principal é feita nativamente pelo device loopbackWithoutChrome; em um
+      // navegador comum o provider ainda usa restrictOwnAudio quando disponível.
       const voiceSettings = loadVoiceVideoSettings();
       const stream = await this.screen.startScreenShare();
       const videoTrack = stream.getVideoTracks()[0];
@@ -241,17 +239,20 @@ export class CallController {
 
       const screenAudioTrack = stream.getAudioTracks()[0];
       if (screenAudioTrack && voiceSettings.excludeRiskAudioFromScreenShare) {
-        try {
-          await screenAudioTrack.applyConstraints({ restrictOwnAudio: true } as DisplayAudioConstraints);
-          const settings = screenAudioTrack.getSettings() as DisplayAudioSettings;
-          if (settings.restrictOwnAudio === false) {
-            console.warn("O sistema não conseguiu aplicar restrictOwnAudio ao compartilhamento.");
-          }
-        } catch (error) {
-          // Mantemos o compartilhamento funcionando mesmo em navegadores/SOs que
-          // ainda não implementam essa constraint. Electron 43/Chromium 150 é o
-          // caminho principal em que esperamos que ela esteja disponível.
-          console.warn("restrictOwnAudio indisponível nesta captura; mantendo áudio de sistema padrão.", error);
+        const settings = screenAudioTrack.getSettings() as DisplayAudioSettings;
+        const nativeRiskExclusion = settings.deviceId === "loopbackWithoutChrome";
+        const browserRiskExclusion = settings.restrictOwnAudio === true;
+        if (nativeRiskExclusion || browserRiskExclusion) {
+          console.info("Risk screen audio exclusion active", {
+            deviceId: settings.deviceId ?? "unknown",
+            restrictOwnAudio: settings.restrictOwnAudio ?? false,
+            mode: nativeRiskExclusion ? "native-process-loopback" : "restrictOwnAudio",
+          });
+        } else {
+          console.warn("A captura de tela não confirmou a exclusão do áudio do Risk.", {
+            deviceId: settings.deviceId ?? "unknown",
+            restrictOwnAudio: settings.restrictOwnAudio ?? false,
+          });
         }
       }
 

@@ -6,5 +6,6 @@ target/
 .env
 *.log
 coverage/
+*.tsbuildinfo
 release/
 .DS_Store

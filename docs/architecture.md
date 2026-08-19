@@ -1,19 +1,37 @@
 # Arquitetura e operação
 
-O servidor nunca retransmite mídia: ele autentica, autoriza a entrada e encaminha SDP/ICE somente entre peers que constam na mesma sala. O transporte atual é mesh e tem limite de seis pessoas; acima disso, uma implementação de `CallTransport` baseada em SFU deverá substituir `MeshWebRTCTransport`.
+O backend Rust continua responsável pelos dados duráveis do produto: contas, amizades, grupos, canais, mensagens e emissão de credenciais TURN temporárias. Ele não participa mais do signaling de chamadas.
 
-Tokens TURN são gerados por usuário com validade de uma hora e assinatura HMAC-SHA1 compatível com o mecanismo de segredo compartilhado do coturn. Credenciais permanentes não chegam ao cliente.
+```text
+React / Electron ── HTTP ── Axum ── PostgreSQL (dados duráveis do app)
+       │
+       ├── Supabase Realtime (Broadcast + Presence efêmeros)
+       │          offer / answer / ICE / estado pequeno
+       │
+       └════════ WebRTC Mesh P2P ════════ outros peers
+                    áudio / vídeo / tela
+                              │
+                         STUN / TURN
+```
 
-## Segurança
+O Supabase não recebe mídia e não contém tabelas do Risk. Broadcast não persiste SDP/ICE; Presence desaparece quando o canal é encerrado. TURN continua separado e só retransmite mídia quando a conectividade direta não é possível.
 
-O backend limita cada mensagem/corpo a 64 KiB, ignora IDs de origem enviados pelo cliente e deriva `fromPeerId` da conexão autenticada. Produção deve acrescentar rate limiting distribuído no Redis, restrição de CORS, TLS no proxy e refresh token em cookie `HttpOnly`, `Secure`, `SameSite=Strict`.
+O chat conectado usa o mesmo `SignalingProvider` para negociar um `RTCDataChannel`. O conteúdo das mensagens nunca passa pelo Supabase: é enviado diretamente no Mesh e salvo somente no IndexedDB de cada participante. Sem peers online, não há entrega remota.
 
-No Electron, `contextIsolation`, sandbox e `nodeIntegration: false` estão ativos. O preload expõe somente a listagem serializada de fontes de tela.
+## Limites e segurança
 
-## Linux
+O Mesh mantém no máximo uma `RTCPeerConnection` por peer e é indicado para aproximadamente seis participantes. Cada entrada gera um UUID efêmero. A sala é transformada em SHA-256 antes de virar tópico Realtime. Mensagens têm validação estrutural, limite de 64 KiB, expiração, deduplicação e rate limit local.
 
-Electron/Chromium usa PipeWire e xdg-desktop-portal em Wayland e o capturador do Chromium em X11. A disponibilidade de áudio do sistema varia por portal, compositor e versão do Chromium; falha de áudio não deve interromper a track de vídeo. Valide GNOME, KDE e um compositor wlroots no pipeline de release.
+Somente `VITE_SUPABASE_URL` e a chave pública `VITE_SUPABASE_ANON_KEY` chegam ao renderer. Nunca exponha `service_role`, secret key, senha do banco, JWT do backend ou credenciais TURN permanentes.
+
+O cliente não chama `.from()`, Supabase Storage ou Edge Functions. O SDK é configurado sem sessão Supabase persistente e é utilizado apenas para Realtime.
+
+## Diagnóstico
+
+`CallController.getDiagnostics()` retorna status do signaling, status do canal, peer/sala derivados, peers de Presence, quantidade de mensagens processadas e, para cada conexão, `connectionState`, `iceConnectionState`, `signalingState` e fila de ICE. Conteúdo de SDP, candidatos e credenciais não é incluído.
+
+Use `VITE_DEBUG_SIGNALING=true` somente em desenvolvimento para eventos resumidos. Mesmo nesse modo, SDP, ICE, chaves e tokens não são registrados.
 
 ## TURN em produção
 
-Defina `external-ip`, um realm público, TLS e faixa de relay no coturn; publique 3478 UDP/TCP, 5349 TLS e a faixa UDP configurada. Teste relay forçado com `iceTransportPolicy: "relay"` numa build diagnóstica antes de cada release.
+Defina `external-ip`, realm público, TLS e faixa de relay no coturn; publique 3478 UDP/TCP, 5349 TLS e a faixa UDP configurada. As credenciais entregues ao cliente são temporárias e assinadas pelo backend.

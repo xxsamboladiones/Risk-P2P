@@ -1,33 +1,31 @@
 use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    password_hash::{
+        rand_core::{OsRng, RngCore},
+        PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+    },
     Argon2,
 };
 use axum::{
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
-    },
-    http::{header, HeaderMap, StatusCode},
+    extract::{Path, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
-use chrono::{Duration, Utc};
-use futures_util::{SinkExt, StreamExt};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
+use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::Sha1;
+use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool};
-use std::{collections::HashMap, env, sync::Arc};
-use tokio::sync::{mpsc, RwLock};
-use tower_http::{
-    cors::{Any, CorsLayer},
-    limit::RequestBodyLimitLayer,
-    trace::TraceLayer,
-};
+use std::env;
+use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -36,25 +34,20 @@ struct Config {
     turn_host: String,
     turn_port: u16,
     turn_secret: String,
+    refresh_days: i64,
+    cookie_secure: bool,
 }
 #[derive(Clone)]
 struct AppState {
     db: PgPool,
     config: Config,
-    peers: Arc<RwLock<HashMap<Uuid, Peer>>>,
-}
-#[derive(Clone)]
-struct Peer {
-    name: String,
-    room: Option<Uuid>,
-    state: Value,
-    tx: mpsc::UnboundedSender<Message>,
 }
 #[derive(Serialize, Deserialize)]
 struct Claims {
     sub: Uuid,
     exp: usize,
     kind: String,
+    jti: Uuid,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,11 +65,40 @@ struct Login {
 struct NewRoom {
     name: String,
 }
+#[derive(Deserialize)]
+struct FriendRequestInput {
+    email: String,
+}
+#[derive(Deserialize)]
+struct NewCommunity {
+    name: String,
+}
+#[derive(Deserialize)]
+struct NewChannel {
+    name: String,
+    kind: String,
+}
+#[derive(Deserialize)]
+struct NewMessage {
+    content: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NewMember {
+    user_id: Uuid,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NewCommunityInvite {
+    email: Option<String>,
+    create_link: Option<bool>,
+}
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TokenResponse {
     access_token: String,
 }
+type AuthResponse = (HeaderMap, Json<TokenResponse>);
 #[derive(Debug, thiserror::Error)]
 enum ApiError {
     #[error("{0}")]
@@ -121,22 +143,55 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3478),
             turn_secret: env::var("TURN_SECRET")?,
+            refresh_days: env::var("REFRESH_TOKEN_TTL_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+            cookie_secure: env::var("COOKIE_SECURE")
+                .map(|v| v == "true")
+                .unwrap_or(false),
         },
-        peers: Default::default(),
     };
     let app = Router::new()
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
         .route("/auth/register", post(register))
         .route("/auth/login", post(login))
+        .route("/auth/refresh", post(refresh))
+        .route("/auth/logout", post(logout))
+        .route("/me", get(me))
+        .route("/friends", get(list_friends))
+        .route("/friends/requests", post(send_friend_request))
+        .route("/friends/requests/{id}/accept", post(accept_friend_request))
+        .route("/communities", get(list_communities).post(create_community))
+        .route(
+            "/communities/{id}/channels",
+            get(list_channels).post(create_channel),
+        )
+        .route("/communities/{id}/members", post(add_community_member))
+        .route("/communities/{id}/invites", post(create_community_invite))
+        .route("/community-invites", get(list_community_invites))
+        .route(
+            "/community-invites/{id}/accept",
+            post(accept_community_invite),
+        )
+        .route("/invites/{token}/accept", post(accept_invite_link))
+        .route(
+            "/channels/{id}/messages",
+            get(list_messages).post(create_message),
+        )
         .route("/rooms", post(create_room))
         .route("/rtc/credentials", get(turn_credentials))
-        .route("/ws", get(ws_upgrade))
         .layer(RequestBodyLimitLayer::new(64 * 1024))
         .layer(
             CorsLayer::new()
-                .allow_origin(Any)
+                .allow_origin(
+                    env::var("WEB_ORIGIN")
+                        .unwrap_or_else(|_| "http://localhost:5173".into())
+                        .parse::<HeaderValue>()?,
+                )
                 .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
-                .allow_methods(Any),
+                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_credentials(true),
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -149,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
 async fn register(
     State(s): State<AppState>,
     Json(i): Json<Register>,
-) -> Result<Json<TokenResponse>, ApiError> {
+) -> Result<AuthResponse, ApiError> {
     if i.password.len() < 8 || i.display_name.trim().len() < 2 {
         return Err(ApiError::Bad("Nome ou senha inválidos".into()));
     }
@@ -173,14 +228,9 @@ async fn register(
             ApiError::Internal(e.into())
         }
     })?;
-    Ok(Json(TokenResponse {
-        access_token: issue(&s.config, id)?,
-    }))
+    create_session(&s, id).await
 }
-async fn login(
-    State(s): State<AppState>,
-    Json(i): Json<Login>,
-) -> Result<Json<TokenResponse>, ApiError> {
+async fn login(State(s): State<AppState>, Json(i): Json<Login>) -> Result<AuthResponse, ApiError> {
     let row = sqlx::query_as::<_, (Uuid, String)>(
         "SELECT id,password_hash FROM users WHERE email=lower($1)",
     )
@@ -195,9 +245,124 @@ async fn login(
             &PasswordHash::new(&row.1).map_err(|_| ApiError::Unauthorized)?,
         )
         .map_err(|_| ApiError::Unauthorized)?;
-    Ok(Json(TokenResponse {
-        access_token: issue(&s.config, row.0)?,
-    }))
+    create_session(&s, row.0).await
+}
+async fn create_session(s: &AppState, user_id: Uuid) -> Result<AuthResponse, ApiError> {
+    let (token, hash, expires) = new_refresh(&s.config);
+    sqlx::query("INSERT INTO sessions(user_id,refresh_token_hash,expires_at)VALUES($1,$2,$3)")
+        .bind(user_id)
+        .bind(hash)
+        .bind(expires)
+        .execute(&s.db)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    auth_response(&s.config, user_id, token)
+}
+async fn refresh(State(s): State<AppState>, headers: HeaderMap) -> Result<AuthResponse, ApiError> {
+    let token = cookie(&headers, "refresh_token").ok_or(ApiError::Unauthorized)?;
+    let hash = token_hash(&token);
+    let mut tx =
+        s.db.begin()
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
+    let session = sqlx::query_as::<_, (Uuid, Uuid, DateTime<Utc>, Option<DateTime<Utc>>)>("SELECT id,user_id,expires_at,revoked_at FROM sessions WHERE refresh_token_hash=$1 FOR UPDATE")
+        .bind(hash).fetch_optional(&mut *tx).await.map_err(|e| ApiError::Internal(e.into()))?
+        .ok_or(ApiError::Unauthorized)?;
+    if session.3.is_some() || session.2 <= Utc::now() {
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
+        return Err(ApiError::Unauthorized);
+    }
+    sqlx::query("UPDATE sessions SET revoked_at=now() WHERE id=$1")
+        .bind(session.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    let (new_token, new_hash, expires) = new_refresh(&s.config);
+    sqlx::query("INSERT INTO sessions(user_id,refresh_token_hash,expires_at)VALUES($1,$2,$3)")
+        .bind(session.1)
+        .bind(new_hash)
+        .bind(expires)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    auth_response(&s.config, session.1, new_token)
+}
+async fn logout(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(HeaderMap, Json<Value>), ApiError> {
+    if let Some(token) = cookie(&headers, "refresh_token") {
+        sqlx::query("UPDATE sessions SET revoked_at=now() WHERE refresh_token_hash=$1 AND revoked_at IS NULL").bind(token_hash(&token)).execute(&s.db).await.map_err(|e| ApiError::Internal(e.into()))?;
+    }
+    let mut response = HeaderMap::new();
+    response.insert(
+        header::SET_COOKIE,
+        HeaderValue::from_static("refresh_token=; Path=/auth; HttpOnly; SameSite=Lax; Max-Age=0"),
+    );
+    Ok((response, Json(json!({"ok":true}))))
+}
+async fn me(State(s): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+    let user = bearer(&headers, &s.config)?;
+    let row = sqlx::query_as::<_, (Uuid, String, String)>(
+        "SELECT id,display_name,email FROM users WHERE id=$1",
+    )
+    .bind(user)
+    .fetch_optional(&s.db)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?
+    .ok_or(ApiError::Unauthorized)?;
+    Ok(Json(json!({"id":row.0,"displayName":row.1,"email":row.2})))
+}
+fn new_refresh(config: &Config) -> (String, String, DateTime<Utc>) {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let token = URL_SAFE_NO_PAD.encode(bytes);
+    let hash = token_hash(&token);
+    (
+        token,
+        hash,
+        Utc::now() + Duration::days(config.refresh_days),
+    )
+}
+fn token_hash(token: &str) -> String {
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
+fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|item| item.trim().split_once('='))
+        .find_map(|(key, value)| (key == name).then(|| value.to_owned()))
+}
+fn auth_response(
+    config: &Config,
+    user_id: Uuid,
+    refresh_token: String,
+) -> Result<AuthResponse, ApiError> {
+    let secure = if config.cookie_secure { "; Secure" } else { "" };
+    let cookie = format!(
+        "refresh_token={refresh_token}; Path=/auth; HttpOnly; SameSite=Lax; Max-Age={}{}",
+        config.refresh_days * 86_400,
+        secure
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).map_err(|e| ApiError::Internal(e.into()))?,
+    );
+    Ok((
+        headers,
+        Json(TokenResponse {
+            access_token: issue(config, user_id)?,
+        }),
+    ))
 }
 fn issue(c: &Config, id: Uuid) -> Result<String, ApiError> {
     encode(
@@ -206,6 +371,7 @@ fn issue(c: &Config, id: Uuid) -> Result<String, ApiError> {
             sub: id,
             exp: (Utc::now() + Duration::minutes(15)).timestamp() as usize,
             kind: "access".into(),
+            jti: Uuid::new_v4(),
         },
         &EncodingKey::from_secret(c.jwt.as_bytes()),
     )
@@ -225,6 +391,370 @@ fn bearer(h: &HeaderMap, c: &Config) -> Result<Uuid, ApiError> {
     .map_err(|_| ApiError::Unauthorized)?
     .claims
     .sub)
+}
+async fn list_friends(State(s): State<AppState>, h: HeaderMap) -> Result<Json<Value>, ApiError> {
+    let user = bearer(&h, &s.config)?;
+    let friends = sqlx::query_as::<_, (Uuid, String)>("SELECT u.id,u.display_name FROM friendships f JOIN users u ON u.id=CASE WHEN f.user_a=$1 THEN f.user_b ELSE f.user_a END WHERE f.user_a=$1 OR f.user_b=$1 ORDER BY lower(u.display_name)").bind(user).fetch_all(&s.db).await.map_err(|e| ApiError::Internal(e.into()))?;
+    let pending = sqlx::query_as::<_, (Uuid, Uuid, String)>("SELECT r.id,u.id,u.display_name FROM friend_requests r JOIN users u ON u.id=r.sender_id WHERE r.recipient_id=$1 AND r.status='pending' ORDER BY r.created_at DESC").bind(user).fetch_all(&s.db).await.map_err(|e| ApiError::Internal(e.into()))?;
+    Ok(Json(
+        json!({"friends":friends.into_iter().map(|(id,display_name)|json!({"id":id,"displayName":display_name})).collect::<Vec<_>>(),"pending":pending.into_iter().map(|(request_id,id,display_name)|json!({"requestId":request_id,"id":id,"displayName":display_name})).collect::<Vec<_>>()}),
+    ))
+}
+async fn send_friend_request(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Json(i): Json<FriendRequestInput>,
+) -> Result<Json<Value>, ApiError> {
+    let user = bearer(&h, &s.config)?;
+    let recipient = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email=lower($1)")
+        .bind(i.email.trim())
+        .fetch_optional(&s.db)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?
+        .ok_or_else(|| ApiError::Bad("Usuário não encontrado".into()))?;
+    if recipient == user {
+        return Err(ApiError::Bad("Você não pode adicionar a si mesmo".into()));
+    }
+    let already = sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM friendships WHERE (user_a=LEAST($1,$2) AND user_b=GREATEST($1,$2)))").bind(user).bind(recipient).fetch_one(&s.db).await.map_err(|e|ApiError::Internal(e.into()))?;
+    if already {
+        return Err(ApiError::Conflict("Vocês já são amigos".into()));
+    }
+    sqlx::query("INSERT INTO friend_requests(sender_id,recipient_id)VALUES($1,$2) ON CONFLICT(sender_id,recipient_id) DO UPDATE SET status='pending',created_at=now()").bind(user).bind(recipient).execute(&s.db).await.map_err(|e|ApiError::Internal(e.into()))?;
+    Ok(Json(json!({"ok":true})))
+}
+async fn accept_friend_request(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let user = bearer(&h, &s.config)?;
+    let mut tx =
+        s.db.begin()
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
+    let sender=sqlx::query_scalar::<_,Uuid>("UPDATE friend_requests SET status='accepted' WHERE id=$1 AND recipient_id=$2 AND status='pending' RETURNING sender_id").bind(id).bind(user).fetch_optional(&mut *tx).await.map_err(|e|ApiError::Internal(e.into()))?.ok_or(ApiError::Unauthorized)?;
+    sqlx::query("INSERT INTO friendships(user_a,user_b)VALUES(LEAST($1,$2),GREATEST($1,$2)) ON CONFLICT DO NOTHING").bind(user).bind(sender).execute(&mut *tx).await.map_err(|e|ApiError::Internal(e.into()))?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    Ok(Json(json!({"ok":true})))
+}
+async fn list_communities(
+    State(s): State<AppState>,
+    h: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let user = bearer(&h, &s.config)?;
+    let rows=sqlx::query_as::<_,(Uuid,String)>("SELECT c.id,c.name FROM communities c JOIN community_members m ON m.community_id=c.id WHERE m.user_id=$1 ORDER BY c.created_at").bind(user).fetch_all(&s.db).await.map_err(|e|ApiError::Internal(e.into()))?;
+    Ok(Json(json!(rows
+        .into_iter()
+        .map(|(id, name)| json!({"id":id,"name":name}))
+        .collect::<Vec<_>>())))
+}
+async fn create_community(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Json(i): Json<NewCommunity>,
+) -> Result<Json<Value>, ApiError> {
+    let user = bearer(&h, &s.config)?;
+    if i.name.trim().len() < 2 {
+        return Err(ApiError::Bad("Nome do grupo muito curto".into()));
+    }
+    let mut tx =
+        s.db.begin()
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
+    let id = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO communities(name,owner_id)VALUES($1,$2)RETURNING id",
+    )
+    .bind(i.name.trim())
+    .bind(user)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    sqlx::query("INSERT INTO community_members(community_id,user_id)VALUES($1,$2)")
+        .bind(id)
+        .bind(user)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    sqlx::query("INSERT INTO channels(community_id,name,kind,position)VALUES($1,'geral','text',0)")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    let room = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO rooms(name,owner_id)VALUES('Geral',$1)RETURNING id",
+    )
+    .bind(user)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    sqlx::query("INSERT INTO channels(community_id,name,kind,voice_room_id,position)VALUES($1,'Geral','voice',$2,1)").bind(id).bind(room).execute(&mut *tx).await.map_err(|e|ApiError::Internal(e.into()))?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    Ok(Json(json!({"id":id,"name":i.name.trim()})))
+}
+async fn add_community_member(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(i): Json<NewMember>,
+) -> Result<Json<Value>, ApiError> {
+    let user = bearer(&h, &s.config)?;
+    let owner = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM communities WHERE id=$1 AND owner_id=$2)",
+    )
+    .bind(id)
+    .bind(user)
+    .fetch_one(&s.db)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    if !owner {
+        return Err(ApiError::Unauthorized);
+    }
+    let friend=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM friendships WHERE user_a=LEAST($1,$2) AND user_b=GREATEST($1,$2))").bind(user).bind(i.user_id).fetch_one(&s.db).await.map_err(|e|ApiError::Internal(e.into()))?;
+    if !friend {
+        return Err(ApiError::Bad(
+            "Adicione essa pessoa como amiga primeiro".into(),
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO community_members(community_id,user_id)VALUES($1,$2)ON CONFLICT DO NOTHING",
+    )
+    .bind(id)
+    .bind(i.user_id)
+    .execute(&s.db)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    Ok(Json(json!({"ok":true})))
+}
+
+async fn create_community_invite(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(i): Json<NewCommunityInvite>,
+) -> Result<Json<Value>, ApiError> {
+    let user = bearer(&h, &s.config)?;
+    let allowed = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM community_members WHERE community_id=$1 AND user_id=$2)",
+    )
+    .bind(id)
+    .bind(user)
+    .fetch_one(&s.db)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    if !allowed {
+        return Err(ApiError::Unauthorized);
+    }
+    if i.create_link.unwrap_or(false) {
+        let mut bytes = [0_u8; 24];
+        OsRng.fill_bytes(&mut bytes);
+        let token = URL_SAFE_NO_PAD.encode(bytes);
+        sqlx::query("INSERT INTO community_invites(community_id,inviter_id,token_hash,max_uses) VALUES($1,$2,$3,100)")
+            .bind(id).bind(user).bind(token_hash(&token)).execute(&s.db).await
+            .map_err(|e| ApiError::Internal(e.into()))?;
+        return Ok(Json(json!({"token":token,"expiresInDays":7})));
+    }
+    let email = i.email.as_deref().unwrap_or("").trim();
+    let recipient = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email=lower($1)")
+        .bind(email)
+        .fetch_optional(&s.db)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?
+        .ok_or_else(|| ApiError::Bad("Usuário não encontrado".into()))?;
+    if recipient == user {
+        return Err(ApiError::Bad("Você já está no grupo".into()));
+    }
+    let member = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM community_members WHERE community_id=$1 AND user_id=$2)",
+    )
+    .bind(id)
+    .bind(recipient)
+    .fetch_one(&s.db)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    if member {
+        return Err(ApiError::Conflict("Essa pessoa já está no grupo".into()));
+    }
+    sqlx::query(
+        "INSERT INTO community_invites(community_id,inviter_id,recipient_id) VALUES($1,$2,$3)",
+    )
+    .bind(id)
+    .bind(user)
+    .bind(recipient)
+    .execute(&s.db)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    Ok(Json(json!({"ok":true})))
+}
+
+async fn list_community_invites(
+    State(s): State<AppState>,
+    h: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let user = bearer(&h, &s.config)?;
+    let rows = sqlx::query_as::<_, (Uuid, Uuid, String, String)>("SELECT i.id,c.id,c.name,u.display_name FROM community_invites i JOIN communities c ON c.id=i.community_id JOIN users u ON u.id=i.inviter_id WHERE i.recipient_id=$1 AND i.status='pending' AND i.expires_at>now() ORDER BY i.created_at DESC")
+        .bind(user).fetch_all(&s.db).await.map_err(|e| ApiError::Internal(e.into()))?;
+    Ok(Json(json!(rows.into_iter().map(|(id,community_id,community_name,inviter)|json!({"id":id,"communityId":community_id,"communityName":community_name,"inviter":inviter})).collect::<Vec<_>>())))
+}
+
+async fn accept_community_invite(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let user = bearer(&h, &s.config)?;
+    let mut tx =
+        s.db.begin()
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
+    let community = sqlx::query_scalar::<_, Uuid>("UPDATE community_invites SET status='accepted',uses=uses+1 WHERE id=$1 AND recipient_id=$2 AND status='pending' AND expires_at>now() RETURNING community_id")
+        .bind(id).bind(user).fetch_optional(&mut *tx).await.map_err(|e| ApiError::Internal(e.into()))?.ok_or(ApiError::Unauthorized)?;
+    sqlx::query(
+        "INSERT INTO community_members(community_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
+    )
+    .bind(community)
+    .bind(user)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    Ok(Json(json!({"communityId":community})))
+}
+
+async fn accept_invite_link(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(token): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let user = bearer(&h, &s.config)?;
+    let mut tx =
+        s.db.begin()
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
+    let community = sqlx::query_scalar::<_, Uuid>("UPDATE community_invites SET uses=uses+1,status=CASE WHEN uses+1>=max_uses THEN 'accepted' ELSE status END WHERE token_hash=$1 AND status='pending' AND expires_at>now() AND uses<max_uses RETURNING community_id")
+        .bind(token_hash(&token)).fetch_optional(&mut *tx).await.map_err(|e| ApiError::Internal(e.into()))?.ok_or_else(|| ApiError::Bad("Convite inválido ou expirado".into()))?;
+    sqlx::query(
+        "INSERT INTO community_members(community_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
+    )
+    .bind(community)
+    .bind(user)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    Ok(Json(json!({"communityId":community})))
+}
+async fn require_member(db: &PgPool, community: Uuid, user: Uuid) -> Result<(), ApiError> {
+    let ok = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM community_members WHERE community_id=$1 AND user_id=$2)",
+    )
+    .bind(community)
+    .bind(user)
+    .fetch_one(db)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?;
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized)
+    }
+}
+async fn list_channels(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let user = bearer(&h, &s.config)?;
+    require_member(&s.db, id, user).await?;
+    let rows=sqlx::query_as::<_,(Uuid,String,String,Option<Uuid>)>("SELECT id,name,kind,voice_room_id FROM channels WHERE community_id=$1 ORDER BY position,created_at").bind(id).fetch_all(&s.db).await.map_err(|e|ApiError::Internal(e.into()))?;
+    Ok(Json(json!(rows.into_iter().map(|(id,name,kind,voice_room_id)|json!({"id":id,"name":name,"kind":kind,"voiceRoomId":voice_room_id})).collect::<Vec<_>>())))
+}
+async fn create_channel(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(i): Json<NewChannel>,
+) -> Result<Json<Value>, ApiError> {
+    let user = bearer(&h, &s.config)?;
+    require_member(&s.db, id, user).await?;
+    if !matches!(i.kind.as_str(), "text" | "voice") {
+        return Err(ApiError::Bad("Tipo de canal inválido".into()));
+    }
+    let mut tx =
+        s.db.begin()
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
+    let voice_room = if i.kind == "voice" {
+        Some(
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO rooms(name,owner_id)VALUES($1,$2)RETURNING id",
+            )
+            .bind(i.name.trim())
+            .bind(user)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?,
+        )
+    } else {
+        None
+    };
+    let channel=sqlx::query_as::<_,(Uuid,String,String,Option<Uuid>)>("INSERT INTO channels(community_id,name,kind,voice_room_id,position)VALUES($1,$2,$3,$4,(SELECT COALESCE(max(position),-1)+1 FROM channels WHERE community_id=$1))RETURNING id,name,kind,voice_room_id").bind(id).bind(i.name.trim()).bind(&i.kind).bind(voice_room).fetch_one(&mut *tx).await.map_err(|e|ApiError::Internal(e.into()))?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+    Ok(Json(
+        json!({"id":channel.0,"name":channel.1,"kind":channel.2,"voiceRoomId":channel.3}),
+    ))
+}
+async fn list_messages(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let user = bearer(&h, &s.config)?;
+    let community = sqlx::query_scalar::<_, Uuid>(
+        "SELECT community_id FROM channels WHERE id=$1 AND kind='text'",
+    )
+    .bind(id)
+    .fetch_optional(&s.db)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?
+    .ok_or_else(|| ApiError::Bad("Canal não encontrado".into()))?;
+    require_member(&s.db, community, user).await?;
+    let rows=sqlx::query_as::<_,(Uuid,String,String,DateTime<Utc>)>("SELECT m.id,u.display_name,m.content,m.created_at FROM messages m JOIN users u ON u.id=m.author_id WHERE m.channel_id=$1 ORDER BY m.created_at DESC LIMIT 100").bind(id).fetch_all(&s.db).await.map_err(|e|ApiError::Internal(e.into()))?;
+    Ok(Json(json!(rows.into_iter().rev().map(|(id,author,content,created_at)|json!({"id":id,"author":author,"content":content,"createdAt":created_at})).collect::<Vec<_>>())))
+}
+async fn create_message(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(i): Json<NewMessage>,
+) -> Result<Json<Value>, ApiError> {
+    let user = bearer(&h, &s.config)?;
+    let community = sqlx::query_scalar::<_, Uuid>(
+        "SELECT community_id FROM channels WHERE id=$1 AND kind='text'",
+    )
+    .bind(id)
+    .fetch_optional(&s.db)
+    .await
+    .map_err(|e| ApiError::Internal(e.into()))?
+    .ok_or_else(|| ApiError::Bad("Canal não encontrado".into()))?;
+    require_member(&s.db, community, user).await?;
+    let content = i.content.trim();
+    if content.is_empty() || content.len() > 4000 {
+        return Err(ApiError::Bad("Mensagem inválida".into()));
+    }
+    let row=sqlx::query_as::<_,(Uuid,String,DateTime<Utc>)>("WITH inserted AS (INSERT INTO messages(channel_id,author_id,content)VALUES($1,$2,$3)RETURNING id,created_at) SELECT inserted.id,u.display_name,inserted.created_at FROM inserted JOIN users u ON u.id=$2").bind(id).bind(user).bind(content).fetch_one(&s.db).await.map_err(|e|ApiError::Internal(e.into()))?;
+    Ok(Json(
+        json!({"id":row.0,"author":row.1,"content":content,"createdAt":row.2}),
+    ))
 }
 async fn create_room(
     State(s): State<AppState>,
@@ -254,190 +784,4 @@ async fn turn_credentials(
     Ok(Json(
         json!({"iceServers":[{"urls":[format!("stun:{}:{}",s.config.turn_host,s.config.turn_port)]},{"urls":[format!("turn:{}:{}?transport=udp",s.config.turn_host,s.config.turn_port),format!("turn:{}:{}?transport=tcp",s.config.turn_host,s.config.turn_port)],"username":username,"credential":credential}]}),
     ))
-}
-
-async fn ws_upgrade(ws: WebSocketUpgrade, State(s): State<AppState>) -> impl IntoResponse {
-    ws.max_message_size(64 * 1024)
-        .on_upgrade(move |socket| websocket(socket, s))
-}
-async fn websocket(socket: WebSocket, s: AppState) {
-    let id = Uuid::new_v4();
-    let (mut sink, mut stream) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let writer = tokio::spawn(async move {
-        while let Some(m) = rx.recv().await {
-            if sink.send(m).await.is_err() {
-                break;
-            }
-        }
-    });
-    let mut authed = false;
-    while let Some(Ok(Message::Text(text))) = stream.next().await {
-        let Ok(v) = serde_json::from_str::<Value>(&text) else {
-            send_error(&tx, "invalid-json", "Mensagem inválida");
-            continue;
-        };
-        let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
-        if kind == "authenticate" {
-            let Some(token) = v.get("token").and_then(Value::as_str) else {
-                continue;
-            };
-            if let Ok(data) = decode::<Claims>(
-                token,
-                &DecodingKey::from_secret(s.config.jwt.as_bytes()),
-                &Validation::default(),
-            ) {
-                if let Ok(name) =
-                    sqlx::query_scalar::<_, String>("SELECT display_name FROM users WHERE id=$1")
-                        .bind(data.claims.sub)
-                        .fetch_one(&s.db)
-                        .await
-                {
-                    s.peers.write().await.insert(
-                        id,
-                        Peer {
-                            name,
-                            room: None,
-                            state: json!({"microphone":true,"camera":false,"screenShare":false}),
-                            tx: tx.clone(),
-                        },
-                    );
-                    authed = true;
-                    let _ = tx.send(msg(
-                        json!({"type":"authenticated","peerId":id,"userId":data.claims.sub}),
-                    ));
-                }
-            } else {
-                send_error(&tx, "unauthorized", "Token inválido")
-            }
-            continue;
-        }
-        if !authed {
-            send_error(&tx, "unauthorized", "Autentique primeiro");
-            continue;
-        }
-        handle(id, v, &s).await
-    }
-    leave(id, &s).await;
-    s.peers.write().await.remove(&id);
-    writer.abort()
-}
-async fn handle(id: Uuid, v: Value, s: &AppState) {
-    let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
-    if kind == "heartbeat" {
-        if let Some(p) = s.peers.read().await.get(&id) {
-            let _ = p.tx.send(msg(json!({"type":"pong"})));
-        }
-        return;
-    }
-    let room = v
-        .get("roomId")
-        .and_then(Value::as_str)
-        .and_then(|x| Uuid::parse_str(x).ok());
-    match kind {
-        "join-room" => {
-            let Some(room) = room else { return };
-            let exists =
-                sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM rooms WHERE id=$1)")
-                    .bind(room)
-                    .fetch_one(&s.db)
-                    .await
-                    .unwrap_or(false);
-            if !exists {
-                return;
-            }
-            let mut peers = s.peers.write().await;
-            let list: Vec<Value> = peers
-                .iter()
-                .filter(|(pid, p)| **pid != id && p.room == Some(room))
-                .map(|(pid, p)| json!({"peerId":pid,"displayName":p.name,"state":p.state.clone()}))
-                .collect();
-            if list.len() >= 5 {
-                if let Some(p) = peers.get(&id) {
-                    send_error(&p.tx, "room-full", "Limite P2P de 6 pessoas atingido")
-                }
-                return;
-            }
-            if let Some(me) = peers.get_mut(&id) {
-                me.room = Some(room);
-                let _ = me.tx.send(msg(
-                    json!({"type":"room-joined","roomId":room,"peers":list}),
-                ));
-            }
-            let name = peers.get(&id).map(|p| p.name.clone()).unwrap_or_default();
-            let state = peers
-                .get(&id)
-                .map(|p| p.state.clone())
-                .unwrap_or_else(|| json!({}));
-            broadcast(
-                &peers,
-                room,
-                Some(id),
-                json!({"type":"peer-joined","roomId":room,"peerId":id,"displayName":name,"state":state}),
-            )
-        }
-        "leave-room" => leave(id, s).await,
-        "offer" | "answer" | "ice-candidate" => {
-            let Some(room) = room else { return };
-            let target = v
-                .get("targetPeerId")
-                .and_then(Value::as_str)
-                .and_then(|x| Uuid::parse_str(x).ok());
-            let peers = s.peers.read().await;
-            if peers.get(&id).and_then(|p| p.room) != Some(room) {
-                return;
-            }
-            if let Some(target) = target.and_then(|x| peers.get(&x)) {
-                if target.room == Some(room) {
-                    let mut out = v;
-                    out["fromPeerId"] = json!(id);
-                    let _ = target.tx.send(msg(out));
-                }
-            }
-        }
-        "peer-state" => {
-            let Some(room) = room else { return };
-            let state = v.get("state").cloned().unwrap_or(json!({}));
-            let mut peers = s.peers.write().await;
-            if peers.get(&id).and_then(|p| p.room) == Some(room) {
-                if let Some(peer) = peers.get_mut(&id) {
-                    peer.state = state.clone();
-                }
-                broadcast(
-                    &peers,
-                    room,
-                    Some(id),
-                    json!({"type":"peer-state","roomId":room,"peerId":id,"state":state}),
-                )
-            }
-        }
-        _ => {}
-    }
-}
-async fn leave(id: Uuid, s: &AppState) {
-    let mut peers = s.peers.write().await;
-    if let Some(room) = peers.get(&id).and_then(|p| p.room) {
-        if let Some(me) = peers.get_mut(&id) {
-            me.room = None
-        }
-        broadcast(
-            &peers,
-            room,
-            Some(id),
-            json!({"type":"peer-left","roomId":room,"peerId":id}),
-        )
-    }
-}
-fn broadcast(peers: &HashMap<Uuid, Peer>, room: Uuid, except: Option<Uuid>, v: Value) {
-    for (id, p) in peers {
-        if Some(*id) != except && p.room == Some(room) {
-            let _ = p.tx.send(msg(v.clone()));
-        }
-    }
-}
-fn msg(v: Value) -> Message {
-    Message::Text(v.to_string().into())
-}
-fn send_error(tx: &mpsc::UnboundedSender<Message>, code: &str, message: &str) {
-    let _ = tx.send(msg(json!({"type":"error","code":code,"message":message})));
 }

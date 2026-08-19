@@ -9,6 +9,9 @@
     "build": "pnpm -r build",
     "build:web": "pnpm --filter @risk/web build",
     "build:desktop": "pnpm --filter @risk/desktop build",
+    "package:win": "pnpm build:web && pnpm --filter @risk/desktop build:win",
+    "package:linux": "pnpm build:web && pnpm --filter @risk/desktop build:linux",
+    "package:linux:docker": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-linux-docker.ps1",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test"
   }

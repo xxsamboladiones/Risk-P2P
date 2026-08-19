@@ -8,13 +8,49 @@ export interface ScreenShareProvider {
   stopScreenShare(): Promise<void>;
 }
 
+type DesktopScreenBridge = {
+  listScreenSources(): Promise<Array<{ id: string; name: string; thumbnail?: string; displayId?: string }>>;
+  selectScreenSource(sourceId: string): Promise<void>;
+};
+
+function desktopScreenBridge(): DesktopScreenBridge | undefined {
+  return (globalThis as typeof globalThis & { desktop?: DesktopScreenBridge }).desktop;
+}
+
 export class WebScreenShareProvider implements ScreenShareProvider {
   private stream?: MediaStream;
-  async getSources(): Promise<ScreenSource[]> { return []; }
-  async startScreenShare(): Promise<MediaStream> {
+
+  async getSources(): Promise<ScreenSource[]> {
+    const desktop = desktopScreenBridge();
+    return desktop ? desktop.listScreenSources() : [];
+  }
+
+  async startScreenShare(sourceId?: string): Promise<MediaStream> {
+    const desktop = desktopScreenBridge();
+    if (desktop) {
+      let selectedSourceId = sourceId;
+      if (!selectedSourceId) {
+        const sources = await desktop.listScreenSources();
+        if (sources.length === 0) throw new Error("Nenhuma tela ou janela está disponível para compartilhamento.");
+        if (sources.length === 1) {
+          selectedSourceId = sources[0]!.id;
+        } else {
+          const options = sources.map((source, index) => `${index + 1}. ${source.name}`).join("\n");
+          const answer = window.prompt(`Escolha a fonte para compartilhar:\n\n${options}`, "1");
+          if (answer === null) throw new DOMException("Compartilhamento cancelado.", "NotAllowedError");
+          const selectedIndex = Number.parseInt(answer.trim(), 10) - 1;
+          if (!Number.isInteger(selectedIndex) || selectedIndex < 0 || selectedIndex >= sources.length) {
+            throw new Error("Fonte de compartilhamento inválida.");
+          }
+          selectedSourceId = sources[selectedIndex]!.id;
+        }
+      }
+      await desktop.selectScreenSource(selectedSourceId);
+    }
     this.stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
     return this.stream;
   }
+
   async stopScreenShare(): Promise<void> {
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = undefined;

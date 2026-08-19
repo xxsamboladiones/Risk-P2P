@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { api } from "../api";
 import {
   ensureLocalGroup,
   getOrCreateLocalIdentity,
@@ -40,21 +41,29 @@ export function GroupInvitePanel({
       let localGroups = await loadLocalGroups();
 
       // Grupos criados antes da migração para o armazenamento P2P/SQLite podem
-      // existir apenas na tabela `communities`. Ao abrir o fluxo de convite,
-      // promovemos o grupo selecionado para uma representação P2P local com o
-      // mesmo id/nome/canais. Isso evita bloquear convites de grupos legados e
-      // mantém os metadados usados pelo DataChannel no mesmo SQLite do desktop.
-      if (
-        preferredGroupId
-        && preferredGroupName
-        && !localGroups.some((group) => group.groupId === preferredGroupId)
-      ) {
+      // existir apenas na API local de communities. Se o grupo selecionado não
+      // estiver em p2p_groups, recuperamos seus metadados e o promovemos para a
+      // representação P2P local antes de gerar o convite.
+      if (preferredGroupId && !localGroups.some((group) => group.groupId === preferredGroupId)) {
+        let groupName = preferredGroupName;
+        let groupChannels = preferredGroupChannels;
+
+        if (!groupName) {
+          const communities = await api.communities(token);
+          groupName = communities.find((group) => group.id === preferredGroupId)?.name;
+        }
+        if (!groupName) throw new Error("Grupo selecionado não foi encontrado no armazenamento local.");
+
+        if (!groupChannels) {
+          groupChannels = await api.channels(token, preferredGroupId).catch(() => []);
+        }
+
         const identity = await getOrCreateLocalIdentity(displayName);
         await ensureLocalGroup(
           preferredGroupId,
-          preferredGroupName,
+          groupName,
           publicIdentity(identity),
-          preferredGroupChannels ?? [],
+          groupChannels,
         );
         localGroups = await loadLocalGroups();
         window.dispatchEvent(new Event("risk:social-updated"));
@@ -80,7 +89,7 @@ export function GroupInvitePanel({
     return () => {
       alive = false;
     };
-  }, [displayName, initialMode, preferredGroupChannels, preferredGroupId, preferredGroupName]);
+  }, [displayName, initialMode, preferredGroupChannels, preferredGroupId, preferredGroupName, token]);
 
   if (initialMode === "join") {
     return <div className="group-invite-panel">

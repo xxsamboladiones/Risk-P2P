@@ -31,7 +31,7 @@ export function reconcileRemoteMediaState(
   if (next.screenShare && !exactScreen) {
     let candidate: MediaStream | undefined;
     if (exactCamera) {
-      candidate = videoStreams.findLast((stream) => stream.id !== exactCamera.id);
+      candidate = [...videoStreams].reverse().find((stream) => stream.id !== exactCamera.id);
     } else if (!next.camera) {
       candidate = videoStreams.at(-1);
     } else if (videoStreams.length >= 2) {

@@ -166,9 +166,6 @@ export class MeshWebRTCTransport implements CallTransport {
     if (initiator && this.events.onDataMessage && !entry.dataChannel) {
       this.bindControlDataChannel(peerId, entry, entry.pc.createDataChannel(CONTROL_CHANNEL_LABEL, { ordered: true }));
     }
-    if (initiator && this.events.onTransferMessage && !entry.transferDataChannel) {
-      this.bindTransferDataChannel(peerId, entry, entry.pc.createDataChannel(TRANSFER_CHANNEL_LABEL, { ordered: true }));
-    }
     if (initiator) {
       entry.needsNegotiation = true;
       await this.negotiateIfNeeded(peerId, entry);
@@ -266,6 +263,13 @@ export class MeshWebRTCTransport implements CallTransport {
 
   isTransferChannelOpen(peerId: string): boolean {
     return this.peers.get(peerId)?.transferDataChannel?.readyState === "open";
+  }
+
+  ensureTransferChannel(peerId: string): void {
+    const entry = this.requirePeer(peerId);
+    if (!this.events.onTransferMessage || entry.transferDataChannel) return;
+    if (this.localPeerId > peerId) return;
+    this.bindTransferDataChannel(peerId, entry, entry.pc.createDataChannel(TRANSFER_CHANNEL_LABEL, { ordered: true }));
   }
 
   async waitForTransferBufferedAmountLow(peerId: string, threshold = TRANSFER_LOW_WATER_MARK_BYTES): Promise<void> {

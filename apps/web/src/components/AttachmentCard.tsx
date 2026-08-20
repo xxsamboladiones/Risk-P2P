@@ -13,6 +13,7 @@ import {
   X,
 } from "lucide-react";
 import type { ChatAttachmentProgress, ChatAttachmentRecord } from "../chat";
+import "./attachments.css";
 
 export type AttachmentCardProps = {
   record: ChatAttachmentRecord;

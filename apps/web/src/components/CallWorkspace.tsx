@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent, type RefObject } from "react";
 import {
   Hash,
   Maximize2,
@@ -113,7 +113,7 @@ function VolumeControl({ label, value, onChange }: { label: string; value: numbe
   </label>;
 }
 
-function FullscreenButton({ target }: { target: React.RefObject<HTMLElement | null> }) {
+function FullscreenButton({ target }: { target: RefObject<HTMLElement | null> }) {
   return <button
     type="button"
     className="tile-fullscreen"
@@ -302,26 +302,47 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
   const context = callContext;
 
   useEffect(() => {
-    if (context?.textChannelId) return;
+    if (context) return;
     let alive = true;
-    void Promise.all([loadLocalGroups(), api.me(token)])
-      .then(([groups, profile]) => {
+    void (async () => {
+      try {
+        const [localGroups, profile] = await Promise.all([loadLocalGroups(), api.me(token)]);
         if (!alive) return;
-        const group = groups.find((item) => item.channels.some((channel) => channel.kind === "voice" && channel.voiceRoomId === roomId));
-        if (!group) return;
-        const textChannel = group.channels.find((channel) => channel.kind === "text") ?? null;
-        const next: CallContext = {
-          groupId: group.groupId,
-          groupName: group.name,
-          textChannelId: textChannel?.id ?? null,
-          textChannelName: textChannel?.name ?? null,
-          displayName: profile.displayName,
-        };
-        setCallContext(next);
-      })
-      .catch(() => undefined);
+        const localGroup = localGroups.find((item) => item.channels.some((channel) => channel.kind === "voice" && channel.voiceRoomId === roomId));
+        if (localGroup) {
+          const textChannel = localGroup.channels.find((channel) => channel.kind === "text") ?? null;
+          setCallContext({
+            groupId: localGroup.groupId,
+            groupName: localGroup.name,
+            textChannelId: textChannel?.id ?? null,
+            textChannelName: textChannel?.name ?? null,
+            displayName: profile.displayName,
+          });
+          return;
+        }
+
+        const communities = await api.communities(token).catch(() => []);
+        for (const community of communities) {
+          if (!alive) return;
+          const channels = await api.channels(token, community.id).catch(() => []);
+          const voiceChannel = channels.find((channel) => channel.kind === "voice" && channel.voiceRoomId === roomId);
+          if (!voiceChannel) continue;
+          const textChannel = channels.find((channel) => channel.kind === "text") ?? null;
+          setCallContext({
+            groupId: community.id,
+            groupName: community.name,
+            textChannelId: textChannel?.id ?? null,
+            textChannelName: textChannel?.name ?? null,
+            displayName: profile.displayName,
+          });
+          return;
+        }
+      } catch {
+        // A chamada continua funcionando mesmo se não conseguirmos resolver o chat.
+      }
+    })();
     return () => { alive = false; };
-  }, [context?.textChannelId, roomId, setCallContext, token]);
+  }, [context, roomId, setCallContext, token]);
 
   useEffect(() => {
     const channelId = context?.textChannelId;
@@ -357,7 +378,7 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
         if (!alive) return;
         setMessages([...history].sort((left, right) => left.createdAt.localeCompare(right.createdAt)));
         setAttachments(storedAttachments.reduce<ChatAttachmentRecord[]>((items, record) => upsertAttachment(items, record), []));
-        await chat.connect(channelId, context?.displayName ?? "Participante", iceServers);
+        await chat.connect(channelId, context.displayName, iceServers);
       } catch (cause) {
         if (alive) setError(cause instanceof Error ? cause.message : "Não foi possível conectar o chat do grupo.");
       }
@@ -420,7 +441,7 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
     }
   }
 
-  async function submitMessage(event: React.FormEvent<HTMLFormElement>): Promise<void> {
+  async function submitMessage(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     const input = event.currentTarget.elements.namedItem("message") as HTMLInputElement;
     const content = input.value.trim();

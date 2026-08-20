@@ -1,3 +1,5 @@
+mod attachments;
+
 use super::{bearer, internal, ApiError, AppState};
 use axum::{
     extract::{Path, State},
@@ -49,6 +51,7 @@ pub fn router() -> Router<AppState> {
             "/p2p/messages/{channel_id}",
             get(list_messages).post(save_message),
         )
+        .merge(attachments::router())
 }
 
 async fn list_friends(

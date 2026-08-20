@@ -97,7 +97,9 @@ export type SyncWireMessage =
 
 export const MAX_SYNC_DESCRIPTORS_PER_PAGE = 96;
 export const MAX_SYNC_NEED_IDS = 128;
-export const MAX_SYNC_ITEMS_PER_MESSAGE = 16;
+// Attachment manifests may include hundreds of chunk hashes. One item per frame keeps
+// sync.items safely below the 64 KiB control-channel ceiling without fragmenting JSON.
+export const MAX_SYNC_ITEMS_PER_MESSAGE = 1;
 
 export function isSyncWireMessage(value: unknown): value is SyncWireMessage {
   if (!value || typeof value !== "object") return false;

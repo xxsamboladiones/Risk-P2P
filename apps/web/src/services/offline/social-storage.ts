@@ -65,9 +65,18 @@ export async function saveLocalFriend(friend: LocalFriend): Promise<void> {
 
 export async function loadLocalGroups(): Promise<LocalGroup[]> {
   const config = await desktopConfig();
-  if (!config) return legacyGroups();
+  if (!config) {
+    const groups = await legacyGroups();
+    const identity = await loadLocalIdentity();
+    if (!identity) return groups;
+    return reconcileIdentityMembership(groups, identity, (group) => putInStore(OFFLINE_STORES.groups, group));
+  }
   await migrateLegacySocial(config);
-  return desktopRequest<LocalGroup[]>(config, "/p2p/groups", { method: "GET" });
+  const groups = await desktopRequest<LocalGroup[]>(config, "/p2p/groups", { method: "GET" });
+  const identity = await loadLocalIdentity();
+  if (!identity) return groups;
+  return reconcileIdentityMembership(groups, identity, (group) =>
+    desktopRequest(config, "/p2p/groups", { method: "POST", body: JSON.stringify(group) }).then(() => undefined));
 }
 
 export async function saveLocalGroup(group: LocalGroup): Promise<void> {
@@ -136,6 +145,39 @@ export async function mergeLocalGroupMembers(groupId: string, incoming: PublicPe
 
 export function publicIdentity(identity: LocalIdentity): PublicPeerIdentity {
   return { peerId: identity.peerId, publicKey: identity.publicKey, displayName: identity.displayName, avatar: identity.avatar };
+}
+
+async function reconcileIdentityMembership(
+  groups: LocalGroup[],
+  identity: LocalIdentity,
+  persist: (group: LocalGroup) => Promise<void>,
+): Promise<LocalGroup[]> {
+  const self = publicIdentity(identity);
+  const reconciled: LocalGroup[] = [];
+  for (const group of groups) {
+    const members = [...group.members];
+    const index = members.findIndex((member) => member.peerId === self.peerId);
+    let changed = false;
+    if (index < 0) {
+      members.push(self);
+      changed = true;
+    } else {
+      const current = members[index]!;
+      if (samePublicKey(current.publicKey, self.publicKey)
+        && (current.displayName !== self.displayName || current.avatar !== self.avatar)) {
+        members[index] = self;
+        changed = true;
+      }
+    }
+    if (!changed) {
+      reconciled.push(group);
+      continue;
+    }
+    const updated = { ...group, members };
+    await persist(updated);
+    reconciled.push(updated);
+  }
+  return reconciled;
 }
 
 function validPublicPeerIdentity(identity: PublicPeerIdentity): boolean {

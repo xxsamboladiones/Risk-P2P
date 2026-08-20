@@ -57,9 +57,20 @@ const DEFAULT_RETRY_DELAY_MS = 500;
 
 export async function sha256Hex(data: Blob | ArrayBuffer | ArrayBufferView): Promise<string> {
   if (data instanceof Blob) return sha256BlobHex(data);
-  const bytes = ArrayBuffer.isView(data)
-    ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
-    : data;
+
+  let bytes: ArrayBuffer | Uint8Array<ArrayBuffer>;
+  if (data instanceof ArrayBuffer) {
+    bytes = data;
+  } else {
+    // ArrayBufferView.buffer é ArrayBufferLike no TypeScript moderno e pode ser
+    // um SharedArrayBuffer. Web Crypto não aceita SharedArrayBuffer como
+    // BufferSource, então copiamos explicitamente apenas o intervalo visível da
+    // view para memória respaldada por ArrayBuffer normal.
+    const copy = new Uint8Array(data.byteLength);
+    copy.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+    bytes = copy;
+  }
+
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, "0")).join("");
 }

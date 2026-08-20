@@ -8,6 +8,7 @@ import {
   type AttachmentTransferProgress,
   type FileControlMessage,
 } from "@risk/protocol/attachments";
+import { sha256BlobHex } from "./streaming-sha256";
 
 export type TransferSendControl = (peerId: string, message: FileControlMessage) => void | Promise<void>;
 export type TransferSendChunk = (peerId: string, frame: AttachmentChunkFrame) => void | Promise<void>;
@@ -42,6 +43,7 @@ type QueuedTransfer = {
   missingChunks?: Set<number>;
   paused: boolean;
   cancelled: boolean;
+  awaitingVerification: boolean;
   retryCount: number;
   bytesTransferred: number;
   startedAt?: string;
@@ -54,11 +56,10 @@ const DEFAULT_RETRY_LIMIT = 3;
 const DEFAULT_RETRY_DELAY_MS = 500;
 
 export async function sha256Hex(data: Blob | ArrayBuffer | ArrayBufferView): Promise<string> {
-  const bytes = data instanceof Blob
-    ? await data.arrayBuffer()
-    : ArrayBuffer.isView(data)
-      ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
-      : data;
+  if (data instanceof Blob) return sha256BlobHex(data);
+  const bytes = ArrayBuffer.isView(data)
+    ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
+    : data;
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, "0")).join("");
 }
@@ -161,6 +162,7 @@ export class AttachmentTransferSender extends EventTarget {
       manifest,
       paused: false,
       cancelled: false,
+      awaitingVerification: false,
       retryCount: 0,
       bytesTransferred: 0,
     };
@@ -174,6 +176,7 @@ export class AttachmentTransferSender extends EventTarget {
     const transfer = this.findTransfer(transferId);
     transfer.missingChunks = missingChunks ? new Set(missingChunks) : undefined;
     transfer.paused = false;
+    transfer.awaitingVerification = false;
     this.emitProgress(transfer, "queued");
     await this.pump();
   }
@@ -187,6 +190,7 @@ export class AttachmentTransferSender extends EventTarget {
   resume(transferId: string, missingChunks?: number[]): void {
     const transfer = this.findTransfer(transferId);
     transfer.paused = false;
+    transfer.awaitingVerification = false;
     transfer.missingChunks = missingChunks ? new Set(missingChunks) : transfer.missingChunks;
     this.emitProgress(transfer, "queued");
     void this.pump();
@@ -196,7 +200,17 @@ export class AttachmentTransferSender extends EventTarget {
     const transfer = this.findTransfer(transferId);
     transfer.cancelled = true;
     transfer.paused = false;
+    transfer.awaitingVerification = false;
     this.emitProgress(transfer, "cancelled");
+    if (!this.active.has(transferId)) this.removeTransfer(transfer);
+  }
+
+  confirm(transferId: string): void {
+    const transfer = this.findTransfer(transferId);
+    transfer.awaitingVerification = false;
+    transfer.bytesTransferred = transfer.manifest.size;
+    this.emitProgress(transfer, "completed");
+    this.removeTransfer(transfer);
   }
 
   private async pump(): Promise<void> {
@@ -204,13 +218,12 @@ export class AttachmentTransferSender extends EventTarget {
     this.pumping = true;
     try {
       while (this.active.size < this.maxConcurrentTransfers) {
-        const next = this.queue.find((item) => !item.cancelled && !item.paused && !this.active.has(item.transferId));
+        const next = this.queue.find((item) => !item.cancelled && !item.paused && !item.awaitingVerification && !this.active.has(item.transferId));
         if (!next) break;
         this.active.set(next.transferId, next);
         void this.run(next).finally(() => {
           this.active.delete(next.transferId);
-          const index = this.queue.indexOf(next);
-          if (index >= 0 && (next.cancelled || next.bytesTransferred >= expectedBytes(next))) this.queue.splice(index, 1);
+          if (next.cancelled) this.removeTransfer(next);
           void this.pump();
         });
       }
@@ -232,19 +245,19 @@ export class AttachmentTransferSender extends EventTarget {
         await this.applyBackpressure(transfer.peerId);
         frame.transferId = transfer.transferId;
         await this.sendWithRetry(transfer, frame);
-        transfer.bytesTransferred += frame.size;
+        transfer.bytesTransferred = Math.min(transfer.manifest.size, transfer.bytesTransferred + frame.size);
         this.emitProgress(transfer, "transferring");
       }
       if (transfer.cancelled) return;
+      transfer.awaitingVerification = true;
       this.emitProgress(transfer, "verifying");
       await this.sendControl(transfer.peerId, {
         type: "file.complete",
         transferId: transfer.transferId,
         contentHash: transfer.manifest.contentHash,
       });
-      transfer.bytesTransferred = expectedBytes(transfer);
-      this.emitProgress(transfer, "completed");
     } catch (error) {
+      transfer.awaitingVerification = false;
       this.emitProgress(transfer, "failed", error instanceof Error ? error.message : String(error));
       await this.sendControl(transfer.peerId, {
         type: "file.error",
@@ -285,6 +298,11 @@ export class AttachmentTransferSender extends EventTarget {
     return transfer;
   }
 
+  private removeTransfer(transfer: QueuedTransfer): void {
+    const index = this.queue.indexOf(transfer);
+    if (index >= 0) this.queue.splice(index, 1);
+  }
+
   private emitProgress(transfer: QueuedTransfer, state: AttachmentTransferProgress["state"], lastError?: string): void {
     const detail: AttachmentTransferProgress = {
       transferId: transfer.transferId,
@@ -315,16 +333,6 @@ function extensionOf(filename: string): string | undefined {
   const index = filename.lastIndexOf(".");
   if (index <= 0 || index === filename.length - 1) return undefined;
   return filename.slice(index + 1).toLowerCase();
-}
-
-function expectedBytes(transfer: QueuedTransfer): number {
-  if (!transfer.missingChunks) return transfer.manifest.size;
-  let total = 0;
-  for (const index of transfer.missingChunks) {
-    const offset = index * transfer.manifest.chunkSize;
-    total += Math.max(0, Math.min(transfer.manifest.chunkSize, transfer.manifest.size - offset));
-  }
-  return total;
 }
 
 function positiveInteger(value: number | undefined, fallback: number): number {

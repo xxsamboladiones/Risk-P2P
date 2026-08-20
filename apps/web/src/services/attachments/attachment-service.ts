@@ -121,8 +121,11 @@ export class AttachmentService extends EventTarget {
   }
 
   async sendFile(file: File): Promise<AttachmentManifest> {
-    const peers = this.authenticatedPeers().filter((peerId) => this.transport.isTransferChannelOpen(peerId));
-    if (peers.length === 0) throw new Error("Nenhum peer autenticado possui o canal risk.transfer aberto.");
+    const peers = this.authenticatedPeers().filter((peerId) => {
+      const capabilities = this.peerCapabilities.get(peerId);
+      return capabilities?.has("file-transfer-v1") && this.transport.isTransferChannelOpen(peerId);
+    });
+    if (peers.length === 0) throw new Error("Nenhum peer autenticado com suporte a arquivos possui o canal risk.transfer aberto.");
     if (file.size > MAX_FILE_SIZE_BYTES) throw new Error("O arquivo excede o limite de 20 GiB desta versão do Risk.");
 
     const manifest = await buildManifest(file, this.channelId, this.localPeerId);
@@ -152,6 +155,8 @@ export class AttachmentService extends EventTarget {
     if (record.channelId !== this.channelId) throw new Error("Anexo pertence a outro canal.");
     if (record.state === "completed") return;
     if (!this.isAuthenticated(record.peerId)) throw new Error("O peer que possui este arquivo não está conectado.");
+    const capabilities = this.peerCapabilities.get(record.peerId);
+    if (!capabilities?.has("file-transfer-v1")) throw new Error("O peer conectado não oferece transferência de arquivos nesta versão.");
     await this.sendControl(record.peerId, { type: "file.request", attachmentId: record.attachmentId });
     const updated = { ...record, state: "waiting" as const, updatedAt: new Date().toISOString() };
     await this.storage.saveRecord(updated);
@@ -159,17 +164,35 @@ export class AttachmentService extends EventTarget {
   }
 
   async pause(record: StoredAttachmentRecord): Promise<void> {
-    if (!record.transferId.startsWith("sync:")) await this.sendControl(record.peerId, { type: "file.pause", transferId: record.transferId });
+    if (record.transferId.startsWith("sync:")) return;
+    if (record.direction === "outgoing") {
+      this.sender.pause(record.transferId);
+    } else {
+      await this.receiver.handleControl(record.peerId, { type: "file.pause", transferId: record.transferId });
+    }
+    await this.sendControl(record.peerId, { type: "file.pause", transferId: record.transferId });
   }
 
   async resume(record: StoredAttachmentRecord): Promise<void> {
     if (record.transferId.startsWith("sync:")) { await this.requestDownload(record); return; }
+    if (record.direction === "outgoing") {
+      this.sender.resume(record.transferId);
+    } else {
+      await this.receiver.handleControl(record.peerId, { type: "file.resume", transferId: record.transferId });
+    }
     await this.sendControl(record.peerId, { type: "file.resume", transferId: record.transferId });
   }
 
   async cancel(record: StoredAttachmentRecord): Promise<void> {
-    if (!record.transferId.startsWith("sync:")) await this.sendControl(record.peerId, { type: "file.cancel", transferId: record.transferId, reason: "cancelled_by_user" });
-    await this.receiver.cancel(record.transferId).catch(() => undefined);
+    if (record.transferId.startsWith("sync:")) {
+      const updated = { ...record, state: "cancelled" as const, updatedAt: new Date().toISOString() };
+      await this.storage.saveRecord(updated);
+      this.emitRecord(updated);
+      return;
+    }
+    if (record.direction === "outgoing") this.sender.cancel(record.transferId);
+    else await this.receiver.cancel(record.transferId);
+    await this.sendControl(record.peerId, { type: "file.cancel", transferId: record.transferId, reason: "cancelled_by_user" });
   }
 
   async getBlob(record: StoredAttachmentRecord): Promise<Blob> {
@@ -211,13 +234,17 @@ export class AttachmentService extends EventTarget {
 
   async handleTransferFrame(peerId: string, data: ArrayBuffer): Promise<void> {
     if (!this.isAuthenticated(peerId)) return;
+    const capabilities = this.peerCapabilities.get(peerId);
+    if (!capabilities?.has("file-transfer-v1")) return;
     const frame = decodeAttachmentChunkFrame(data);
     await this.receiver.handleChunk(peerId, frame);
   }
 
   private async handleFileControl(peerId: string, message: FileControlMessage): Promise<void> {
     if (message.type === "peer.capabilities") {
-      this.peerCapabilities.set(peerId, new Set(message.capabilities.filter((capability): capability is RiskCapability => LOCAL_CAPABILITIES.includes(capability))));
+      const supported = new Set(message.capabilities.filter((capability): capability is RiskCapability => LOCAL_CAPABILITIES.includes(capability)));
+      this.peerCapabilities.set(peerId, supported);
+      if (supported.has("file-transfer-v1")) this.transport.ensureTransferChannel(peerId);
       return;
     }
     if (message.type === "file.request") { await this.serveRequestedAttachment(peerId, message.attachmentId); return; }
@@ -248,6 +275,11 @@ export class AttachmentService extends EventTarget {
   }
 
   private async serveRequestedAttachment(peerId: string, attachmentId: string): Promise<void> {
+    const capabilities = this.peerCapabilities.get(peerId);
+    if (!capabilities?.has("file-transfer-v1") || !this.transport.isTransferChannelOpen(peerId)) {
+      await this.sendControl(peerId, { type: "file.error", transferId: `request:${attachmentId}`, code: "transfer_unavailable", message: "O canal de transferência ainda não está disponível.", retryable: true });
+      return;
+    }
     const record = await this.storage.findCompletedByAttachmentId(attachmentId);
     if (!record || record.channelId !== this.channelId) {
       await this.sendControl(peerId, { type: "file.error", transferId: `request:${attachmentId}`, code: "attachment_unavailable", message: "Este peer não possui mais o arquivo solicitado.", retryable: false });
@@ -397,9 +429,12 @@ export class AttachmentService extends EventTarget {
   private async markOutgoingVerified(transferId: string, contentHash: string): Promise<void> {
     const record = await this.storage.findByTransferId(transferId);
     if (!record || record.manifest.contentHash.toLowerCase() !== contentHash.toLowerCase()) return;
-    const updated = { ...record, state: "completed" as const, bytesTransferred: record.totalBytes, completedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    this.sender.confirm(transferId);
+    const now = new Date().toISOString();
+    const updated = { ...record, state: "completed" as const, bytesTransferred: record.totalBytes, completedAt: now, updatedAt: now };
     await this.storage.saveRecord(updated);
     this.emitRecord(updated);
+    this.outgoing.delete(transferId);
   }
 
   private async markTransferError(transferId: string, error: string): Promise<void> {

@@ -98,9 +98,9 @@ async function waitForPipeWireTrack(preparation: DesktopScreenAudioPreparation):
   return undefined;
 }
 
-async function startPipeWireDesktopShare(preparation: DesktopScreenAudioPreparation): Promise<MediaStream> {
+async function startPipeWireDesktopShare(preparation: DesktopScreenAudioPreparation, selectedSourceId?: string): Promise<MediaStream> {
   if (!window.desktop) throw new Error("Bridge desktop indisponível para captura PipeWire.");
-  const sourceId = await window.desktop.chooseScreenSource();
+  const sourceId = selectedSourceId ?? await window.desktop.chooseScreenSource();
   if (!sourceId) throw new DOMException("Compartilhamento cancelado.", "NotAllowedError");
   await window.desktop.selectScreenSource(sourceId);
   const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
@@ -331,7 +331,7 @@ export class CallController {
     } catch (error) { this.reportError(error, "Não foi possível alterar a câmera."); }
   }
 
-  async toggleScreen(_roomId: string): Promise<void> {
+  async toggleScreen(_roomId: string, sourceId?: string): Promise<void> {
     if (this.screenStream) { await this.stopScreen(); return; }
     const lifecycle = this.lifecycleId;
     let desktopAudio: DesktopScreenAudioPreparation | null = null;
@@ -345,8 +345,8 @@ export class CallController {
 
       const pipeWireDesktop = desktopAudio?.mode === "pipewire" || desktopAudio?.mode === "unavailable";
       stream = pipeWireDesktop
-        ? await startPipeWireDesktopShare(desktopAudio!)
-        : await this.screen.startScreenShare();
+        ? await startPipeWireDesktopShare(desktopAudio!, sourceId)
+        : await this.screen.startScreenShare(sourceId);
 
       if (desktopAudio?.mode === "unavailable") {
         const message = `PipeWire indisponível para áudio da tela: ${desktopAudio.reason ?? "ferramentas PipeWire não encontradas"}. A tela continuará sem áudio do sistema.`;

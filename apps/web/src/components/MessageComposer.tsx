@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import { Paperclip, Send } from "lucide-react";
 
 export function MessageComposer({
@@ -9,13 +9,13 @@ export function MessageComposer({
 }: {
   placeholder: string;
   canAttach: boolean;
-  onSubmit(event: React.FormEvent<HTMLFormElement>): void | Promise<void>;
+  onSubmit(event: FormEvent<HTMLFormElement>): void | Promise<void>;
   onFiles(files: File[]): Promise<void>;
 }) {
   const fileInput = useRef<HTMLInputElement>(null);
   const [preparing, setPreparing] = useState(false);
 
-  async function selectFiles(event: React.ChangeEvent<HTMLInputElement>) {
+  async function selectFiles(event: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files ?? []);
     event.target.value = "";
     if (!files.length) return;

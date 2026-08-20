@@ -13,7 +13,7 @@ type RiskMediaCaptureOptions = {
 const STORAGE_KEY = "risk.voice-video-settings.v1";
 
 export const DEFAULT_VOICE_VIDEO_SETTINGS: VoiceVideoSettings = {
-  noiseSuppression: "rnnoise",
+  noiseSuppression: "standard",
   echoCancellation: true,
   excludeRiskAudioFromScreenShare: true,
 };
@@ -33,9 +33,9 @@ export function loadVoiceVideoSettings(): VoiceVideoSettings {
       return settings;
     }
     const value = JSON.parse(raw) as Partial<VoiceVideoSettings>;
-    const noiseSuppression: NoiseSuppressionMode = value.noiseSuppression === "standard" || value.noiseSuppression === "off"
+    const noiseSuppression: NoiseSuppressionMode = value.noiseSuppression === "rnnoise" || value.noiseSuppression === "off"
       ? value.noiseSuppression
-      : "rnnoise";
+      : "standard";
     const settings: VoiceVideoSettings = {
       noiseSuppression,
       echoCancellation: value.echoCancellation !== false,

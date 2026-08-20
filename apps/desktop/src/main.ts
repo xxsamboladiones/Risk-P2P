@@ -8,6 +8,8 @@ import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
+
 const root = path.dirname(fileURLToPath(import.meta.url));
 const DEVELOPMENT_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:5173"]);
 const DESKTOP_HOST = "127.0.0.1";

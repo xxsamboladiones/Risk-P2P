@@ -72,6 +72,7 @@ export type AttachmentTransferProgress = {
 };
 
 export type FileOfferMessage = { type: "file.offer"; transferId: string; manifest: AttachmentManifest };
+export type FileRequestMessage = { type: "file.request"; attachmentId: string };
 export type FileAcceptMessage = { type: "file.accept"; transferId: string };
 export type FileRejectMessage = { type: "file.reject"; transferId: string; reason?: string };
 export type FileManifestMessage = { type: "file.manifest"; transferId: string; manifest: AttachmentManifest };
@@ -92,6 +93,7 @@ export type FileAvailabilityMessage = {
 export type FileControlMessage =
   | PeerCapabilitiesMessage
   | FileOfferMessage
+  | FileRequestMessage
   | FileAcceptMessage
   | FileRejectMessage
   | FileManifestMessage
@@ -138,6 +140,24 @@ export function validateAttachmentManifest(manifest: AttachmentManifest): string
   if (!/^[a-f0-9]{64}$/i.test(manifest.contentHash)) errors.push("invalid_content_hash");
   if (manifest.chunkHashes && manifest.chunkHashes.length !== manifest.chunkCount) errors.push("invalid_chunk_hash_count");
   return errors;
+}
+
+export function isFileControlMessage(value: unknown): value is FileControlMessage {
+  if (!value || typeof value !== "object") return false;
+  const type = (value as { type?: unknown }).type;
+  return type === "peer.capabilities"
+    || type === "file.offer"
+    || type === "file.request"
+    || type === "file.accept"
+    || type === "file.reject"
+    || type === "file.manifest"
+    || type === "file.need"
+    || type === "file.pause"
+    || type === "file.resume"
+    || type === "file.cancel"
+    || type === "file.complete"
+    || type === "file.error"
+    || type === "file.availability";
 }
 
 export function sanitizeAttachmentFilename(filename: string): string {

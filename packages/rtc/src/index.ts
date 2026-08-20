@@ -51,9 +51,6 @@ export class WebScreenShareProvider implements ScreenShareProvider {
       await desktop.selectScreenSource(selectedSourceId);
     }
 
-    // No Electron, restrictOwnAudio precisa fazer parte da solicitação inicial.
-    // Aplicar a constraint depois que a track de loopback já foi criada é tarde
-    // demais para escolher o backend loopbackWithoutChrome no Windows.
     const restrictOwnAudio = riskMediaCaptureOptions()?.restrictOwnAudio === true;
     const audio: true | DisplayAudioConstraints = restrictOwnAudio ? { restrictOwnAudio: true } : true;
     this.stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio });
@@ -107,6 +104,8 @@ export interface TransportEvents {
   onConnectionState(peerId: string, state: RTCPeerConnectionState): void;
   onDataMessage?(peerId: string, data: string): void;
   onDataState?(peerId: string, state: RTCDataChannelState): void;
+  onTransferMessage?(peerId: string, data: ArrayBuffer): void;
+  onTransferState?(peerId: string, state: RTCDataChannelState): void;
 }
 
 export type PeerConnectionDiagnostics = {
@@ -116,6 +115,7 @@ export type PeerConnectionDiagnostics = {
   signalingState: RTCSignalingState;
   pendingIceCandidates: number;
   dataChannelState: RTCDataChannelState | "unavailable";
+  transferDataChannelState: RTCDataChannelState | "unavailable";
 };
 
 export interface CallTransport {
@@ -135,10 +135,17 @@ type PeerEntry = {
   settingRemoteAnswer: boolean;
   pendingIceCandidates: RTCIceCandidateInit[];
   dataChannel?: RTCDataChannel;
+  transferDataChannel?: RTCDataChannel;
 };
 
 const DEFAULT_MAX_REMOTE_PEERS = 5;
+const CONTROL_CHANNEL_LABEL = "risk.chat";
+const TRANSFER_CHANNEL_LABEL = "risk.transfer";
+const MAX_CONTROL_MESSAGE_BYTES = 64 * 1024;
 const MAX_DATA_BUFFER_BYTES = 512 * 1024;
+const MAX_TRANSFER_FRAME_BYTES = 320 * 1024;
+const TRANSFER_HIGH_WATER_MARK_BYTES = 4 * 1024 * 1024;
+const TRANSFER_LOW_WATER_MARK_BYTES = 1 * 1024 * 1024;
 
 export class MeshWebRTCTransport implements CallTransport {
   private readonly peers = new Map<string, PeerEntry>();
@@ -157,7 +164,10 @@ export class MeshWebRTCTransport implements CallTransport {
     const entry = this.peers.get(peerId) ?? this.createPeer(peerId);
     if (initiator) entry.canNegotiate = true;
     if (initiator && this.events.onDataMessage && !entry.dataChannel) {
-      this.bindDataChannel(peerId, entry, entry.pc.createDataChannel("risk.chat", { ordered: true }));
+      this.bindControlDataChannel(peerId, entry, entry.pc.createDataChannel(CONTROL_CHANNEL_LABEL, { ordered: true }));
+    }
+    if (initiator && this.events.onTransferMessage && !entry.transferDataChannel) {
+      this.bindTransferDataChannel(peerId, entry, entry.pc.createDataChannel(TRANSFER_CHANNEL_LABEL, { ordered: true }));
     }
     if (initiator) {
       entry.needsNegotiation = true;
@@ -218,20 +228,63 @@ export class MeshWebRTCTransport implements CallTransport {
   }
 
   sendData(data: string, targetPeerId?: string): number {
-    if (new TextEncoder().encode(data).byteLength > 64 * 1024) throw new Error("Mensagem DataChannel excede 64 KiB.");
+    if (new TextEncoder().encode(data).byteLength > MAX_CONTROL_MESSAGE_BYTES) throw new Error("Mensagem DataChannel excede 64 KiB.");
     let sent = 0;
     for (const [peerId, entry] of this.peers) {
       if (targetPeerId && peerId !== targetPeerId) continue;
       const channel = entry.dataChannel;
       if (channel?.readyState !== "open") continue;
       if (channel.bufferedAmount > MAX_DATA_BUFFER_BYTES) {
-        logger.warn("DataChannel congestionado; mensagem não enviada", { peerId, bufferedAmount: channel.bufferedAmount });
+        logger.warn("DataChannel de controle congestionado; mensagem não enviada", { peerId, bufferedAmount: channel.bufferedAmount });
         continue;
       }
       channel.send(data);
       sent += 1;
     }
     return sent;
+  }
+
+  sendTransferData(data: ArrayBuffer | ArrayBufferView, targetPeerId?: string): number {
+    const payload = exactArrayBuffer(data);
+    if (payload.byteLength > MAX_TRANSFER_FRAME_BYTES) throw new Error("Frame do risk.transfer excede o limite permitido.");
+    let sent = 0;
+    for (const [peerId, entry] of this.peers) {
+      if (targetPeerId && peerId !== targetPeerId) continue;
+      const channel = entry.transferDataChannel;
+      if (channel?.readyState !== "open") continue;
+      if (channel.bufferedAmount > TRANSFER_HIGH_WATER_MARK_BYTES) continue;
+      channel.send(payload);
+      sent += 1;
+    }
+    return sent;
+  }
+
+  getTransferBufferedAmount(peerId: string): number {
+    const channel = this.peers.get(peerId)?.transferDataChannel;
+    return channel?.readyState === "open" ? channel.bufferedAmount : Number.POSITIVE_INFINITY;
+  }
+
+  isTransferChannelOpen(peerId: string): boolean {
+    return this.peers.get(peerId)?.transferDataChannel?.readyState === "open";
+  }
+
+  async waitForTransferBufferedAmountLow(peerId: string, threshold = TRANSFER_LOW_WATER_MARK_BYTES): Promise<void> {
+    const channel = this.requirePeer(peerId).transferDataChannel;
+    if (!channel || channel.readyState !== "open") throw new Error(`Canal ${TRANSFER_CHANNEL_LABEL} indisponível para ${peerId}.`);
+    if (channel.bufferedAmount <= threshold) return;
+    channel.bufferedAmountLowThreshold = Math.max(0, threshold);
+    await new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        channel.removeEventListener("bufferedamountlow", onLow);
+        channel.removeEventListener("close", onClosed);
+        channel.removeEventListener("error", onClosed);
+      };
+      const onLow = () => { cleanup(); resolve(); };
+      const onClosed = () => { cleanup(); reject(new Error(`Canal ${TRANSFER_CHANNEL_LABEL} foi fechado durante a transferência.`)); };
+      channel.addEventListener("bufferedamountlow", onLow, { once: true });
+      channel.addEventListener("close", onClosed, { once: true });
+      channel.addEventListener("error", onClosed, { once: true });
+    });
   }
 
   async restartIce(peerId: string): Promise<void> {
@@ -251,6 +304,7 @@ export class MeshWebRTCTransport implements CallTransport {
       entry.pc.onconnectionstatechange = null;
       entry.pendingIceCandidates.length = 0;
       entry.dataChannel?.close();
+      entry.transferDataChannel?.close();
       entry.pc.close();
       this.peers.delete(id);
     });
@@ -264,6 +318,7 @@ export class MeshWebRTCTransport implements CallTransport {
       signalingState: entry.pc.signalingState,
       pendingIceCandidates: entry.pendingIceCandidates.length,
       dataChannelState: entry.dataChannel?.readyState ?? "unavailable",
+      transferDataChannelState: entry.transferDataChannel?.readyState ?? "unavailable",
     }));
   }
 
@@ -292,11 +347,12 @@ export class MeshWebRTCTransport implements CallTransport {
       const stream = streams[0];
       if (stream) this.events.onRemoteStream(peerId, stream);
     };
-    pc.ondatachannel = ({ channel }) => this.bindDataChannel(peerId, entry, channel);
+    pc.ondatachannel = ({ channel }) => {
+      if (channel.label === TRANSFER_CHANNEL_LABEL) this.bindTransferDataChannel(peerId, entry, channel);
+      else if (channel.label === CONTROL_CHANNEL_LABEL || channel.label === "risk.control") this.bindControlDataChannel(peerId, entry, channel);
+      else channel.close();
+    };
     pc.onnegotiationneeded = () => {
-      // publishTrack/unpublishTrack marcam a negociação explicitamente. Este handler
-      // continua como fallback para mudanças feitas pelo próprio navegador, mas não
-      // cria uma segunda offer enquanto outra negociação já está em andamento.
       if (!entry.canNegotiate) {
         entry.needsNegotiation = true;
         return;
@@ -314,14 +370,33 @@ export class MeshWebRTCTransport implements CallTransport {
     return entry;
   }
 
-  private bindDataChannel(peerId: string, entry: PeerEntry, channel: RTCDataChannel): void {
+  private bindControlDataChannel(peerId: string, entry: PeerEntry, channel: RTCDataChannel): void {
     if (entry.dataChannel && entry.dataChannel !== channel) entry.dataChannel.close();
     entry.dataChannel = channel;
     channel.onopen = () => this.events.onDataState?.(peerId, channel.readyState);
     channel.onclose = () => this.events.onDataState?.(peerId, channel.readyState);
     channel.onerror = () => this.events.onDataState?.(peerId, channel.readyState);
     channel.onmessage = ({ data }) => {
-      if (typeof data === "string" && new TextEncoder().encode(data).byteLength <= 64 * 1024) this.events.onDataMessage?.(peerId, data);
+      if (typeof data === "string" && new TextEncoder().encode(data).byteLength <= MAX_CONTROL_MESSAGE_BYTES) this.events.onDataMessage?.(peerId, data);
+    };
+  }
+
+  private bindTransferDataChannel(peerId: string, entry: PeerEntry, channel: RTCDataChannel): void {
+    if (entry.transferDataChannel && entry.transferDataChannel !== channel) entry.transferDataChannel.close();
+    entry.transferDataChannel = channel;
+    channel.binaryType = "arraybuffer";
+    channel.bufferedAmountLowThreshold = TRANSFER_LOW_WATER_MARK_BYTES;
+    channel.onopen = () => this.events.onTransferState?.(peerId, channel.readyState);
+    channel.onclose = () => this.events.onTransferState?.(peerId, channel.readyState);
+    channel.onerror = () => this.events.onTransferState?.(peerId, channel.readyState);
+    channel.onmessage = ({ data }) => {
+      if (data instanceof ArrayBuffer) {
+        if (data.byteLength <= MAX_TRANSFER_FRAME_BYTES) this.events.onTransferMessage?.(peerId, data);
+        return;
+      }
+      if (data instanceof Blob && data.size <= MAX_TRANSFER_FRAME_BYTES) {
+        void data.arrayBuffer().then((buffer) => this.events.onTransferMessage?.(peerId, buffer)).catch(() => undefined);
+      }
     };
   }
 
@@ -344,15 +419,11 @@ export class MeshWebRTCTransport implements CallTransport {
     await this.flushPendingIce(entry);
     entry.canNegotiate = true;
     if (description.type === "offer") {
-      // A resposta já descreve todas as tracks locais existentes neste instante.
       entry.needsNegotiation = false;
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       if (pc.localDescription) await this.events.sendAnswer(peerId, pc.localDescription.toJSON());
     } else {
-      // Uma câmera/tela pode ter sido ligada enquanto a offer anterior estava em voo.
-      // Assim que a answer devolve o PeerConnection para stable, enviamos a próxima
-      // negociação pendente sem exigir refresh/reentrada na sala.
       await this.negotiateIfNeeded(peerId, entry);
     }
   }
@@ -393,6 +464,11 @@ export class MeshWebRTCTransport implements CallTransport {
       logger.warn("WebRTC renegotiation failed", { peerId, error: String(error) });
     } finally { entry.makingOffer = false; }
   }
+}
+
+function exactArrayBuffer(data: ArrayBuffer | ArrayBufferView): ArrayBuffer {
+  if (data instanceof ArrayBuffer) return data;
+  return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
 }
 
 export function defaultPeerState(): PeerState { return { microphone: true, camera: false, screenShare: false }; }

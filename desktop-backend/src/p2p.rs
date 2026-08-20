@@ -1,3 +1,4 @@
+mod attachments;
 mod screen_audio;
 
 use super::{bearer, internal, ApiError, AppState};
@@ -51,6 +52,7 @@ pub fn router() -> Router<AppState> {
             "/p2p/messages/{channel_id}",
             get(list_messages).post(save_message),
         )
+        .merge(attachments::router())
         .merge(screen_audio::router())
 }
 

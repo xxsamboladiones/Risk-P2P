@@ -79,14 +79,21 @@ export async function createRnnoiseMicrophone(inputStream: MediaStream): Promise
     source.connect(suppressor).connect(destination);
 
     await context.resume();
+    if (context.state !== "running") {
+      throw new Error(`RNNoise não conseguiu iniciar o AudioContext (${context.state}).`);
+    }
+
     const outputTrack = destination.stream.getAudioTracks()[0];
-    if (!outputTrack) throw new Error("RNNoise não produziu uma track de áudio.");
+    if (!outputTrack || outputTrack.readyState !== "live") {
+      throw new Error("RNNoise não produziu uma track de áudio ativa.");
+    }
     outputTrack.contentHint = "speech";
 
     const outputSettings = outputTrack.getSettings();
     console.info("Risk RNNoise microphone", {
       sampleRate: context.sampleRate,
       channelCount: outputSettings.channelCount ?? 1,
+      contextState: context.state,
     });
 
     let stopped = false;

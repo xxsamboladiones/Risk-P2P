@@ -1,11 +1,14 @@
 const DATABASE = "risk-offline";
-const VERSION = 2;
+const VERSION = 3;
 
 export const OFFLINE_STORES = {
   messages: "chat-messages",
   identity: "identity",
   friends: "friends",
   groups: "groups",
+  attachments: "attachments",
+  attachmentChunks: "attachment-chunks",
+  syncCheckpoints: "sync-checkpoints",
 } as const;
 
 export function openRiskDatabase(): Promise<IDBDatabase> {
@@ -20,6 +23,24 @@ export function openRiskDatabase(): Promise<IDBDatabase> {
       if (!database.objectStoreNames.contains(OFFLINE_STORES.identity)) database.createObjectStore(OFFLINE_STORES.identity, { keyPath: "id" });
       if (!database.objectStoreNames.contains(OFFLINE_STORES.friends)) database.createObjectStore(OFFLINE_STORES.friends, { keyPath: "peerId" });
       if (!database.objectStoreNames.contains(OFFLINE_STORES.groups)) database.createObjectStore(OFFLINE_STORES.groups, { keyPath: "groupId" });
+
+      const attachments = database.objectStoreNames.contains(OFFLINE_STORES.attachments)
+        ? request.transaction!.objectStore(OFFLINE_STORES.attachments)
+        : database.createObjectStore(OFFLINE_STORES.attachments, { keyPath: "recordId" });
+      if (!attachments.indexNames.contains("channelId")) attachments.createIndex("channelId", "channelId", { unique: false });
+      if (!attachments.indexNames.contains("attachmentId")) attachments.createIndex("attachmentId", "attachmentId", { unique: false });
+      if (!attachments.indexNames.contains("transferId")) attachments.createIndex("transferId", "transferId", { unique: false });
+
+      const chunks = database.objectStoreNames.contains(OFFLINE_STORES.attachmentChunks)
+        ? request.transaction!.objectStore(OFFLINE_STORES.attachmentChunks)
+        : database.createObjectStore(OFFLINE_STORES.attachmentChunks, { keyPath: "id" });
+      if (!chunks.indexNames.contains("attachmentId")) chunks.createIndex("attachmentId", "attachmentId", { unique: false });
+
+      const checkpoints = database.objectStoreNames.contains(OFFLINE_STORES.syncCheckpoints)
+        ? request.transaction!.objectStore(OFFLINE_STORES.syncCheckpoints)
+        : database.createObjectStore(OFFLINE_STORES.syncCheckpoints, { keyPath: "id" });
+      if (!checkpoints.indexNames.contains("channelId")) checkpoints.createIndex("channelId", "channelId", { unique: false });
+      if (!checkpoints.indexNames.contains("remotePeerId")) checkpoints.createIndex("remotePeerId", "remotePeerId", { unique: false });
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("IndexedDB indisponível."));
@@ -30,14 +51,54 @@ export function getAllFromStore<T>(storeName: string): Promise<T[]> {
   return withStore<T[]>(storeName, "readonly", (store) => store.getAll());
 }
 
+export function getFromStore<T>(storeName: string, key: IDBValidKey): Promise<T | undefined> {
+  return withStore<T | undefined>(storeName, "readonly", (store) => store.get(key));
+}
+
+export function getAllByIndex<T>(storeName: string, indexName: string, key: IDBValidKey): Promise<T[]> {
+  return withStore<T[]>(storeName, "readonly", (store) => store.index(indexName).getAll(key));
+}
+
 export function putInStore<T>(storeName: string, value: T): Promise<void> {
   return withStore<void>(storeName, "readwrite", (store) => store.put(value));
+}
+
+export function deleteFromStore(storeName: string, key: IDBValidKey): Promise<void> {
+  return withStore<void>(storeName, "readwrite", (store) => store.delete(key));
+}
+
+export async function deleteAllByIndex(storeName: string, indexName: string, key: IDBValidKey): Promise<void> {
+  const database = await openRiskDatabase();
+  try {
+    const transaction = database.transaction(storeName, "readwrite");
+    const store = transaction.objectStore(storeName);
+    const index = store.index(indexName);
+    await new Promise<void>((resolve, reject) => {
+      const request = index.openKeyCursor(IDBKeyRange.only(key));
+      request.onerror = () => reject(request.error ?? new Error("Falha ao limpar armazenamento local."));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) { resolve(); return; }
+        store.delete(cursor.primaryKey);
+        cursor.continue();
+      };
+    });
+    await transactionDone(transaction);
+  } finally { database.close(); }
 }
 
 function asyncRequest<T>(request: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("Falha no armazenamento local."));
+  });
+}
+
+function transactionDone(transaction: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onabort = () => reject(transaction.error ?? new Error("Transação IndexedDB cancelada."));
+    transaction.onerror = () => reject(transaction.error ?? new Error("Falha na transação IndexedDB."));
   });
 }
 

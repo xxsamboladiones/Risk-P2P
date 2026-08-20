@@ -1,4 +1,7 @@
 import { MeshWebRTCTransport } from "@risk/rtc";
+import { AttachmentService, type AttachmentRuntimeState } from "./services/attachments/attachment-service";
+import { createAttachmentStorage } from "./services/attachments/desktop-storage";
+import type { StoredAttachmentRecord } from "./services/attachments/indexeddb-storage";
 import { SupabaseSignalingProvider } from "./services/supabase/signaling";
 import type { SignalingNamespace, SignalingProvider } from "./services/signaling/types";
 import { loadLocalMessages, saveLocalMessage, type LocalChatMessage } from "./services/offline/chat-storage";
@@ -11,6 +14,8 @@ import {
 } from "./services/offline/social-storage";
 
 export type ChatConnectionStatus = "disconnected" | "connecting" | "connected" | "ready" | "error";
+export type ChatAttachmentRecord = StoredAttachmentRecord;
+export type ChatAttachmentProgress = AttachmentRuntimeState;
 
 export type ChatConnectionOptions = {
   identity?: LocalIdentity;
@@ -115,6 +120,7 @@ const FUTURE_CLOCK_SKEW_MS = 30_000;
 export class ChatController {
   private signaling?: SignalingProvider;
   private transport?: MeshWebRTCTransport;
+  private attachmentService?: AttachmentService;
   private channelId?: string;
   private groupId?: string;
   private peerId?: string;
@@ -131,12 +137,19 @@ export class ChatController {
   private readonly historyRequests = new Map<string, string>();
   private readonly messageCallbacks = new Set<(message: LocalChatMessage) => void>();
   private readonly statusCallbacks = new Set<(status: ChatConnectionStatus) => void>();
+  private readonly attachmentCallbacks = new Set<(record: StoredAttachmentRecord) => void>();
+  private readonly attachmentProgressCallbacks = new Set<(progress: AttachmentRuntimeState) => void>();
   private unsubscribers: Array<() => void> = [];
   private refreshingMembers?: Promise<void>;
 
   constructor(private readonly createSignaling: () => SignalingProvider = () => new SupabaseSignalingProvider()) {}
 
   history(channelId: string): Promise<LocalChatMessage[]> { return loadLocalMessages(channelId); }
+
+  async attachmentHistory(channelId: string): Promise<StoredAttachmentRecord[]> {
+    if (this.attachmentService && this.channelId === channelId) return this.attachmentService.history();
+    return (await createAttachmentStorage()).listChannel(channelId);
+  }
 
   async connect(
     channelId: string,
@@ -179,7 +192,7 @@ export class ChatController {
       onConnectionState: (remotePeerId, state) => {
         if (state === "failed" || state === "closed") this.forgetPeerConnection(remotePeerId);
       },
-      onDataMessage: (remotePeerId, data) => { void this.receive(remotePeerId, data); },
+      onDataMessage: (remotePeerId, data) => { void this.receiveData(remotePeerId, data); },
       onDataState: (remotePeerId, state) => {
         if (state === "open") {
           this.dataChannelPeers.add(remotePeerId);
@@ -189,7 +202,20 @@ export class ChatController {
           this.forgetPeerConnection(remotePeerId);
         }
       },
+      onTransferMessage: (remotePeerId, data) => {
+        void this.attachmentService?.handleTransferFrame(remotePeerId, data).catch((error) => console.warn("Frame de anexo rejeitado", error));
+      },
+      onTransferState: (remotePeerId, state) => {
+        if (state === "open" && this.openDataPeers.has(remotePeerId)) void this.attachmentService?.peerReady(remotePeerId).catch(() => undefined);
+      },
     }, options.maxRemotePeers);
+    this.installAttachmentService(new AttachmentService(
+      this.transport,
+      channelId,
+      this.peerId,
+      () => [...this.openDataPeers],
+      await createAttachmentStorage(),
+    ));
     this.bindSignaling(this.signaling, this.peerId);
     if (this.groupId && typeof window !== "undefined") {
       const refresh = () => { void this.refreshGroupMembership(true); };
@@ -209,6 +235,7 @@ export class ChatController {
     await this.transport?.disconnect().catch(() => undefined);
     this.signaling = undefined;
     this.transport = undefined;
+    this.attachmentService = undefined;
     this.channelId = undefined;
     this.groupId = undefined;
     this.peerId = undefined;
@@ -273,8 +300,64 @@ export class ChatController {
     return local;
   }
 
+  async sendAttachment(file: File): Promise<void> {
+    if (!this.attachmentService || this.status !== "ready") throw new Error("Conecte e autentique o chat P2P antes de enviar arquivos.");
+    await this.attachmentService.sendFile(file);
+  }
+
+  async requestAttachment(record: StoredAttachmentRecord): Promise<void> {
+    if (!this.attachmentService) throw new Error("Conecte o chat para solicitar este arquivo.");
+    await this.attachmentService.requestDownload(record);
+  }
+
+  async downloadAttachment(record: StoredAttachmentRecord): Promise<void> {
+    if (!this.attachmentService) {
+      const storage = await createAttachmentStorage();
+      if (record.state !== "completed" && record.direction !== "outgoing") throw new Error("Conecte ao peer para baixar este arquivo.");
+      const blob = await storage.getBlob(record.attachmentId, record.manifest);
+      triggerDownload(blob, record.manifest.filename);
+      return;
+    }
+    await this.attachmentService.download(record);
+  }
+
+  async attachmentBlob(record: StoredAttachmentRecord): Promise<Blob> {
+    if (this.attachmentService) return this.attachmentService.getBlob(record);
+    return (await createAttachmentStorage()).getBlob(record.attachmentId, record.manifest);
+  }
+
+  async pauseAttachment(record: StoredAttachmentRecord): Promise<void> { await this.attachmentService?.pause(record); }
+  async resumeAttachment(record: StoredAttachmentRecord): Promise<void> { await this.attachmentService?.resume(record); }
+  async cancelAttachment(record: StoredAttachmentRecord): Promise<void> { await this.attachmentService?.cancel(record); }
+
   onMessage(callback: (message: LocalChatMessage) => void): () => void { this.messageCallbacks.add(callback); return () => this.messageCallbacks.delete(callback); }
   onStatus(callback: (status: ChatConnectionStatus) => void): () => void { this.statusCallbacks.add(callback); return () => this.statusCallbacks.delete(callback); }
+  onAttachment(callback: (record: StoredAttachmentRecord) => void): () => void { this.attachmentCallbacks.add(callback); return () => this.attachmentCallbacks.delete(callback); }
+  onAttachmentProgress(callback: (progress: AttachmentRuntimeState) => void): () => void { this.attachmentProgressCallbacks.add(callback); return () => this.attachmentProgressCallbacks.delete(callback); }
+
+  private installAttachmentService(service: AttachmentService): void {
+    this.attachmentService = service;
+    service.addEventListener("attachment", (event) => {
+      const record = (event as CustomEvent<StoredAttachmentRecord>).detail;
+      this.attachmentCallbacks.forEach((callback) => callback(record));
+    });
+    service.addEventListener("progress", (event) => {
+      const progress = (event as CustomEvent<AttachmentRuntimeState>).detail;
+      this.attachmentProgressCallbacks.forEach((callback) => callback(progress));
+    });
+  }
+
+  private async receiveData(remotePeerId: string, raw: string): Promise<void> {
+    if (this.openDataPeers.has(remotePeerId) && this.attachmentService) {
+      try {
+        if (await this.attachmentService.handleControlString(remotePeerId, raw)) return;
+      } catch (error) {
+        console.warn("Controle de anexo/sync rejeitado", error);
+        return;
+      }
+    }
+    await this.receive(remotePeerId, raw);
+  }
 
   private bindSignaling(signaling: SignalingProvider, peerId: string): void {
     this.unsubscribers.push(
@@ -336,6 +419,7 @@ export class ChatController {
     this.openDataPeers.delete(remotePeerId);
     this.pendingIdentityChallenges.delete(remotePeerId);
     this.historyRequests.delete(remotePeerId);
+    this.attachmentService?.forgetPeer(remotePeerId);
     this.setStatus(this.openDataPeers.size > 0 ? "ready" : this.dataChannelPeers.size > 0 ? "connected" : "connected");
   }
 
@@ -390,6 +474,7 @@ export class ChatController {
     void (async () => {
       await this.sendGroupMembership(remotePeerId);
       await this.requestHistory(remotePeerId);
+      await this.attachmentService?.peerReady(remotePeerId);
     })();
   }
 
@@ -863,4 +948,14 @@ function base64UrlToArrayBuffer(value: string): ArrayBuffer {
   const bytes = new Uint8Array(buffer);
   for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
   return buffer;
+}
+
+function triggerDownload(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.rel = "noopener";
+  anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }

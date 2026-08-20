@@ -15,6 +15,8 @@ if (process.platform === "linux") {
   process.env["PULSE_PROP_application.id"] = "com.risk.calls";
 }
 
+app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
+
 const root = path.dirname(fileURLToPath(import.meta.url));
 const DEVELOPMENT_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:5173"]);
 const DESKTOP_HOST = "127.0.0.1";
@@ -247,9 +249,6 @@ ipcMain.handle("screen:choose", async (event) => {
   });
   if (!allSources.length) return null;
 
-  // O dialog nativo substitui window.prompt(), que não é suportado no renderer
-  // sandboxed do Electron. Limitamos a lista para evitar um dialog impraticável
-  // quando o usuário possui dezenas de janelas abertas.
   const sources = allSources.slice(0, 20);
   const buttons = [...sources.map((source) => source.name.slice(0, 80)), "Cancelar"];
   const owner = BrowserWindow.fromWebContents(event.sender);
@@ -350,12 +349,6 @@ if (hasSingleInstanceLock) {
           return;
         }
 
-        // Electron 43.4.0 aceita internamente o device id de áudio como string.
-        // Em Windows usamos diretamente loopbackWithoutChrome para acionar o
-        // process-loopback nativo do Chromium e excluir toda a reprodução da
-        // árvore do próprio Risk. Isso evita depender da propagação de
-        // restrictOwnAudio, que nos testes reais do Electron estava chegando
-        // como false mesmo quando solicitado pelo renderer.
         const audioDevice = process.platform === "win32"
           ? WINDOWS_LOOPBACK_WITHOUT_RISK
           : "loopback";

@@ -1,4 +1,4 @@
-import { OFFLINE_STORES, getAllFromStore, openRiskDatabase, putInStore } from "./database";
+import { OFFLINE_STORES, deleteFromStore, getAllFromStore, openRiskDatabase, putInStore } from "./database";
 
 export type PublicPeerIdentity = { peerId: string; publicKey: JsonWebKey; displayName: string; avatar?: string };
 export type LocalIdentity = PublicPeerIdentity & { id: "self"; privateKey: CryptoKey };
@@ -65,6 +65,13 @@ export async function saveLocalFriend(friend: LocalFriend): Promise<void> {
   await desktopRequest(config, "/p2p/friends", { method: "POST", body: JSON.stringify(friend) });
 }
 
+export async function deleteLocalFriend(peerId: string): Promise<void> {
+  await deleteFromStore(OFFLINE_STORES.friends, peerId).catch(() => undefined);
+  const config = await desktopConfig();
+  if (!config) return;
+  await desktopRequest(config, `/p2p/friends/${encodeURIComponent(peerId)}/delete`, { method: "POST" });
+}
+
 export async function loadLocalGroups(): Promise<LocalGroup[]> {
   const config = await desktopConfig();
   if (!config) {
@@ -88,6 +95,13 @@ export async function saveLocalGroup(group: LocalGroup): Promise<void> {
     return;
   }
   await desktopRequest(config, "/p2p/groups", { method: "POST", body: JSON.stringify(group) });
+}
+
+export async function deleteLocalGroup(groupId: string): Promise<void> {
+  await deleteFromStore(OFFLINE_STORES.groups, groupId).catch(() => undefined);
+  const config = await desktopConfig();
+  if (!config) return;
+  await desktopRequest(config, `/p2p/groups/${encodeURIComponent(groupId)}/delete`, { method: "POST" });
 }
 
 export async function createLocalGroup(name: string, owner: PublicPeerIdentity): Promise<LocalGroup> {
@@ -210,9 +224,6 @@ async function desktopConfig(): Promise<DesktopBackendConfig | null> {
     return desktopConfigPromise;
   }
 
-  // Quando localhost:5173 é aberto diretamente no navegador durante `pnpm dev:desktop`,
-  // ele não possui o preload do Electron. O Vite fornece /__risk-api e injeta o token
-  // efêmero no processo Node, permitindo usar o MESMO SQLite do sidecar sem expor o token.
   if (import.meta.env.DEV && import.meta.env.VITE_API_URL === DEV_BACKEND_PROXY) {
     return { baseUrl: DEV_BACKEND_PROXY };
   }

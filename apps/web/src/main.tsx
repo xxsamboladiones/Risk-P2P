@@ -129,7 +129,12 @@ function VideoTile({ participant }: { participant: Participant }) {
   const userHasAudio = Boolean(cameraStream?.getAudioTracks().length);
   const screenHasAudio = Boolean(screenStream?.getAudioTracks().length);
 
-  return <article className={`tile ${source} ${participant.connection === "connected" ? "online" : ""}`}>
+  return <article
+    className={`tile ${source} ${participant.connection === "connected" ? "online" : ""}`}
+    tabIndex={0}
+    title="Clique para destacar · duplo clique para tela cheia"
+    onDoubleClick={(event) => { void event.currentTarget.requestFullscreen().catch(() => undefined); }}
+  >
     <video ref={ref} autoPlay playsInline muted className={hasVideo ? source : "hidden-video"}/>
     {!hasVideo && <div className="video-off"><VideoOff/><span>Vídeo desligado</span></div>}
     {userHasAudio && <RemoteAudio stream={cameraStream!} volume={userVolume}/>} 
@@ -155,7 +160,12 @@ function LocalVideoTile({ stream, label, mirrored, microphone }: { stream: Media
       void ref.current.play().catch(() => undefined);
     }
   }, [stream]);
-  return <article className={`tile local online ${source}`}>
+  return <article
+    className={`tile local online ${source}`}
+    tabIndex={0}
+    title="Clique para destacar · duplo clique para tela cheia"
+    onDoubleClick={(event) => { void event.currentTarget.requestFullscreen().catch(() => undefined); }}
+  >
     <video ref={ref} autoPlay playsInline muted className={`${source}${mirrored ? " mirrored" : ""}`}/>
     <div className="tile-label"><span>Você · {label}</span>{!microphone && <MicOff size={15}/>}<em>PRÉVIA</em></div>
   </article>;
@@ -198,8 +208,7 @@ function Auth() {
 function Modal({ title, children, onClose }: { title: string; children: React.ReactNode; onClose(): void }) {
   return <div className="modal-backdrop" onMouseDown={onClose}>
     <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
-      <button className="modal-close" onClick={onClose}>×</button><h2>{title}</h2>{children}
-    </section>
+      <button className="modal-close" onClick={onClose}>×</button><h2>{title}</h2>{children}</section>
   </div>;
 }
 
@@ -560,7 +569,9 @@ function CallRoom() {
   return <main className="room">
     <header><div className="brand"><Sparkles/> Risk</div><div><strong>Sala ao vivo</strong><span>{roomId}</span></div><div className="status"><i/> Conectado · {peers.length + 1}</div></header>
     {callError && <div className="global-error" onClick={() => setError(null)}>{callError}</div>}
-    <section className="stage">
+    <section className="stage" onMouseDown={(event) => {
+      if (event.target === event.currentTarget && document.activeElement instanceof HTMLElement) document.activeElement.blur();
+    }}>
       {localPreviews.camera && <LocalVideoTile stream={localPreviews.camera} label="Câmera" mirrored microphone={localState.microphone}/>} 
       {localPreviews.screen && <LocalVideoTile stream={localPreviews.screen} label={localState.screenAudio ? "Tela · áudio ativo" : "Tela · sem áudio do sistema"} mirrored={false} microphone={localState.microphone}/>} 
       {peers.map((participant) => <VideoTile key={participant.peerId} participant={participant}/>)}

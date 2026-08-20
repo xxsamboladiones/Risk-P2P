@@ -33,6 +33,7 @@ export async function getOrCreateLocalIdentity(displayName: string): Promise<Loc
       existing = { ...existing, displayName };
       await putInStore(OFFLINE_STORES.identity, existing);
     }
+    await refreshIdentityMembership().catch((error) => console.warn("Não foi possível reconciliar a identidade P2P com os grupos locais.", error));
     return existing;
   }
   const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
@@ -44,6 +45,7 @@ export async function getOrCreateLocalIdentity(displayName: string): Promise<Loc
     privateKey: await makePrivateKeyNonExtractable(pair.privateKey),
   };
   await putInStore(OFFLINE_STORES.identity, identity);
+  await refreshIdentityMembership().catch((error) => console.warn("Não foi possível incluir a nova identidade P2P nos grupos locais.", error));
   return identity;
 }
 
@@ -145,6 +147,10 @@ export async function mergeLocalGroupMembers(groupId: string, incoming: PublicPe
 
 export function publicIdentity(identity: LocalIdentity): PublicPeerIdentity {
   return { peerId: identity.peerId, publicKey: identity.publicKey, displayName: identity.displayName, avatar: identity.avatar };
+}
+
+async function refreshIdentityMembership(): Promise<void> {
+  await loadLocalGroups();
 }
 
 async function reconcileIdentityMembership(

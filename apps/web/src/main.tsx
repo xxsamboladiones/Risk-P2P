@@ -28,6 +28,7 @@ import {
   type ChatAttachmentRecord,
   type ChatConnectionStatus,
 } from "./chat";
+import { CallWorkspace } from "./components/CallWorkspace";
 import { ConversationTimeline } from "./components/ConversationTimeline";
 import { GroupInvitePanel } from "./components/GroupInvitePanel";
 import { MessageComposer } from "./components/MessageComposer";
@@ -556,34 +557,7 @@ function attachmentStateWeight(state: ChatAttachmentRecord["state"]): number {
 }
 
 function CallRoom() {
-  const roomId = useCallStore((state) => state.roomId)!;
-  const participants = useCallStore((state) => state.participants);
-  const localPreviews = useCallStore((state) => state.localPreviews);
-  const localState = useCallStore((state) => state.localState);
-  const callError = useCallStore((state) => state.error);
-  const setError = useCallStore((state) => state.setError);
-  const setRoom = useCallStore((state) => state.setRoom);
-  const peers = Object.values(participants);
-  const hasVideo = Boolean(localPreviews.camera || localPreviews.screen);
-
-  return <main className="room">
-    <header><div className="brand"><Sparkles/> Risk</div><div><strong>Sala ao vivo</strong><span>{roomId}</span></div><div className="status"><i/> Conectado · {peers.length + 1}</div></header>
-    {callError && <div className="global-error" onClick={() => setError(null)}>{callError}</div>}
-    <section className="stage" onMouseDown={(event) => {
-      if (event.target === event.currentTarget && document.activeElement instanceof HTMLElement) document.activeElement.blur();
-    }}>
-      {localPreviews.camera && <LocalVideoTile stream={localPreviews.camera} label="Câmera" mirrored microphone={localState.microphone}/>} 
-      {localPreviews.screen && <LocalVideoTile stream={localPreviews.screen} label={localState.screenAudio ? "Tela · áudio ativo" : "Tela · sem áudio do sistema"} mirrored={false} microphone={localState.microphone}/>} 
-      {peers.map((participant) => <VideoTile key={participant.peerId} participant={participant}/>)}
-      {!hasVideo && !peers.length && <div className="empty"><div className="pulse"><Sparkles/></div><h2>Você chegou primeiro</h2><p>Compartilhe o código <b>{roomId}</b> para alguém entrar.</p></div>}
-    </section>
-    <footer>
-      <button className={localState.microphone ? "" : "off"} onClick={() => void call.toggleMicrophone(roomId)}>{localState.microphone ? <Mic/> : <MicOff/>}<span>Microfone</span></button>
-      <button className={localState.camera ? "active" : ""} onClick={() => void call.toggleCamera(roomId)}>{localState.camera ? <Video/> : <VideoOff/>}<span>Câmera</span></button>
-      <button className={localState.screenShare ? "active" : ""} onClick={() => void call.toggleScreen(roomId)}><MonitorUp/><span>Compartilhar</span></button>
-      <button className="hangup" onClick={() => { setRoom(null); void call.leave(roomId); }}><PhoneOff/><span>Sair</span></button>
-    </footer>
-  </main>;
+  return <CallWorkspace call={call} chat={chat}/>;
 }
 
 function App() {

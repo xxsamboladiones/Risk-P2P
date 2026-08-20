@@ -1,23 +1,17 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Hash,
   Headphones,
   LogOut,
   MessageCircle,
-  Mic,
-  MicOff,
-  MonitorUp,
-  PhoneOff,
   Plus,
   Settings2,
   Sparkles,
+  Trash2,
+  UserMinus,
   UserPlus,
   Users,
-  Video,
-  VideoOff,
-  Volume2,
-  VolumeX,
 } from "lucide-react";
 import { api, type Channel, type ChatMessage, type Community, type CurrentUser, type Friend, type PendingFriend } from "./api";
 import { CallController } from "./call";
@@ -37,13 +31,15 @@ import { VoiceVideoSettingsPanel } from "./components/VoiceVideoSettingsPanel";
 import {
   addLocalGroupChannel,
   createLocalGroup,
+  deleteLocalFriend,
+  deleteLocalGroup,
   getOrCreateLocalIdentity,
   loadLocalFriends,
   loadLocalGroups,
   publicIdentity,
   type PublicPeerIdentity,
 } from "./services/offline/social-storage";
-import { useCallStore, type Participant } from "./store";
+import { useCallStore } from "./store";
 import "./styles.css";
 
 const call = new CallController();
@@ -60,116 +56,6 @@ function restoreSession(): Promise<string | null> {
       .finally(() => { sessionRestore = undefined; });
   }
   return sessionRestore;
-}
-
-function RemoteAudio({ stream, volume }: { stream: MediaStream; volume: number }) {
-  const contextRef = useRef<AudioContext | null>(null);
-  const gainRef = useRef<GainNode | null>(null);
-
-  useEffect(() => {
-    const context = new AudioContext();
-    const source = context.createMediaStreamSource(stream);
-    const gain = context.createGain();
-    gain.gain.value = volume / 100;
-    source.connect(gain).connect(context.destination);
-    contextRef.current = context;
-    gainRef.current = gain;
-    void context.resume().catch(() => undefined);
-    return () => {
-      source.disconnect();
-      gain.disconnect();
-      void context.close();
-      contextRef.current = null;
-      gainRef.current = null;
-    };
-  }, [stream]);
-
-  useEffect(() => {
-    const gain = gainRef.current;
-    if (gain) gain.gain.setTargetAtTime(volume / 100, gain.context.currentTime, 0.015);
-    if (contextRef.current?.state === "suspended") void contextRef.current.resume().catch(() => undefined);
-  }, [volume]);
-
-  return null;
-}
-
-function VolumeControl({ label, value, onChange }: { label: string; value: number; onChange(value: number): void }) {
-  return <label className="volume-control" title={`${label}: ${value}%`}>
-    {value === 0 ? <VolumeX size={15}/> : <Volume2 size={15}/>}<span>{label}</span>
-    <input type="range" min="0" max="200" step="5" value={value} onChange={(event) => onChange(Number(event.target.value))} aria-label={`Volume de ${label}`}/>
-    <b>{value}%</b>
-  </label>;
-}
-
-function VideoTile({ participant }: { participant: Participant }) {
-  const streams = Object.values(participant.streams ?? {});
-  const screenStream = participant.state.screenStreamId ? participant.streams?.[participant.state.screenStreamId] : undefined;
-  const cameraStream = (participant.state.cameraStreamId ? participant.streams?.[participant.state.cameraStreamId] : undefined)
-    ?? streams.find((stream) => stream.id !== screenStream?.id);
-  const [source, setSource] = useState<"camera" | "screen">("camera");
-  const [userVolume, setUserVolume] = useState(100);
-  const [screenVolume, setScreenVolume] = useState(100);
-
-  useEffect(() => {
-    if (participant.state.screenShare && screenStream) setSource("screen");
-    else if (!participant.state.screenShare) setSource("camera");
-  }, [participant.state.screenShare, screenStream]);
-
-  const selected = source === "screen" ? screenStream : cameraStream;
-  const ref = useRef<HTMLVideoElement>(null);
-  const trackKey = selected?.getVideoTracks().map((track) => track.id).join(":") ?? "";
-  useEffect(() => {
-    if (ref.current) {
-      ref.current.srcObject = selected ?? null;
-      void ref.current.play().catch(() => undefined);
-    }
-  }, [selected, trackKey]);
-
-  const hasVideo = Boolean(selected?.getVideoTracks().length);
-  const canSwitch = participant.state.camera && Boolean(cameraStream && screenStream);
-  const userHasAudio = Boolean(cameraStream?.getAudioTracks().length);
-  const screenHasAudio = Boolean(screenStream?.getAudioTracks().length);
-
-  return <article
-    className={`tile ${source} ${participant.connection === "connected" ? "online" : ""}`}
-    tabIndex={0}
-    title="Clique para destacar · duplo clique para tela cheia"
-    onDoubleClick={(event) => { void event.currentTarget.requestFullscreen().catch(() => undefined); }}
-  >
-    <video ref={ref} autoPlay playsInline muted className={hasVideo ? source : "hidden-video"}/>
-    {!hasVideo && <div className="video-off"><VideoOff/><span>Vídeo desligado</span></div>}
-    {userHasAudio && <RemoteAudio stream={cameraStream!} volume={userVolume}/>} 
-    {screenHasAudio && <RemoteAudio stream={screenStream!} volume={screenVolume}/>} 
-    {canSwitch && <div className="source-switch">
-      <button className={source === "camera" ? "selected" : ""} onClick={() => setSource("camera")}><Video size={14}/> Câmera</button>
-      <button className={source === "screen" ? "selected" : ""} onClick={() => setSource("screen")}><MonitorUp size={14}/> Tela</button>
-    </div>}
-    {(userHasAudio || screenHasAudio) && <div className="volume-panel">
-      {userHasAudio && <VolumeControl label="Usuário" value={userVolume} onChange={setUserVolume}/>} 
-      {screenHasAudio && <VolumeControl label="Transmissão" value={screenVolume} onChange={setScreenVolume}/>} 
-    </div>}
-    <div className="tile-label"><span>{participant.displayName}</span>{!participant.state.microphone && <MicOff size={15}/>} {participant.state.screenAudio && <em>ÁUDIO DA TELA</em>}</div>
-  </article>;
-}
-
-function LocalVideoTile({ stream, label, mirrored, microphone }: { stream: MediaStream; label: string; mirrored: boolean; microphone: boolean }) {
-  const ref = useRef<HTMLVideoElement>(null);
-  const source = mirrored ? "camera" : "screen";
-  useEffect(() => {
-    if (ref.current) {
-      ref.current.srcObject = stream;
-      void ref.current.play().catch(() => undefined);
-    }
-  }, [stream]);
-  return <article
-    className={`tile local online ${source}`}
-    tabIndex={0}
-    title="Clique para destacar · duplo clique para tela cheia"
-    onDoubleClick={(event) => { void event.currentTarget.requestFullscreen().catch(() => undefined); }}
-  >
-    <video ref={ref} autoPlay playsInline muted className={`${source}${mirrored ? " mirrored" : ""}`}/>
-    <div className="tile-label"><span>Você · {label}</span>{!microphone && <MicOff size={15}/>}<em>PRÉVIA</em></div>
-  </article>;
 }
 
 function Auth() {
@@ -214,6 +100,7 @@ function Modal({ title, children, onClose }: { title: string; children: React.Re
 }
 
 type SocialModal = "friend" | "group" | "channel" | "member" | "joinGroup" | "settings" | null;
+type DeleteTarget = { kind: "friend"; friend: Friend } | { kind: "group"; group: Community } | null;
 
 function SocialHome() {
   const token = useCallStore((state) => state.token)!;
@@ -233,6 +120,8 @@ function SocialHome() {
   const [attachments, setAttachments] = useState<ChatAttachmentRecord[]>([]);
   const [attachmentProgress, setAttachmentProgress] = useState<Record<string, ChatAttachmentProgress | undefined>>({});
   const [modal, setModal] = useState<SocialModal>(null);
+  const [deleteTarget, setDeleteTarget] = useState<DeleteTarget>(null);
+  const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState("");
   const [chatStatus, setChatStatus] = useState<ChatConnectionStatus>("disconnected");
 
@@ -245,7 +134,9 @@ function SocialHome() {
     ]);
     const mergedFriends = [...social.friends];
     localFriends.forEach((friend) => {
-      if (!mergedFriends.some((item) => item.id === friend.peerId)) mergedFriends.push({ id: friend.peerId, displayName: friend.displayName, local: true });
+      const existing = mergedFriends.find((item) => item.id === friend.peerId);
+      if (existing) existing.local = true;
+      else mergedFriends.push({ id: friend.peerId, displayName: friend.displayName, local: true });
     });
     const mergedGroups = [...groups];
     localGroups.forEach((group) => {
@@ -418,6 +309,51 @@ function SocialHome() {
     catch (cause) { setError(cause instanceof Error ? cause.message : "Falha na operação com o arquivo"); }
   }
 
+  async function performDelete() {
+    const target = deleteTarget;
+    if (!target || deleting) return;
+    setDeleting(true);
+    try {
+      if (target.kind === "friend") {
+        const results = await Promise.allSettled([
+          deleteLocalFriend(target.friend.id),
+          api.removeFriend(token, target.friend.id),
+        ]);
+        if (results.every((result) => result.status === "rejected")) {
+          const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+          throw failure?.reason ?? new Error("Não foi possível desfazer a amizade.");
+        }
+        if (activeFriend?.id === target.friend.id) {
+          await chat.disconnect().catch(() => undefined);
+          setActiveFriend(null);
+        }
+      } else {
+        const results = await Promise.allSettled([
+          deleteLocalGroup(target.group.id),
+          api.removeCommunity(token, target.group.id),
+        ]);
+        if (results.every((result) => result.status === "rejected")) {
+          const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+          throw failure?.reason ?? new Error("Não foi possível remover o grupo.");
+        }
+        if (selectedCommunity?.id === target.group.id) {
+          await chat.disconnect().catch(() => undefined);
+          setSelectedCommunity(null);
+          setChannels([]);
+          setActiveChannel(null);
+          setGroupMembers([]);
+        }
+      }
+      setDeleteTarget(null);
+      await loadSocial();
+      window.dispatchEvent(new Event("risk:social-updated"));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível concluir a remoção.");
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   async function logout() {
     sessionRestoreSuppressed = true;
     sessionRestore = undefined;
@@ -449,7 +385,7 @@ function SocialHome() {
       </aside>
 
       <aside className="navigation">
-        <div className="nav-title">{selectedCommunity?.name ?? activeFriend?.displayName ?? "Risk"}</div>
+        <div className="nav-title"><span>{selectedCommunity?.name ?? activeFriend?.displayName ?? "Risk"}</span>{selectedCommunity && <button className="nav-danger" title="Apagar ou sair do grupo" aria-label="Apagar ou sair do grupo" onClick={() => setDeleteTarget({ kind: "group", group: selectedCommunity })}><Trash2 size={16}/></button>}</div>
         {selectedCommunity ? <>
           <div className="nav-section"><span>CANAIS DE TEXTO</span><button onClick={() => setModal("channel")}><Plus size={15}/></button></div>
           {channels.filter((item) => item.kind === "text").map((channel) => <button key={channel.id} className={activeChannel?.id === channel.id ? "channel active" : "channel"} onClick={() => setActiveChannel(channel)}><Hash/>{channel.name}</button>)}
@@ -484,7 +420,7 @@ function SocialHome() {
           <div className="friends-layout"><div>
             <h3>Seus amigos — {friends.length}</h3>
             {pending.map((request) => <div className="friend-row pending" key={request.requestId}><div className="avatar">{request.displayName[0]}</div><div><strong>{request.displayName}</strong><small>Quer adicionar você</small></div><button onClick={() => void api.acceptFriend(token, request.requestId).then(loadSocial).catch((cause) => setError(cause instanceof Error ? cause.message : "Falha ao aceitar"))}>Aceitar</button></div>)}
-            {friends.map((friend) => <div className="friend-row" key={friend.id}><div className="avatar">{friend.displayName[0]}</div><div><strong>{friend.displayName}</strong><small>{friend.local ? "Amigo P2P neste dispositivo" : "Amigo no Risk"}</small></div><button disabled={!friend.local} title={friend.local ? "Abrir chat privado P2P" : "Chat P2P requer amizade por identidade local"} onClick={() => { setSelectedCommunity(null); setActiveFriend(friend); }}><MessageCircle size={18}/></button></div>)}
+            {friends.map((friend) => <div className="friend-row" key={friend.id}><div className="avatar">{friend.displayName[0]}</div><div><strong>{friend.displayName}</strong><small>{friend.local ? "Amigo P2P neste dispositivo" : "Amigo no Risk"}</small></div><div className="friend-actions"><button disabled={!friend.local} title={friend.local ? "Abrir chat privado P2P" : "Chat P2P requer amizade por identidade local"} onClick={() => { setSelectedCommunity(null); setActiveFriend(friend); }}><MessageCircle size={18}/></button><button className="danger-icon" title="Desfazer amizade" aria-label={`Desfazer amizade com ${friend.displayName}`} onClick={() => setDeleteTarget({ kind: "friend", friend })}><UserMinus size={18}/></button></div></div>)}
             {!friends.length && !pending.length && <div className="empty-social"><Users/><h2>Seu círculo começa aqui</h2><p>Crie um código temporário ou use o código de outra pessoa.</p><button onClick={() => setModal("friend")}>Adicionar primeiro amigo</button></div>}
           </div><aside><h3>Atividade</h3><p>As salas de voz ativas dos seus grupos aparecerão aqui futuramente.</p></aside></div>
         </> : activeChannel?.kind === "text" ? <>
@@ -533,6 +469,7 @@ function SocialHome() {
       }}><input name="name" minLength={2} maxLength={80} placeholder="Nome do canal" required/><select name="kind"><option value="text">Canal de texto</option><option value="voice">Sala de voz</option></select><button>Criar canal</button></form></Modal>}
       {modal === "member" && selectedCommunity && <Modal title="Adicionar membro" onClose={() => setModal(null)}>{currentUser ? <GroupInvitePanel token={token} displayName={currentUser.displayName} preferredGroupId={selectedCommunity.id} preferredGroupName={selectedCommunity.name} preferredGroupChannels={channels} initialMode="create" onComplete={() => void loadSocial()}/> : <p>Carregando sua identidade…</p>}</Modal>}
       {modal === "joinGroup" && <Modal title="Entrar em grupo" onClose={() => setModal(null)}>{currentUser ? <GroupInvitePanel token={token} displayName={currentUser.displayName} initialMode="join" onComplete={() => { void loadSocial(); setModal(null); }}/> : <p>Carregando sua identidade…</p>}</Modal>}
+      {deleteTarget && <Modal title={deleteTarget.kind === "friend" ? "Desfazer amizade" : "Remover grupo"} onClose={() => { if (!deleting) setDeleteTarget(null); }}><div className="danger-confirm"><div className="danger-confirm-icon">{deleteTarget.kind === "friend" ? <UserMinus/> : <Trash2/>}</div>{deleteTarget.kind === "friend" ? <p>Desfazer amizade com <strong>{deleteTarget.friend.displayName}</strong>? O histórico local não será apagado automaticamente.</p> : <p>Remover <strong>{deleteTarget.group.name}</strong>? Se você for o dono, o grupo será apagado. Caso contrário, você apenas sairá dele.</p>}<div className="danger-confirm-actions"><button className="secondary" disabled={deleting} onClick={() => setDeleteTarget(null)}>Cancelar</button><button className="danger-action" disabled={deleting} onClick={() => void performDelete()}>{deleting ? "Removendo…" : deleteTarget.kind === "friend" ? "Desfazer amizade" : "Remover grupo"}</button></div></div></Modal>}
     </main>
     <button className="floating-invite" onClick={() => setModal("joinGroup")}><UserPlus size={18}/> Entrar em grupo</button>
   </>;

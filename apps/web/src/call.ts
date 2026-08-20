@@ -21,6 +21,16 @@ type DesktopScreenAudioPreparation = {
   reason?: string;
 };
 
+function placeholderParticipant(peerId: string): Participant {
+  return {
+    peerId,
+    displayName: `Peer ${peerId.slice(0, 6)}`,
+    state: { microphone: true, camera: false, screenShare: false },
+    streams: {},
+    connection: "new",
+  };
+}
+
 async function prepareDesktopScreenAudio(excludeRisk: boolean): Promise<DesktopScreenAudioPreparation | null> {
   if (!window.desktop?.getBackendConfig) return null;
   const config = await window.desktop.getBackendConfig();
@@ -190,15 +200,15 @@ export class CallController {
       sendIce: (targetPeerId, candidate) => this.signaling!.sendIceCandidate(targetPeerId, candidate),
       onRemoteStream: (remotePeerId, stream) => {
         const store = useCallStore.getState();
-        const participant = store.participants[remotePeerId];
-        if (!participant) return;
+        const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
         const streams = { ...participant.streams, [stream.id]: stream };
         const state = reconcileRemoteMediaState(streams, participant.state);
         store.upsert({ ...participant, streams, state });
       },
       onConnectionState: (remotePeerId, connection) => {
-        const participant = useCallStore.getState().participants[remotePeerId];
-        if (participant) useCallStore.getState().upsert({ ...participant, connection });
+        const store = useCallStore.getState();
+        const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
+        store.upsert({ ...participant, connection });
       },
     });
     this.bindSignaling(this.signaling, roomId, this.peerId);
@@ -278,12 +288,14 @@ export class CallController {
     try {
       if (this.cameraTrack) {
         const track = this.cameraTrack;
+        this.cameraTrack = undefined;
+        this.state.camera = false;
+        this.updateLocalPreview();
+        void this.signaling?.sendPeerState(this.state).catch((error) => this.reportError(error, "Não foi possível atualizar a câmera."));
         await this.transport?.unpublishTrack(track);
         if (!this.isActive(lifecycle)) return;
         track.stop();
         this.local.removeTrack(track);
-        this.cameraTrack = undefined;
-        this.state.camera = false;
       } else {
         const cameraStream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 } } });
         const cameraTrack = cameraStream.getVideoTracks()[0];
@@ -297,15 +309,25 @@ export class CallController {
         }
         this.cameraTrack = cameraTrack;
         this.local.addTrack(cameraTrack);
-        await this.transport?.publishTrack(cameraTrack, this.local);
+        this.state.camera = true;
+        this.updateLocalPreview();
+        void this.signaling?.sendPeerState(this.state).catch((error) => this.reportError(error, "Não foi possível atualizar a câmera."));
+        try {
+          await this.transport?.publishTrack(cameraTrack, this.local);
+        } catch (error) {
+          if (this.cameraTrack === cameraTrack) this.cameraTrack = undefined;
+          this.local.removeTrack(cameraTrack);
+          cameraTrack.stop();
+          this.state.camera = false;
+          this.updateLocalPreview();
+          void this.signaling?.sendPeerState(this.state).catch(() => undefined);
+          throw error;
+        }
         if (!this.isActive(lifecycle)) {
           cameraTrack.stop();
           return;
         }
-        this.state.camera = true;
       }
-      this.updateLocalPreview();
-      await this.signaling?.sendPeerState(this.state);
     } catch (error) { this.reportError(error, "Não foi possível alterar a câmera."); }
   }
 
@@ -313,6 +335,7 @@ export class CallController {
     if (this.screenStream) { await this.stopScreen(); return; }
     const lifecycle = this.lifecycleId;
     let desktopAudio: DesktopScreenAudioPreparation | null = null;
+    let stream: MediaStream | undefined;
     try {
       const voiceSettings = loadVoiceVideoSettings();
       desktopAudio = await prepareDesktopScreenAudio(voiceSettings.excludeRiskAudioFromScreenShare).catch((error) => {
@@ -321,7 +344,7 @@ export class CallController {
       });
 
       const pipeWireDesktop = desktopAudio?.mode === "pipewire" || desktopAudio?.mode === "unavailable";
-      const stream = pipeWireDesktop
+      stream = pipeWireDesktop
         ? await startPipeWireDesktopShare(desktopAudio!)
         : await this.screen.startScreenShare();
 
@@ -381,19 +404,22 @@ export class CallController {
         this.screenStream = undefined;
         return;
       }
-      await Promise.all(stream.getTracks().map((track) => transport.publishTrack(track, stream)));
+
+      this.state.screenShare = true;
+      this.state.screenStreamId = stream.id;
+      this.state.screenAudio = stream.getAudioTracks().length > 0;
+      this.updateLocalPreview();
+      void this.signaling?.sendPeerState(this.state).catch((error) => this.reportError(error, "Não foi possível atualizar o compartilhamento de tela."));
+
+      await Promise.all(stream.getTracks().map((track) => transport.publishTrack(track, stream!)));
       if (!this.isActive(lifecycle)) {
         stream.getTracks().forEach((track) => track.stop());
         await stopDesktopScreenAudio();
         return;
       }
-      this.state.screenShare = true;
-      this.state.screenStreamId = stream.id;
-      this.state.screenAudio = stream.getAudioTracks().length > 0;
-      this.updateLocalPreview();
-      await this.signaling?.sendPeerState(this.state);
     } catch (error) {
-      if (desktopAudio?.mode === "pipewire") await stopDesktopScreenAudio();
+      if (stream && this.screenStream === stream) await this.stopScreen().catch(() => undefined);
+      else if (desktopAudio?.mode === "pipewire") await stopDesktopScreenAudio();
       if (!(error instanceof DOMException && error.name === "NotAllowedError")) this.reportError(error, "Não foi possível compartilhar a tela.");
     }
   }
@@ -411,13 +437,8 @@ export class CallController {
     this.signalingUnsubscribers.push(
       signaling.onPeerJoined((peer) => {
         const store = useCallStore.getState();
-        store.upsert({
-          peerId: peer.peerId,
-          displayName: `Peer ${peer.peerId.slice(0, 6)}`,
-          state: { microphone: true, camera: false, screenShare: false },
-          streams: {},
-          connection: "new",
-        });
+        const participant = store.participants[peer.peerId] ?? placeholderParticipant(peer.peerId);
+        store.upsert({ ...participant, connection: participant.connection ?? "new" });
         void this.transport?.connect(peer.peerId, peerId < peer.peerId).catch((error) => store.setError(String(error)));
         void signaling.sendPeerState(this.state).catch((error) => store.setError(String(error)));
         void signaling.sendPeerProfile(this.displayName).catch((error) => store.setError(String(error)));
@@ -437,22 +458,13 @@ export class CallController {
       }),
       signaling.onPeerState((message) => {
         const store = useCallStore.getState();
-        const participant = store.participants[message.fromPeerId] ?? {
-          peerId: message.fromPeerId,
-          displayName: `Peer ${message.fromPeerId.slice(0, 6)}`,
-          streams: {},
-        };
+        const participant = store.participants[message.fromPeerId] ?? placeholderParticipant(message.fromPeerId);
         const state = reconcileRemoteMediaState(participant.streams, message.payload.state);
         store.upsert({ ...participant, state });
       }),
       signaling.onPeerProfile((message) => {
         const store = useCallStore.getState();
-        const participant = store.participants[message.fromPeerId] ?? {
-          peerId: message.fromPeerId,
-          displayName: message.payload.displayName,
-          state: { microphone: true, camera: false, screenShare: false },
-          streams: {},
-        };
+        const participant = store.participants[message.fromPeerId] ?? placeholderParticipant(message.fromPeerId);
         store.upsert({ ...participant, displayName: message.payload.displayName });
       }),
       signaling.onStatusChange((status) => {
@@ -466,16 +478,16 @@ export class CallController {
     const stream = this.screenStream;
     if (!stream) return;
     this.screenStream = undefined;
+    this.state.screenShare = false;
+    this.state.screenStreamId = undefined;
+    this.state.screenAudio = false;
+    this.updateLocalPreview();
+    void this.signaling?.sendPeerState(this.state).catch((error) => this.reportError(error, "Não foi possível atualizar o compartilhamento de tela."));
     const transport = this.transport;
     if (transport) await Promise.all(stream.getTracks().map((track) => transport.unpublishTrack(track).catch(() => undefined)));
     stream.getTracks().forEach((track) => track.stop());
     await this.screen.stopScreenShare().catch(() => undefined);
     await stopDesktopScreenAudio();
-    this.state.screenShare = false;
-    this.state.screenStreamId = undefined;
-    this.state.screenAudio = false;
-    this.updateLocalPreview();
-    await this.signaling?.sendPeerState(this.state).catch((error) => this.reportError(error, "Não foi possível atualizar o compartilhamento de tela."));
   }
 
   private updateLocalPreview(): void {

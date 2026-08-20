@@ -112,23 +112,7 @@ export class IndexedDbAttachmentStorage implements AttachmentChunkSink {
     source: Blob,
     manifest: AttachmentManifest,
   ): Promise<StoredAttachmentRecord> {
-    const now = new Date().toISOString();
-    const record: StoredAttachmentRecord = {
-      recordId: recordId(channelId, manifest.id, transferId),
-      attachmentId: manifest.id,
-      transferId,
-      channelId,
-      peerId,
-      direction: "outgoing",
-      manifest,
-      state: "offered",
-      bytesTransferred: 0,
-      totalBytes: manifest.size,
-      retryCount: 0,
-      createdAt: manifest.createdAt,
-      updatedAt: now,
-    };
-    await this.saveRecord(record);
+    const record = await this.registerOutgoing(transferId, channelId, peerId, manifest);
     for (let index = 0; index < manifest.chunkCount; index += 1) {
       const offset = index * manifest.chunkSize;
       const payload = await source.slice(offset, Math.min(source.size, offset + manifest.chunkSize)).arrayBuffer();
@@ -170,6 +154,29 @@ export class IndexedDbAttachmentStorage implements AttachmentChunkSink {
     return record;
   }
 
+  async registerSyncedMetadata(peerId: string, manifest: AttachmentManifest): Promise<StoredAttachmentRecord> {
+    const existing = await this.findAnyByAttachmentId(manifest.id);
+    if (existing) return existing;
+    const transferId = `sync:${peerId}:${manifest.id}`;
+    const record: StoredAttachmentRecord = {
+      recordId: recordId(manifest.channelId ?? "unknown", manifest.id, transferId),
+      attachmentId: manifest.id,
+      transferId,
+      channelId: manifest.channelId ?? "unknown",
+      peerId,
+      direction: "incoming",
+      manifest,
+      state: "waiting",
+      bytesTransferred: 0,
+      totalBytes: manifest.size,
+      retryCount: 0,
+      createdAt: manifest.createdAt,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.saveRecord(record);
+    return record;
+  }
+
   async updateProgress(progress: AttachmentTransferProgress): Promise<StoredAttachmentRecord | undefined> {
     const record = await this.findByTransferId(progress.transferId);
     if (!record) return undefined;
@@ -196,9 +203,13 @@ export class IndexedDbAttachmentStorage implements AttachmentChunkSink {
     return (await getAllByIndex<StoredAttachmentRecord>(OFFLINE_STORES.attachments, "transferId", transferId))[0];
   }
 
+  async findAnyByAttachmentId(attachmentId: string): Promise<StoredAttachmentRecord | undefined> {
+    return (await getAllByIndex<StoredAttachmentRecord>(OFFLINE_STORES.attachments, "attachmentId", attachmentId))[0];
+  }
+
   async findCompletedByAttachmentId(attachmentId: string): Promise<StoredAttachmentRecord | undefined> {
     return (await getAllByIndex<StoredAttachmentRecord>(OFFLINE_STORES.attachments, "attachmentId", attachmentId))
-      .find((record) => record.state === "completed");
+      .find((record) => record.state === "completed" || record.direction === "outgoing");
   }
 
   async getBlob(attachmentId: string, manifest?: AttachmentManifest): Promise<Blob> {

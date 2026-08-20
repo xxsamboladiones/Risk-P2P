@@ -35,6 +35,7 @@ type IncomingTransfer = {
 
 const DEFAULT_MAX_INCOMING_TRANSFERS = 4;
 const DEFAULT_MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024 * 1024;
+const MAX_MISSING_CHUNKS_PER_REQUEST = 2_048;
 
 export class AttachmentTransferReceiver extends EventTarget {
   private readonly transfers = new Map<string, IncomingTransfer>();
@@ -111,9 +112,10 @@ export class AttachmentTransferReceiver extends EventTarget {
     const transfer = this.requireTransfer(transferId);
     await this.sink.prepare(transferId, transfer.manifest);
     transfer.state = "accepted";
-    await this.sendControl(transfer.peerId, { type: "file.accept", transferId });
     const missing = await this.getMissingChunks(transfer);
-    if (missing.length > 0 && missing.length < transfer.manifest.chunkCount) {
+    if (missing.length === transfer.manifest.chunkCount) {
+      await this.sendControl(transfer.peerId, { type: "file.accept", transferId });
+    } else {
       await this.requestMissing(transfer.peerId, transfer, missing);
     }
     transfer.state = "transferring";
@@ -221,7 +223,11 @@ export class AttachmentTransferReceiver extends EventTarget {
   }
 
   private async requestMissing(peerId: string, transfer: IncomingTransfer, missingChunks: number[]): Promise<void> {
-    await this.sendControl(peerId, { type: "file.need", transferId: transfer.transferId, missingChunks });
+    await this.sendControl(peerId, {
+      type: "file.need",
+      transferId: transfer.transferId,
+      missingChunks: missingChunks.slice(0, MAX_MISSING_CHUNKS_PER_REQUEST),
+    });
   }
 
   private async getMissingChunks(transfer: IncomingTransfer): Promise<number[]> {

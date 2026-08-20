@@ -10,7 +10,6 @@ import {
   MonitorUp,
   PhoneOff,
   Plus,
-  Send,
   Settings2,
   Sparkles,
   UserPlus,
@@ -22,8 +21,16 @@ import {
 } from "lucide-react";
 import { api, type Channel, type ChatMessage, type Community, type CurrentUser, type Friend, type PendingFriend } from "./api";
 import { CallController } from "./call";
-import { ChatController, privateConversationId, type ChatConnectionStatus } from "./chat";
+import {
+  ChatController,
+  privateConversationId,
+  type ChatAttachmentProgress,
+  type ChatAttachmentRecord,
+  type ChatConnectionStatus,
+} from "./chat";
+import { ConversationTimeline } from "./components/ConversationTimeline";
 import { GroupInvitePanel } from "./components/GroupInvitePanel";
+import { MessageComposer } from "./components/MessageComposer";
 import { P2PInvitePanel } from "./components/P2PInvitePanel";
 import { VoiceVideoSettingsPanel } from "./components/VoiceVideoSettingsPanel";
 import {
@@ -213,6 +220,8 @@ function SocialHome() {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [activeChannel, setActiveChannel] = useState<Channel | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [attachments, setAttachments] = useState<ChatAttachmentRecord[]>([]);
+  const [attachmentProgress, setAttachmentProgress] = useState<Record<string, ChatAttachmentProgress | undefined>>({});
   const [modal, setModal] = useState<SocialModal>(null);
   const [error, setError] = useState("");
   const [chatStatus, setChatStatus] = useState<ChatConnectionStatus>("disconnected");
@@ -306,7 +315,7 @@ function SocialHome() {
 
   useEffect(() => {
     const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
-    if (!conversationId) { setMessages([]); return; }
+    if (!conversationId) { setMessages([]); setAttachments([]); setAttachmentProgress({}); return; }
     let alive = true;
     const offMessage = chat.onMessage((message) => {
       if (!alive) return;
@@ -316,15 +325,31 @@ function SocialHome() {
       });
     });
     const offStatus = chat.onStatus((status) => { if (alive) setChatStatus(status); });
-    void chat.history(conversationId)
-      .then((items) => { if (alive) setMessages([...items].sort((a, b) => a.createdAt.localeCompare(b.createdAt))); })
+    const offAttachment = chat.onAttachment((record) => {
+      if (!alive || record.channelId !== conversationId) return;
+      setAttachments((current) => upsertAttachment(current, record));
+    });
+    const offProgress = chat.onAttachmentProgress((progress) => {
+      if (!alive || progress.record.channelId !== conversationId) return;
+      setAttachmentProgress((current) => ({ ...current, [progress.record.attachmentId]: progress }));
+      setAttachments((current) => upsertAttachment(current, progress.record));
+    });
+    void Promise.all([chat.history(conversationId), chat.attachmentHistory(conversationId)])
+      .then(([chatItems, attachmentItems]) => {
+        if (!alive) return;
+        setMessages([...chatItems].sort((a, b) => a.createdAt.localeCompare(b.createdAt)));
+        setAttachments(dedupeAttachments(attachmentItems));
+      })
       .catch((cause) => setError(cause instanceof Error ? cause.message : "Falha no histórico local"));
     return () => {
       alive = false;
       offMessage();
       offStatus();
+      offAttachment();
+      offProgress();
       void chat.disconnect();
       setChatStatus("disconnected");
+      setAttachmentProgress({});
     };
   }, [activeChannel, activeFriend, privateChannelId]);
 
@@ -372,6 +397,17 @@ function SocialHome() {
     catch (cause) { setError(cause instanceof Error ? cause.message : "Falha ao enviar mensagem"); }
   }
 
+  async function sendFiles(files: File[]) {
+    try {
+      for (const file of files) await chat.sendAttachment(file);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Falha ao enviar arquivo"); }
+  }
+
+  async function attachmentAction(action: (record: ChatAttachmentRecord) => Promise<void>, record: ChatAttachmentRecord) {
+    try { await action(record); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : "Falha na operação com o arquivo"); }
+  }
+
   async function logout() {
     sessionRestoreSuppressed = true;
     sessionRestore = undefined;
@@ -379,6 +415,19 @@ function SocialHome() {
     catch { /* logout local continua mesmo se a API estiver indisponível */ }
     finally { reset(); }
   }
+
+  const timeline = <ConversationTimeline
+    messages={messages}
+    attachments={attachments}
+    progress={attachmentProgress}
+    connected={chatStatus === "ready"}
+    loadBlob={(record) => chat.attachmentBlob(record)}
+    onDownload={(record) => attachmentAction((item) => chat.downloadAttachment(item), record)}
+    onRequest={(record) => attachmentAction((item) => chat.requestAttachment(item), record)}
+    onPause={(record) => attachmentAction((item) => chat.pauseAttachment(item), record)}
+    onResume={(record) => attachmentAction((item) => chat.resumeAttachment(item), record)}
+    onCancel={(record) => attachmentAction((item) => chat.cancelAttachment(item), record)}
+  />;
 
   return <>
     <main className="social-shell">
@@ -416,10 +465,10 @@ function SocialHome() {
         {activeFriend ? <>
           <header className="content-header"><MessageCircle/><strong>{activeFriend.displayName}</strong><span>Mensagem direta P2P</span><button className={`chat-connect ${chatStatus}`} disabled={!privateChannelId || chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat privado conectado" : chatStatus === "connected" ? "Aguardando amigo…" : chatStatus === "connecting" ? "Conectando…" : "Conectar P2P"}</button></header>
           <div className="messages">
-            {messages.map((message) => <article key={message.id}><div className="avatar">{message.author[0]}</div><div><strong>{message.author}</strong><time>{new Date(message.createdAt).toLocaleString()}</time><p>{message.content}</p></div></article>)}
-            {!messages.length && <div className="channel-welcome"><MessageCircle/><h2>Conversa com {activeFriend.displayName}</h2><p>Os dois amigos devem abrir esta conversa e clicar em Conectar P2P. Depois disso as mensagens seguem pelo WebRTC DataChannel.</p></div>}
+            {timeline}
+            {!messages.length && !attachments.length && <div className="channel-welcome"><MessageCircle/><h2>Conversa com {activeFriend.displayName}</h2><p>Os dois amigos devem abrir esta conversa e clicar em Conectar P2P. Depois disso mensagens e arquivos seguem diretamente pelo WebRTC.</p></div>}
           </div>
-          <form className="message-box" onSubmit={(event) => void submitMessage(event)}><Plus/><input name="message" maxLength={4000} placeholder={`Mensagem para ${activeFriend.displayName}`} autoComplete="off"/><button><Send/></button></form>
+          <MessageComposer placeholder={`Mensagem para ${activeFriend.displayName}`} canAttach={chatStatus === "ready"} onSubmit={submitMessage} onFiles={sendFiles}/>
         </> : !selectedCommunity ? <>
           <header className="content-header"><Users/><strong>Amigos</strong><button onClick={() => setModal("friend")}>Adicionar amigo</button></header>
           <div className="friends-layout"><div>
@@ -431,10 +480,10 @@ function SocialHome() {
         </> : activeChannel?.kind === "text" ? <>
           <header className="content-header"><Hash/><strong>{activeChannel.name}</strong><span>{selectedCommunity.name}</span><button className={`chat-connect ${chatStatus}`} disabled={chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat P2P conectado" : chatStatus === "connected" ? "Aguardando peer…" : chatStatus === "connecting" ? "Conectando…" : "Conectar chat"}</button></header>
           <div className="messages">
-            {messages.map((message) => <article key={message.id}><div className="avatar">{message.author[0]}</div><div><strong>{message.author}</strong><time>{new Date(message.createdAt).toLocaleString()}</time><p>{message.content}</p></div></article>)}
-            {!messages.length && <div className="channel-welcome"><Hash/><h2>Bem-vindo a #{activeChannel.name}</h2><p>Este é o começo deste canal P2P salvo neste dispositivo.</p></div>}
+            {timeline}
+            {!messages.length && !attachments.length && <div className="channel-welcome"><Hash/><h2>Bem-vindo a #{activeChannel.name}</h2><p>Este é o começo deste canal P2P salvo neste dispositivo.</p></div>}
           </div>
-          <form className="message-box" onSubmit={(event) => void submitMessage(event)}><Plus/><input name="message" maxLength={4000} placeholder={`Conversar em #${activeChannel.name}`} autoComplete="off"/><button><Send/></button></form>
+          <MessageComposer placeholder={`Conversar em #${activeChannel.name}`} canAttach={chatStatus === "ready"} onSubmit={submitMessage} onFiles={sendFiles}/>
         </> : <div className="empty-social"><Headphones/><h2>Escolha uma sala</h2><p>Entre em um canal de voz pela barra lateral.</p></div>}
       </section>
 
@@ -477,6 +526,24 @@ function SocialHome() {
     </main>
     <button className="floating-invite" onClick={() => setModal("joinGroup")}><UserPlus size={18}/> Entrar em grupo</button>
   </>;
+}
+
+function upsertAttachment(current: ChatAttachmentRecord[], record: ChatAttachmentRecord): ChatAttachmentRecord[] {
+  const index = current.findIndex((item) => item.attachmentId === record.attachmentId);
+  if (index < 0) return [...current, record].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  const existing = current[index]!;
+  const replacement = attachmentStateWeight(record.state) >= attachmentStateWeight(existing.state) ? record : existing;
+  const next = [...current];
+  next[index] = replacement;
+  return next.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+}
+
+function dedupeAttachments(records: ChatAttachmentRecord[]): ChatAttachmentRecord[] {
+  return records.reduce<ChatAttachmentRecord[]>((items, record) => upsertAttachment(items, record), []);
+}
+
+function attachmentStateWeight(state: ChatAttachmentRecord["state"]): number {
+  return ({ offered: 1, waiting: 2, accepted: 3, queued: 4, transferring: 5, paused: 6, verifying: 7, failed: 8, cancelled: 8, completed: 10 })[state];
 }
 
 function CallRoom() {

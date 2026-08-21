@@ -1,88 +1,139 @@
 # Risk — comunicação P2P
 
-Risk é um aplicativo Web/Electron para chamadas de voz, vídeo, compartilhamento de tela e chat P2P via WebRTC.
+**Risk** é um aplicativo desktop de comunicação P2P com chamadas de voz e vídeo, compartilhamento de tela, chat, grupos e transferência de arquivos usando WebRTC.
 
-## Arquitetura atual
+> **Versão atual: Alpha 0.2.0**
+>
+> O projeto ainda está em fase Alpha. Recursos, protocolo e persistência podem mudar entre versões.
 
-O desktop é entregue como **um único aplicativo para o usuário**, mas internamente possui dois processos:
+## Principais recursos
 
-- Electron + React para a interface;
-- `risk-desktop-backend`, sidecar Rust iniciado automaticamente pelo Electron.
+- chamadas de voz P2P;
+- chamadas de vídeo com múltiplos participantes;
+- compartilhamento de tela com presets de qualidade até 1080p/60 FPS;
+- modo de tela cheia com foco em uma transmissão e zoom pelo scroll do mouse;
+- chat integrado durante chamadas;
+- envio P2P de arquivos e anexos pelo DataChannel;
+- previews de imagens, vídeos e áudios;
+- grupos com canais de texto e voz;
+- criação, edição e exclusão de canais locais;
+- amizades e convites P2P por código;
+- armazenamento local no desktop com Rust + SQLite;
+- aplicativo Electron para Windows e Linux.
+
+No Windows, o compartilhamento de tela pode capturar o áudio do sistema usando o caminho nativo do Electron. No Linux existe um caminho experimental via PipeWire para compartilhar áudio do sistema sem retransmitir o próprio áudio reproduzido pelo Risk; quando esse caminho não está disponível, o compartilhamento continua somente com vídeo.
+
+## Como o Risk funciona
+
+O desktop é entregue como **um único aplicativo**, mas internamente possui dois processos:
 
 ```text
 Risk Desktop
 │
-├── Electron Main
-│   ├── inicia o frontend
-│   ├── inicia o backend Rust
-│   ├── aguarda readiness + /health
-│   └── encerra o backend junto com o app
+├── Electron + React
+│   ├── interface
+│   ├── captura de mídia
+│   ├── signaling
+│   └── WebRTC
 │
-├── React UI
-│   └── HTTP local autenticado
-│
-└── Rust Desktop Backend
-    └── SQLite em app.getPath("userData")
+└── risk-desktop-backend
+    ├── Rust + Axum
+    └── SQLite local
 
-Supabase Realtime ── rendezvous / signaling efêmero
-WebRTC Mesh       ── áudio / vídeo / tela / DataChannel
+Supabase Realtime ── signaling / rendezvous efêmero
+WebRTC Mesh       ── áudio / vídeo / tela / chat / arquivos
 STUN/TURN         ── conectividade entre redes
 ```
 
-O desktop **não exige PostgreSQL, Docker ou um backend social externo instalado pelo usuário**. O banco é criado localmente pelo sidecar Rust.
+O desktop **não exige PostgreSQL, Docker ou um servidor social instalado pelo usuário**. O sidecar Rust é iniciado automaticamente pelo Electron e cria o banco local em `app.getPath("userData")`.
 
-O diretório de dados é fornecido pelo Electron através de `RISK_DATA_DIR`; o arquivo SQLite é criado como `risk.sqlite3`. O banco nunca é gravado dentro de `resources`, `app.asar` ou da pasta de instalação.
+O arquivo SQLite é salvo como:
+
+```text
+risk.sqlite3
+```
+
+O banco não é gravado dentro de `resources`, `app.asar` ou da pasta de instalação.
+
+## P2P e privacidade
+
+O Supabase Realtime é usado apenas para coordenação temporária entre peers:
+
+- Presence encontra peers conectados;
+- Broadcast transporta offer, answer, ICE e estado efêmero;
+- nenhuma tabela Supabase é necessária para chamadas;
+- mídia, mensagens e arquivos trafegam pelo WebRTC;
+- SDP, ICE e histórico de chamadas não são persistidos pelo Risk.
+
+Convites P2P usam códigos temporários no formato:
+
+```text
+risk-XXXX-XXXX-XXXX-XXXX
+```
+
+A identidade P2P usa ECDSA P-256. A chave privada local é mantida como `CryptoKey` não extraível e não é enviada ao Supabase ou a outros peers.
+
+## Transferência de arquivos
+
+Anexos usam um DataChannel dedicado para transferência binária, separado do canal normal de mensagens.
+
+O protocolo inclui:
+
+- transferência em chunks;
+- SHA-256 incremental;
+- progresso, velocidade e ETA;
+- retomada e solicitação de arquivos;
+- previews de mídia;
+- armazenamento local de anexos.
+
+## Chamadas
+
+O transporte atual usa WebRTC Mesh e limita cada cliente a cinco peers remotos, totalizando até **seis participantes por chamada**.
+
+A interface de chamada suporta:
+
+- microfone;
+- câmera;
+- compartilhamento de tela;
+- seleção de janela/tela dentro do próprio Risk Desktop;
+- 720p/30 FPS;
+- 720p/60 FPS;
+- 1080p/30 FPS;
+- 1080p/60 FPS;
+- stream em destaque com thumbnails dos demais participantes;
+- tela cheia;
+- zoom com a roda do mouse no modo tela cheia;
+- alternância entre chamada e chat sem encerrar a conexão.
 
 ## Componentes
 
-- `apps/web`: interface React, chamadas, chat P2P e signaling Supabase Realtime;
-- `apps/desktop`: processo principal e preload Electron;
-- `desktop-backend`: backend local Rust/Axum + SQLite usado pelo aplicativo desktop;
-- `packages/rtc`: mídia, DataChannel e gerenciamento WebRTC;
-- `packages/protocol`: tipos compartilhados;
-- `server`: backend central PostgreSQL legado/experimental, mantido separadamente do caminho crítico do desktop;
-- `infrastructure`: coturn, Docker e empacotamento.
+```text
+apps/web           Interface React, chat, chamadas e signaling
+apps/desktop       Electron Main + preload
+packages/rtc       WebRTC, mídia, DataChannels e file transfer
+packages/protocol  Tipos e mensagens compartilhadas
+desktop-backend    Backend local Rust/Axum + SQLite
+server             Backend PostgreSQL legado/experimental
+infrastructure     Coturn, Docker e infraestrutura auxiliar
+```
 
 ## Backend desktop local
 
-Quando o Electron inicia, ele:
+Quando o Electron inicia:
 
-1. gera um token aleatório por execução;
+1. gera um token local aleatório por execução;
 2. inicia `risk-desktop-backend` como processo filho;
-3. fornece `RISK_DATA_DIR`, `RISK_LOCAL_TOKEN`, `RISK_WEB_ORIGIN` e `RISK_BACKEND_BIND=127.0.0.1:0`;
-4. o Rust abre/cria o SQLite e executa migrations;
-5. o Rust escolhe uma porta livre e escreve uma mensagem de readiness em stdout;
+3. fornece o diretório de dados e configurações locais;
+4. o backend abre/cria o SQLite e executa migrations;
+5. escolhe uma porta loopback livre;
 6. o Electron valida `/health`;
-7. somente então a janela do Risk é aberta.
+7. a janela do Risk é aberta.
 
-A URL do backend e o token local não são hardcoded no bundle Vite. O preload expõe `getBackendConfig()` ao renderer e o cliente API resolve o endpoint em runtime.
+A API local escuta apenas em `127.0.0.1` e, exceto por `/health`, exige `X-Risk-Desktop-Token`.
 
-Toda API do sidecar, exceto `/health`, exige `X-Risk-Desktop-Token`. O servidor escuta apenas em `127.0.0.1`.
+## Configuração
 
-## Persistência
-
-O backend desktop usa SQLite para dados locais como:
-
-- contas/perfis locais;
-- sessão ativa local;
-- amizades e pedidos mantidos pela API local;
-- comunidades e canais;
-- mensagens mantidas pela API local;
-- salas e memberships locais.
-
-A migração dos registros P2P que ainda passam pelas abstrações de IndexedDB para SQLite está em andamento. A identidade criptográfica WebCrypto continua no navegador/Electron porque sua chave privada é mantida como `CryptoKey` não extraível.
-
-## Supabase Signaling
-
-O Supabase Realtime é usado apenas para coordenação temporária:
-
-- Presence descobre peers conectados;
-- Broadcast transporta offer, answer, ICE, perfil e estado efêmero;
-- nenhuma tabela Supabase é necessária para chamadas;
-- SDP, ICE e histórico de chamadas não são persistidos pelo Risk;
-- mídia e mensagens P2P trafegam pelo WebRTC.
-
-Configure apenas chaves públicas no frontend:
+Copie `.env.example` para `.env` e configure pelo menos:
 
 ```dotenv
 VITE_SUPABASE_URL=https://seu-projeto.supabase.co
@@ -90,84 +141,79 @@ VITE_SUPABASE_ANON_KEY=sua-chave-publica
 VITE_DEBUG_SIGNALING=false
 ```
 
-Nunca coloque `service_role`, senha de banco, `JWT_SECRET` ou `TURN_SECRET` no frontend.
-
-## ICE / STUN / TURN
-
-O cliente aceita configuração pública de servidores ICE por build:
+Configuração pública de ICE também pode ser definida por build:
 
 ```dotenv
 VITE_ICE_SERVERS_JSON=[{"urls":["stun:stun.example.com:3478"]}]
 ```
 
-Sem essa variável, existe um STUN de fallback.
-
-O backend desktop **não contém `TURN_SECRET`**. Um segredo TURN permanente dentro do executável poderia ser extraído por qualquer usuário. Para produção, credenciais TURN temporárias devem vir de infraestrutura remota/gerenciada ou de um emissor mínimo separado do armazenamento social local.
+Nunca coloque `service_role`, senha de banco, `JWT_SECRET` ou `TURN_SECRET` no frontend.
 
 ## Desenvolvimento
 
-Pré-requisitos para desenvolvimento: Node 22+, pnpm 10.15+ e Rust estável.
+Pré-requisitos:
 
-1. copie `.env.example` para `.env`;
-2. configure `VITE_SUPABASE_URL` e `VITE_SUPABASE_ANON_KEY`;
-3. execute `pnpm install`;
-4. execute:
+- Node.js 22+;
+- pnpm 10.15+;
+- Rust estável.
+
+Instale as dependências:
+
+```powershell
+pnpm install
+```
+
+Inicie o desktop:
 
 ```powershell
 pnpm dev:desktop
 ```
 
-O comando compila o `risk-desktop-backend` em modo debug antes de iniciar Electron. O Electron então sobe o sidecar automaticamente.
+O comando prepara o sidecar Rust em modo debug, inicia o Vite e abre o Electron.
 
-Enquanto `pnpm dev:desktop` estiver rodando, **a mesma UI também pode ser aberta diretamente em `http://localhost:5173` no navegador**. Em desenvolvimento, o Vite usa `/__risk-api` como proxy para o sidecar ativo e injeta `X-Risk-Desktop-Token` no processo Node, sem expor o token ao JavaScript da página. Assim Electron e navegador usam o mesmo backend e o mesmo `risk.sqlite3`.
-
-O arquivo temporário de descoberta fica em `.risk/dev-backend.json`, é ignorado pelo Git e removido pelo Electron ao encerrar. O proxy só aceita clientes loopback; abrir a UI pelo endereço LAN do Vite não concede acesso ao backend local autenticado.
-
-Para desenvolver somente a interface web:
+Para trabalhar somente na interface web:
 
 ```powershell
 pnpm dev:web
 ```
 
-Sem o Electron/sidecar ativo, chamadas a `/__risk-api` retornam 503. Para apontar deliberadamente o Vite para outra API durante desenvolvimento, defina `RISK_DEV_API_URL`. Em builds web de produção, `VITE_API_URL` continua disponível para uma API HTTP externa. Essa variável não é necessária para o desktop empacotado.
-
 ## Build desktop
 
-Windows:
+### Windows
 
 ```powershell
 pnpm package:win
 ```
 
-Linux:
+O Windows usa:
+
+```text
+apps/desktop/build/icon.ico
+```
+
+### Linux
 
 ```bash
 pnpm package:linux
 ```
 
-Linux via Docker no Windows:
+Ou, no Windows usando Docker:
 
 ```powershell
 pnpm package:linux:docker
 ```
 
-O pipeline executa:
+O Linux usa:
 
 ```text
-cargo build --release (desktop-backend)
-        ↓
-pnpm build:web
-        ↓
-tsc Electron
-        ↓
-copia sidecar para apps/desktop/resources/backend
-        ↓
-electron-builder
+apps/desktop/build/icon.png
 ```
 
-O `electron-builder` coloca o binário Rust em `resources/backend/`, fora do ASAR. No Linux o script de preparação também aplica permissão executável.
+Os artefatos finais ficam em:
 
-Os artefatos finais ficam em `apps/desktop/release/`.
+```text
+apps/desktop/release/
+```
 
 ## Segurança Electron
 
@@ -176,7 +222,7 @@ O desktop mantém:
 - `contextIsolation: true`;
 - `nodeIntegration: false`;
 - `sandbox: true`;
-- preload CommonJS mínimo;
+- preload mínimo;
 - novas janelas bloqueadas;
 - navegação externa bloqueada;
 - permissões de mídia limitadas à origem local do Risk;
@@ -184,37 +230,37 @@ O desktop mantém:
 - token efêmero para a API local;
 - single-instance lock.
 
-O frontend empacotado é servido em uma porta local dinâmica, evitando colisão com uma porta fixa.
-
-## WebRTC e convites
-
-O `MeshWebRTCTransport` limita cada cliente a cinco peers remotos, totalizando seis participantes por chamada.
-
-Convites P2P usam códigos temporários no formato:
-
-```text
-risk-XXXX-XXXX-XXXX-XXXX
-```
-
-O código vira um rendezvous SHA-256 separado por namespace. Após abrir o DataChannel, solicitação, identidade pública, aceite/recusa e ACK usam mensagens ECDSA P-256 assinadas. A chave privada local é não extraível e nunca é enviada ao Supabase ou a outros peers.
-
-## Testes e CI
+## Testes
 
 ```powershell
-pnpm test
 pnpm typecheck
+pnpm test
 ```
 
-A CI valida:
+A CI valida TypeScript, testes Web/P2P, build Web, Electron e o código Rust dos backends.
 
-- TypeScript;
-- testes Web/P2P;
-- build Web;
-- compilação do sidecar Rust desktop;
-- bundle Electron contendo o sidecar;
-- `cargo fmt`, `clippy` e testes do backend central legado;
-- `cargo fmt`, `clippy` e testes do backend SQLite desktop.
+## Alpha 0.2.0
 
-Antes de sair de draft ainda são necessários smoke tests reais de NSIS/AppImage/DEB e testes WebRTC/TURN em duas máquinas/redes diferentes.
+Esta versão adiciona e melhora principalmente:
 
-Consulte também [docs/architecture.md](docs/architecture.md) e [docs/protocol.md](docs/protocol.md).
+- chamadas de voz e vídeo;
+- compartilhamento de tela e presets de qualidade;
+- tela cheia com zoom;
+- chat durante chamadas;
+- transferência de arquivos e anexos;
+- previews de mídia;
+- gerenciamento de grupos e canais;
+- melhorias de estabilidade e conexão P2P;
+- suporte experimental a áudio de screen share via PipeWire no Linux;
+- nova identidade visual do aplicativo.
+
+## Documentação
+
+Consulte também:
+
+- [Arquitetura](docs/architecture.md)
+- [Protocolo](docs/protocol.md)
+
+---
+
+Risk está em desenvolvimento ativo. Bugs e mudanças incompatíveis ainda podem ocorrer durante a fase Alpha.

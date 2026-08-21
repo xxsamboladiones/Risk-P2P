@@ -328,7 +328,7 @@ if (hasSingleInstanceLock) {
     backendConfig = await startBackend(pageUrl);
     await publishDevBackendBridge(backendConfig);
     session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-      callback(isTrustedRendererUrl(webContents.getURL()) && ["media", "display-capture"].includes(permission));
+      callback(isTrustedRendererUrl(webContents.getURL()) && ["media", "display-capture", "fullscreen"].includes(permission));
     });
     session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
       const sourceId = pendingDisplaySourceId;

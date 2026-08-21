@@ -13,6 +13,103 @@ export type CallDiagnostics = {
 };
 
 type DisplayAudioSettings = MediaTrackSettings & { restrictOwnAudio?: boolean };
+type DesktopScreenAudioPreparation = {
+  mode: "display" | "pipewire" | "unavailable";
+  sourceName?: string;
+  sourceLabel?: string;
+  excludedRisk: boolean;
+  reason?: string;
+};
+
+function placeholderParticipant(peerId: string): Participant {
+  return {
+    peerId,
+    displayName: `Peer ${peerId.slice(0, 6)}`,
+    state: { microphone: true, camera: false, screenShare: false },
+    streams: {},
+    connection: "new",
+  };
+}
+
+async function prepareDesktopScreenAudio(excludeRisk: boolean): Promise<DesktopScreenAudioPreparation | null> {
+  if (!window.desktop?.getBackendConfig) return null;
+  const config = await window.desktop.getBackendConfig();
+  const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}/screen-audio/prepare`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-risk-desktop-token": config.token,
+    },
+    body: JSON.stringify({ excludeRisk }),
+  });
+  if (!response.ok) throw new Error(`Falha ao preparar áudio de tela (HTTP ${response.status}).`);
+  return response.json() as Promise<DesktopScreenAudioPreparation>;
+}
+
+async function stopDesktopScreenAudio(): Promise<void> {
+  if (!window.desktop?.getBackendConfig) return;
+  try {
+    const config = await window.desktop.getBackendConfig();
+    await fetch(`${config.baseUrl.replace(/\/$/, "")}/screen-audio/stop`, {
+      method: "POST",
+      headers: { "x-risk-desktop-token": config.token },
+    });
+  } catch {
+    // A parada de tela já encerra as tracks locais. O sidecar também finaliza o
+    // processo pw-loopback ao ser encerrado, então este cleanup é best-effort.
+  }
+}
+
+async function waitForPipeWireTrack(preparation: DesktopScreenAudioPreparation): Promise<MediaStreamTrack | undefined> {
+  if (preparation.mode !== "pipewire") return undefined;
+  const expectedLabel = preparation.sourceLabel?.trim().toLocaleLowerCase() ?? "";
+  const expectedName = preparation.sourceName?.trim().toLocaleLowerCase() ?? "";
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const source = devices.find((device) => {
+      if (device.kind !== "audioinput") return false;
+      const label = device.label.trim().toLocaleLowerCase();
+      return Boolean(label) && (
+        (expectedLabel && (label === expectedLabel || label.includes(expectedLabel)))
+        || (expectedName && label.includes(expectedName))
+      );
+    });
+    if (source) {
+      const capture = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: { exact: source.deviceId },
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          channelCount: 2,
+        },
+        video: false,
+      });
+      const track = capture.getAudioTracks()[0];
+      if (!track) {
+        capture.getTracks().forEach((item) => item.stop());
+        return undefined;
+      }
+      try { track.contentHint = "music"; } catch { /* contentHint é opcional */ }
+      return track;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+  }
+  return undefined;
+}
+
+async function startPipeWireDesktopShare(preparation: DesktopScreenAudioPreparation, selectedSourceId?: string): Promise<MediaStream> {
+  if (!window.desktop) throw new Error("Bridge desktop indisponível para captura PipeWire.");
+  const sourceId = selectedSourceId ?? await window.desktop.chooseScreenSource();
+  if (!sourceId) throw new DOMException("Compartilhamento cancelado.", "NotAllowedError");
+  await window.desktop.selectScreenSource(sourceId);
+  const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+  if (preparation.mode === "pipewire") {
+    const audioTrack = await waitForPipeWireTrack(preparation);
+    if (audioTrack) stream.addTrack(audioTrack);
+  }
+  return stream;
+}
 
 export function reconcileRemoteMediaState(
   streamsById: Participant["streams"],
@@ -103,15 +200,15 @@ export class CallController {
       sendIce: (targetPeerId, candidate) => this.signaling!.sendIceCandidate(targetPeerId, candidate),
       onRemoteStream: (remotePeerId, stream) => {
         const store = useCallStore.getState();
-        const participant = store.participants[remotePeerId];
-        if (!participant) return;
+        const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
         const streams = { ...participant.streams, [stream.id]: stream };
         const state = reconcileRemoteMediaState(streams, participant.state);
         store.upsert({ ...participant, streams, state });
       },
       onConnectionState: (remotePeerId, connection) => {
-        const participant = useCallStore.getState().participants[remotePeerId];
-        if (participant) useCallStore.getState().upsert({ ...participant, connection });
+        const store = useCallStore.getState();
+        const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
+        store.upsert({ ...participant, connection });
       },
     });
     this.bindSignaling(this.signaling, roomId, this.peerId);
@@ -191,12 +288,14 @@ export class CallController {
     try {
       if (this.cameraTrack) {
         const track = this.cameraTrack;
+        this.cameraTrack = undefined;
+        this.state.camera = false;
+        this.updateLocalPreview();
+        void this.signaling?.sendPeerState(this.state).catch((error) => this.reportError(error, "Não foi possível atualizar a câmera."));
         await this.transport?.unpublishTrack(track);
         if (!this.isActive(lifecycle)) return;
         track.stop();
         this.local.removeTrack(track);
-        this.cameraTrack = undefined;
-        this.state.camera = false;
       } else {
         const cameraStream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 } } });
         const cameraTrack = cameraStream.getVideoTracks()[0];
@@ -210,27 +309,55 @@ export class CallController {
         }
         this.cameraTrack = cameraTrack;
         this.local.addTrack(cameraTrack);
-        await this.transport?.publishTrack(cameraTrack, this.local);
+        this.state.camera = true;
+        this.updateLocalPreview();
+        void this.signaling?.sendPeerState(this.state).catch((error) => this.reportError(error, "Não foi possível atualizar a câmera."));
+        try {
+          await this.transport?.publishTrack(cameraTrack, this.local);
+        } catch (error) {
+          if (this.cameraTrack === cameraTrack) this.cameraTrack = undefined;
+          this.local.removeTrack(cameraTrack);
+          cameraTrack.stop();
+          this.state.camera = false;
+          this.updateLocalPreview();
+          void this.signaling?.sendPeerState(this.state).catch(() => undefined);
+          throw error;
+        }
         if (!this.isActive(lifecycle)) {
           cameraTrack.stop();
           return;
         }
-        this.state.camera = true;
       }
-      this.updateLocalPreview();
-      await this.signaling?.sendPeerState(this.state);
     } catch (error) { this.reportError(error, "Não foi possível alterar a câmera."); }
   }
 
-  async toggleScreen(_roomId: string): Promise<void> {
+  async toggleScreen(_roomId: string, sourceId?: string): Promise<void> {
     if (this.screenStream) { await this.stopScreen(); return; }
     const lifecycle = this.lifecycleId;
+    let desktopAudio: DesktopScreenAudioPreparation | null = null;
+    let stream: MediaStream | undefined;
     try {
-      // Sincroniza a preferência antes da captura. No desktop Windows a exclusão
-      // principal é feita nativamente pelo device loopbackWithoutChrome; em um
-      // navegador comum o provider ainda usa restrictOwnAudio quando disponível.
       const voiceSettings = loadVoiceVideoSettings();
-      const stream = await this.screen.startScreenShare();
+      desktopAudio = await prepareDesktopScreenAudio(voiceSettings.excludeRiskAudioFromScreenShare).catch((error) => {
+        console.warn("Não foi possível consultar o backend de áudio de tela; usando captura padrão.", error);
+        return null;
+      });
+
+      const pipeWireDesktop = desktopAudio?.mode === "pipewire" || desktopAudio?.mode === "unavailable";
+      stream = pipeWireDesktop
+        ? await startPipeWireDesktopShare(desktopAudio!, sourceId)
+        : await this.screen.startScreenShare(sourceId);
+
+      if (desktopAudio?.mode === "unavailable") {
+        const message = `PipeWire indisponível para áudio da tela: ${desktopAudio.reason ?? "ferramentas PipeWire não encontradas"}. A tela continuará sem áudio do sistema.`;
+        console.warn(message);
+        useCallStore.getState().setError(message);
+      } else if (desktopAudio?.mode === "pipewire" && !stream.getAudioTracks().length) {
+        const message = "A fonte virtual do PipeWire foi criada, mas o Chromium não a expôs como entrada de áudio. A tela continuará sem áudio do sistema.";
+        console.warn(message);
+        useCallStore.getState().setError(message);
+      }
+
       const videoTrack = stream.getVideoTracks()[0];
       if (!videoTrack) {
         stream.getTracks().forEach((track) => track.stop());
@@ -239,25 +366,33 @@ export class CallController {
 
       const screenAudioTrack = stream.getAudioTracks()[0];
       if (screenAudioTrack && voiceSettings.excludeRiskAudioFromScreenShare) {
-        const settings = screenAudioTrack.getSettings() as DisplayAudioSettings;
-        const nativeRiskExclusion = settings.deviceId === "loopbackWithoutChrome";
-        const browserRiskExclusion = settings.restrictOwnAudio === true;
-        if (nativeRiskExclusion || browserRiskExclusion) {
+        if (desktopAudio?.mode === "pipewire" && desktopAudio.excludedRisk) {
           console.info("Risk screen audio exclusion active", {
-            deviceId: settings.deviceId ?? "unknown",
-            restrictOwnAudio: settings.restrictOwnAudio ?? false,
-            mode: nativeRiskExclusion ? "native-process-loopback" : "restrictOwnAudio",
+            mode: "pipewire-node-exclusion",
+            source: desktopAudio.sourceName ?? desktopAudio.sourceLabel ?? "unknown",
           });
         } else {
-          console.warn("A captura de tela não confirmou a exclusão do áudio do Risk.", {
-            deviceId: settings.deviceId ?? "unknown",
-            restrictOwnAudio: settings.restrictOwnAudio ?? false,
-          });
+          const settings = screenAudioTrack.getSettings() as DisplayAudioSettings;
+          const nativeRiskExclusion = settings.deviceId === "loopbackWithoutChrome";
+          const browserRiskExclusion = settings.restrictOwnAudio === true;
+          if (nativeRiskExclusion || browserRiskExclusion) {
+            console.info("Risk screen audio exclusion active", {
+              deviceId: settings.deviceId ?? "unknown",
+              restrictOwnAudio: settings.restrictOwnAudio ?? false,
+              mode: nativeRiskExclusion ? "native-process-loopback" : "restrictOwnAudio",
+            });
+          } else {
+            console.warn("A captura de tela não confirmou a exclusão do áudio do Risk.", {
+              deviceId: settings.deviceId ?? "unknown",
+              restrictOwnAudio: settings.restrictOwnAudio ?? false,
+            });
+          }
         }
       }
 
       if (!this.isActive(lifecycle)) {
         stream.getTracks().forEach((track) => track.stop());
+        await stopDesktopScreenAudio();
         return;
       }
       this.screenStream = stream;
@@ -265,20 +400,26 @@ export class CallController {
       const transport = this.transport;
       if (!transport) {
         stream.getTracks().forEach((track) => track.stop());
+        await stopDesktopScreenAudio();
         this.screenStream = undefined;
         return;
       }
-      await Promise.all(stream.getTracks().map((track) => transport.publishTrack(track, stream)));
-      if (!this.isActive(lifecycle)) {
-        stream.getTracks().forEach((track) => track.stop());
-        return;
-      }
+
       this.state.screenShare = true;
       this.state.screenStreamId = stream.id;
       this.state.screenAudio = stream.getAudioTracks().length > 0;
       this.updateLocalPreview();
-      await this.signaling?.sendPeerState(this.state);
+      void this.signaling?.sendPeerState(this.state).catch((error) => this.reportError(error, "Não foi possível atualizar o compartilhamento de tela."));
+
+      await Promise.all(stream.getTracks().map((track) => transport.publishTrack(track, stream!)));
+      if (!this.isActive(lifecycle)) {
+        stream.getTracks().forEach((track) => track.stop());
+        await stopDesktopScreenAudio();
+        return;
+      }
     } catch (error) {
+      if (stream && this.screenStream === stream) await this.stopScreen().catch(() => undefined);
+      else if (desktopAudio?.mode === "pipewire") await stopDesktopScreenAudio();
       if (!(error instanceof DOMException && error.name === "NotAllowedError")) this.reportError(error, "Não foi possível compartilhar a tela.");
     }
   }
@@ -296,13 +437,8 @@ export class CallController {
     this.signalingUnsubscribers.push(
       signaling.onPeerJoined((peer) => {
         const store = useCallStore.getState();
-        store.upsert({
-          peerId: peer.peerId,
-          displayName: `Peer ${peer.peerId.slice(0, 6)}`,
-          state: { microphone: true, camera: false, screenShare: false },
-          streams: {},
-          connection: "new",
-        });
+        const participant = store.participants[peer.peerId] ?? placeholderParticipant(peer.peerId);
+        store.upsert({ ...participant, connection: participant.connection ?? "new" });
         void this.transport?.connect(peer.peerId, peerId < peer.peerId).catch((error) => store.setError(String(error)));
         void signaling.sendPeerState(this.state).catch((error) => store.setError(String(error)));
         void signaling.sendPeerProfile(this.displayName).catch((error) => store.setError(String(error)));
@@ -322,22 +458,13 @@ export class CallController {
       }),
       signaling.onPeerState((message) => {
         const store = useCallStore.getState();
-        const participant = store.participants[message.fromPeerId] ?? {
-          peerId: message.fromPeerId,
-          displayName: `Peer ${message.fromPeerId.slice(0, 6)}`,
-          streams: {},
-        };
+        const participant = store.participants[message.fromPeerId] ?? placeholderParticipant(message.fromPeerId);
         const state = reconcileRemoteMediaState(participant.streams, message.payload.state);
         store.upsert({ ...participant, state });
       }),
       signaling.onPeerProfile((message) => {
         const store = useCallStore.getState();
-        const participant = store.participants[message.fromPeerId] ?? {
-          peerId: message.fromPeerId,
-          displayName: message.payload.displayName,
-          state: { microphone: true, camera: false, screenShare: false },
-          streams: {},
-        };
+        const participant = store.participants[message.fromPeerId] ?? placeholderParticipant(message.fromPeerId);
         store.upsert({ ...participant, displayName: message.payload.displayName });
       }),
       signaling.onStatusChange((status) => {
@@ -351,14 +478,16 @@ export class CallController {
     const stream = this.screenStream;
     if (!stream) return;
     this.screenStream = undefined;
-    const transport = this.transport;
-    if (transport) await Promise.all(stream.getTracks().map((track) => transport.unpublishTrack(track).catch(() => undefined)));
-    await this.screen.stopScreenShare().catch(() => undefined);
     this.state.screenShare = false;
     this.state.screenStreamId = undefined;
     this.state.screenAudio = false;
     this.updateLocalPreview();
-    await this.signaling?.sendPeerState(this.state).catch((error) => this.reportError(error, "Não foi possível atualizar o compartilhamento de tela."));
+    void this.signaling?.sendPeerState(this.state).catch((error) => this.reportError(error, "Não foi possível atualizar o compartilhamento de tela."));
+    const transport = this.transport;
+    if (transport) await Promise.all(stream.getTracks().map((track) => transport.unpublishTrack(track).catch(() => undefined)));
+    stream.getTracks().forEach((track) => track.stop());
+    await this.screen.stopScreenShare().catch(() => undefined);
+    await stopDesktopScreenAudio();
   }
 
   private updateLocalPreview(): void {
@@ -385,7 +514,9 @@ export class CallController {
     this.local.getTracks().forEach((track) => track.stop());
     await this.rnnoiseMicrophone?.stop().catch(() => undefined);
     this.microphoneInputStream?.getTracks().forEach((track) => track.stop());
+    this.screenStream?.getTracks().forEach((track) => track.stop());
     await this.screen.stopScreenShare().catch(() => undefined);
+    await stopDesktopScreenAudio();
     this.microphoneInputStream = undefined;
     this.microphoneTrack = undefined;
     this.rnnoiseMicrophone = undefined;

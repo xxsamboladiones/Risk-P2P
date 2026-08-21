@@ -8,11 +8,23 @@ import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+if (process.platform === "linux") {
+  // pipewire-pulse pode expor o PID do daemon em vez do PID do cliente. Marcar
+  // o cliente Pulse permite que o mixer Linux identifique o Risk mesmo nesse caminho.
+  process.env["PULSE_PROP_application.name"] = "Risk";
+  process.env["PULSE_PROP_application.id"] = "com.risk.calls";
+}
+
+app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
+
 const root = path.dirname(fileURLToPath(import.meta.url));
 const DEVELOPMENT_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:5173"]);
 const DESKTOP_HOST = "127.0.0.1";
 const DEV_BACKEND_BRIDGE_FILE = path.resolve(root, "../../../.risk/dev-backend.json");
 const WINDOWS_LOOPBACK_WITHOUT_RISK = "loopbackWithoutChrome";
+const APP_ICON_PATH = app.isPackaged
+  ? path.join(process.resourcesPath, "icon.png")
+  : path.resolve(root, "../build/icon.png");
 let assetServer: Server | undefined;
 let pageUrl = "http://localhost:5173";
 let packagedOrigin = "";
@@ -217,6 +229,16 @@ ipcMain.handle("backend:config", async (event) => {
   return backendConfig;
 });
 
+ipcMain.handle("window:fullscreen", async (event, enabled: unknown) => {
+  if (!isTrustedRendererUrl(event.sender.getURL())) throw new Error("Origem do renderer não autorizada.");
+  if (typeof enabled !== "boolean") throw new Error("Estado de tela cheia inválido.");
+  const owner = BrowserWindow.fromWebContents(event.sender);
+  if (!owner) throw new Error("Janela do Risk não encontrada.");
+  owner.setFullScreen(enabled);
+  if (enabled) owner.focus();
+  return { fullscreen: enabled };
+});
+
 ipcMain.handle("screen:list", async (event) => {
   if (!isTrustedRendererUrl(event.sender.getURL())) throw new Error("Origem do renderer não autorizada.");
   return (await desktopCapturer.getSources({
@@ -240,9 +262,6 @@ ipcMain.handle("screen:choose", async (event) => {
   });
   if (!allSources.length) return null;
 
-  // O dialog nativo substitui window.prompt(), que não é suportado no renderer
-  // sandboxed do Electron. Limitamos a lista para evitar um dialog impraticável
-  // quando o usuário possui dezenas de janelas abertas.
   const sources = allSources.slice(0, 20);
   const buttons = [...sources.map((source) => source.name.slice(0, 80)), "Cancelar"];
   const owner = BrowserWindow.fromWebContents(event.sender);
@@ -288,6 +307,7 @@ function createWindow(): void {
     minWidth: 900,
     minHeight: 600,
     backgroundColor: "#090b10",
+    icon: APP_ICON_PATH,
     show: false,
     autoHideMenuBar: true,
     webPreferences: {
@@ -322,7 +342,7 @@ if (hasSingleInstanceLock) {
     backendConfig = await startBackend(pageUrl);
     await publishDevBackendBridge(backendConfig);
     session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-      callback(isTrustedRendererUrl(webContents.getURL()) && ["media", "display-capture"].includes(permission));
+      callback(isTrustedRendererUrl(webContents.getURL()) && ["media", "display-capture", "fullscreen"].includes(permission));
     });
     session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
       const sourceId = pendingDisplaySourceId;
@@ -343,12 +363,6 @@ if (hasSingleInstanceLock) {
           return;
         }
 
-        // Electron 43.4.0 aceita internamente o device id de áudio como string.
-        // Em Windows usamos diretamente loopbackWithoutChrome para acionar o
-        // process-loopback nativo do Chromium e excluir toda a reprodução da
-        // árvore do próprio Risk. Isso evita depender da propagação de
-        // restrictOwnAudio, que nos testes reais do Electron estava chegando
-        // como false mesmo quando solicitado pelo renderer.
         const audioDevice = process.platform === "win32"
           ? WINDOWS_LOOPBACK_WITHOUT_RISK
           : "loopback";

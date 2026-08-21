@@ -29,6 +29,7 @@ interface Window {
     listScreenSources(): Promise<RiskDesktopSource[]>;
     chooseScreenSource(): Promise<string | null>;
     selectScreenSource(sourceId: string): Promise<void>;
+    setWindowFullscreen(enabled: boolean): Promise<{ fullscreen: boolean }>;
     getBackendConfig(): Promise<RiskDesktopBackendConfig>;
   };
 }

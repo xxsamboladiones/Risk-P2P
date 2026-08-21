@@ -1,12 +1,16 @@
+mod attachments;
+mod screen_audio;
+
 use super::{bearer, internal, ApiError, AppState};
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
+use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,11 +48,17 @@ struct P2pMessage {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/p2p/friends", get(list_friends).post(save_friend))
+        .route("/p2p/friends/{peer_id}/delete", post(delete_p2p_friend))
         .route("/p2p/groups", get(list_groups).post(save_group))
+        .route("/p2p/groups/{group_id}/delete", post(delete_p2p_group))
+        .route("/friends/{friend_id}/remove", post(remove_friendship))
+        .route("/communities/{community_id}/remove", post(remove_community))
         .route(
             "/p2p/messages/{channel_id}",
             get(list_messages).post(save_message),
         )
+        .merge(attachments::router())
+        .merge(screen_audio::router())
 }
 
 async fn list_friends(
@@ -103,6 +113,24 @@ async fn save_friend(
     .await
     .map_err(internal)?;
     Ok(Json(friend))
+}
+
+async fn delete_p2p_friend(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(peer_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let owner = bearer(&headers, &state)?;
+    if !valid_id(&peer_id) {
+        return Err(ApiError::Bad("Amigo P2P inválido".into()));
+    }
+    sqlx::query("DELETE FROM p2p_friends WHERE owner_user_id=? AND peer_id=?")
+        .bind(owner)
+        .bind(peer_id)
+        .execute(&state.db)
+        .await
+        .map_err(internal)?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn list_groups(
@@ -176,6 +204,135 @@ async fn save_group(
     .await
     .map_err(internal)?;
     Ok(Json(group))
+}
+
+async fn delete_p2p_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(group_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let owner = bearer(&headers, &state)?;
+    if !valid_id(&group_id) {
+        return Err(ApiError::Bad("Grupo P2P inválido".into()));
+    }
+    let channels_json = sqlx::query_scalar::<_, String>(
+        "SELECT channels_json FROM p2p_groups WHERE owner_user_id=? AND group_id=?",
+    )
+    .bind(owner)
+    .bind(&group_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(internal)?;
+
+    let mut transaction = state.db.begin().await.map_err(internal)?;
+    if let Some(channels_json) = channels_json {
+        if let Ok(Value::Array(channels)) = serde_json::from_str::<Value>(&channels_json) {
+            for channel in channels {
+                let Some(channel_id) = channel.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                sqlx::query("DELETE FROM p2p_messages WHERE owner_user_id=? AND channel_id=?")
+                    .bind(owner)
+                    .bind(channel_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(internal)?;
+            }
+        }
+    }
+    sqlx::query("DELETE FROM p2p_groups WHERE owner_user_id=? AND group_id=?")
+        .bind(owner)
+        .bind(group_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+    transaction.commit().await.map_err(internal)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn remove_friendship(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(friend_id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let user = bearer(&headers, &state)?;
+    if friend_id == user {
+        return Err(ApiError::Bad("Amizade inválida".into()));
+    }
+    let mut transaction = state.db.begin().await.map_err(internal)?;
+    sqlx::query(
+        "DELETE FROM friendships WHERE (user_a=? AND user_b=?) OR (user_a=? AND user_b=?)",
+    )
+    .bind(user)
+    .bind(friend_id)
+    .bind(friend_id)
+    .bind(user)
+    .execute(&mut *transaction)
+    .await
+    .map_err(internal)?;
+    sqlx::query(
+        "DELETE FROM friend_requests WHERE (sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?)",
+    )
+    .bind(user)
+    .bind(friend_id)
+    .bind(friend_id)
+    .bind(user)
+    .execute(&mut *transaction)
+    .await
+    .map_err(internal)?;
+    transaction.commit().await.map_err(internal)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn remove_community(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(community_id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let user = bearer(&headers, &state)?;
+    let owner = sqlx::query_scalar::<_, Uuid>("SELECT owner_id FROM communities WHERE id=?")
+        .bind(community_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(internal)?;
+    let Some(owner) = owner else {
+        return Ok(Json(json!({ "ok": true, "action": "missing" })));
+    };
+
+    if owner != user {
+        sqlx::query("DELETE FROM community_members WHERE community_id=? AND user_id=?")
+            .bind(community_id)
+            .bind(user)
+            .execute(&state.db)
+            .await
+            .map_err(internal)?;
+        return Ok(Json(json!({ "ok": true, "action": "left" })));
+    }
+
+    let room_ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT voice_room_id FROM channels WHERE community_id=? AND voice_room_id IS NOT NULL",
+    )
+    .bind(community_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(internal)?;
+    let mut transaction = state.db.begin().await.map_err(internal)?;
+    sqlx::query("DELETE FROM communities WHERE id=? AND owner_id=?")
+        .bind(community_id)
+        .bind(user)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+    for room_id in room_ids {
+        sqlx::query("DELETE FROM rooms WHERE id=? AND owner_id=?")
+            .bind(room_id)
+            .bind(user)
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+    }
+    transaction.commit().await.map_err(internal)?;
+    Ok(Json(json!({ "ok": true, "action": "deleted" })))
 }
 
 async fn list_messages(

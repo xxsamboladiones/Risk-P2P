@@ -1,4 +1,4 @@
-import { OFFLINE_STORES, getAllFromStore, openRiskDatabase, putInStore } from "./database";
+import { OFFLINE_STORES, deleteFromStore, getAllFromStore, openRiskDatabase, putInStore } from "./database";
 
 export type PublicPeerIdentity = { peerId: string; publicKey: JsonWebKey; displayName: string; avatar?: string };
 export type LocalIdentity = PublicPeerIdentity & { id: "self"; privateKey: CryptoKey };
@@ -33,6 +33,7 @@ export async function getOrCreateLocalIdentity(displayName: string): Promise<Loc
       existing = { ...existing, displayName };
       await putInStore(OFFLINE_STORES.identity, existing);
     }
+    await refreshIdentityMembership().catch((error) => console.warn("Não foi possível reconciliar a identidade P2P com os grupos locais.", error));
     return existing;
   }
   const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
@@ -44,6 +45,7 @@ export async function getOrCreateLocalIdentity(displayName: string): Promise<Loc
     privateKey: await makePrivateKeyNonExtractable(pair.privateKey),
   };
   await putInStore(OFFLINE_STORES.identity, identity);
+  await refreshIdentityMembership().catch((error) => console.warn("Não foi possível incluir a nova identidade P2P nos grupos locais.", error));
   return identity;
 }
 
@@ -63,11 +65,27 @@ export async function saveLocalFriend(friend: LocalFriend): Promise<void> {
   await desktopRequest(config, "/p2p/friends", { method: "POST", body: JSON.stringify(friend) });
 }
 
+export async function deleteLocalFriend(peerId: string): Promise<void> {
+  await deleteFromStore(OFFLINE_STORES.friends, peerId).catch(() => undefined);
+  const config = await desktopConfig();
+  if (!config) return;
+  await desktopRequest(config, `/p2p/friends/${encodeURIComponent(peerId)}/delete`, { method: "POST" });
+}
+
 export async function loadLocalGroups(): Promise<LocalGroup[]> {
   const config = await desktopConfig();
-  if (!config) return legacyGroups();
+  if (!config) {
+    const groups = await legacyGroups();
+    const identity = await loadLocalIdentity();
+    if (!identity) return groups;
+    return reconcileIdentityMembership(groups, identity, (group) => putInStore(OFFLINE_STORES.groups, group));
+  }
   await migrateLegacySocial(config);
-  return desktopRequest<LocalGroup[]>(config, "/p2p/groups", { method: "GET" });
+  const groups = await desktopRequest<LocalGroup[]>(config, "/p2p/groups", { method: "GET" });
+  const identity = await loadLocalIdentity();
+  if (!identity) return groups;
+  return reconcileIdentityMembership(groups, identity, (group) =>
+    desktopRequest(config, "/p2p/groups", { method: "POST", body: JSON.stringify(group) }).then(() => undefined));
 }
 
 export async function saveLocalGroup(group: LocalGroup): Promise<void> {
@@ -77,6 +95,13 @@ export async function saveLocalGroup(group: LocalGroup): Promise<void> {
     return;
   }
   await desktopRequest(config, "/p2p/groups", { method: "POST", body: JSON.stringify(group) });
+}
+
+export async function deleteLocalGroup(groupId: string): Promise<void> {
+  await deleteFromStore(OFFLINE_STORES.groups, groupId).catch(() => undefined);
+  const config = await desktopConfig();
+  if (!config) return;
+  await desktopRequest(config, `/p2p/groups/${encodeURIComponent(groupId)}/delete`, { method: "POST" });
 }
 
 export async function createLocalGroup(name: string, owner: PublicPeerIdentity): Promise<LocalGroup> {
@@ -138,6 +163,43 @@ export function publicIdentity(identity: LocalIdentity): PublicPeerIdentity {
   return { peerId: identity.peerId, publicKey: identity.publicKey, displayName: identity.displayName, avatar: identity.avatar };
 }
 
+async function refreshIdentityMembership(): Promise<void> {
+  await loadLocalGroups();
+}
+
+async function reconcileIdentityMembership(
+  groups: LocalGroup[],
+  identity: LocalIdentity,
+  persist: (group: LocalGroup) => Promise<void>,
+): Promise<LocalGroup[]> {
+  const self = publicIdentity(identity);
+  const reconciled: LocalGroup[] = [];
+  for (const group of groups) {
+    const members = [...group.members];
+    const index = members.findIndex((member) => member.peerId === self.peerId);
+    let changed = false;
+    if (index < 0) {
+      members.push(self);
+      changed = true;
+    } else {
+      const current = members[index]!;
+      if (samePublicKey(current.publicKey, self.publicKey)
+        && (current.displayName !== self.displayName || current.avatar !== self.avatar)) {
+        members[index] = self;
+        changed = true;
+      }
+    }
+    if (!changed) {
+      reconciled.push(group);
+      continue;
+    }
+    const updated = { ...group, members };
+    await persist(updated);
+    reconciled.push(updated);
+  }
+  return reconciled;
+}
+
 function validPublicPeerIdentity(identity: PublicPeerIdentity): boolean {
   return /^[A-Za-z0-9_-]{8,128}$/.test(identity.peerId)
     && identity.displayName.trim().length >= 2
@@ -162,9 +224,6 @@ async function desktopConfig(): Promise<DesktopBackendConfig | null> {
     return desktopConfigPromise;
   }
 
-  // Quando localhost:5173 é aberto diretamente no navegador durante `pnpm dev:desktop`,
-  // ele não possui o preload do Electron. O Vite fornece /__risk-api e injeta o token
-  // efêmero no processo Node, permitindo usar o MESMO SQLite do sidecar sem expor o token.
   if (import.meta.env.DEV && import.meta.env.VITE_API_URL === DEV_BACKEND_PROXY) {
     return { baseUrl: DEV_BACKEND_PROXY };
   }

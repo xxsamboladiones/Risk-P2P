@@ -1,41 +1,47 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Hash,
   Headphones,
   LogOut,
   MessageCircle,
-  Mic,
-  MicOff,
-  MonitorUp,
-  PhoneOff,
+  Pencil,
   Plus,
-  Send,
   Settings2,
   Sparkles,
+  Trash2,
+  UserMinus,
   UserPlus,
   Users,
-  Video,
-  VideoOff,
-  Volume2,
-  VolumeX,
 } from "lucide-react";
 import { api, type Channel, type ChatMessage, type Community, type CurrentUser, type Friend, type PendingFriend } from "./api";
 import { CallController } from "./call";
-import { ChatController, privateConversationId, type ChatConnectionStatus } from "./chat";
+import {
+  ChatController,
+  privateConversationId,
+  type ChatAttachmentProgress,
+  type ChatAttachmentRecord,
+  type ChatConnectionStatus,
+} from "./chat";
+import { CallWorkspace } from "./components/CallWorkspace";
+import { ConversationTimeline } from "./components/ConversationTimeline";
 import { GroupInvitePanel } from "./components/GroupInvitePanel";
+import { MessageComposer } from "./components/MessageComposer";
 import { P2PInvitePanel } from "./components/P2PInvitePanel";
 import { VoiceVideoSettingsPanel } from "./components/VoiceVideoSettingsPanel";
+import { deleteLocalGroupChannel, renameLocalGroupChannel } from "./services/offline/channel-storage";
 import {
   addLocalGroupChannel,
   createLocalGroup,
+  deleteLocalFriend,
+  deleteLocalGroup,
   getOrCreateLocalIdentity,
   loadLocalFriends,
   loadLocalGroups,
   publicIdentity,
   type PublicPeerIdentity,
 } from "./services/offline/social-storage";
-import { useCallStore, type Participant } from "./store";
+import { useCallStore } from "./store";
 import "./styles.css";
 
 const call = new CallController();
@@ -52,106 +58,6 @@ function restoreSession(): Promise<string | null> {
       .finally(() => { sessionRestore = undefined; });
   }
   return sessionRestore;
-}
-
-function RemoteAudio({ stream, volume }: { stream: MediaStream; volume: number }) {
-  const contextRef = useRef<AudioContext | null>(null);
-  const gainRef = useRef<GainNode | null>(null);
-
-  useEffect(() => {
-    const context = new AudioContext();
-    const source = context.createMediaStreamSource(stream);
-    const gain = context.createGain();
-    gain.gain.value = volume / 100;
-    source.connect(gain).connect(context.destination);
-    contextRef.current = context;
-    gainRef.current = gain;
-    void context.resume().catch(() => undefined);
-    return () => {
-      source.disconnect();
-      gain.disconnect();
-      void context.close();
-      contextRef.current = null;
-      gainRef.current = null;
-    };
-  }, [stream]);
-
-  useEffect(() => {
-    const gain = gainRef.current;
-    if (gain) gain.gain.setTargetAtTime(volume / 100, gain.context.currentTime, 0.015);
-    if (contextRef.current?.state === "suspended") void contextRef.current.resume().catch(() => undefined);
-  }, [volume]);
-
-  return null;
-}
-
-function VolumeControl({ label, value, onChange }: { label: string; value: number; onChange(value: number): void }) {
-  return <label className="volume-control" title={`${label}: ${value}%`}>
-    {value === 0 ? <VolumeX size={15}/> : <Volume2 size={15}/>}<span>{label}</span>
-    <input type="range" min="0" max="200" step="5" value={value} onChange={(event) => onChange(Number(event.target.value))} aria-label={`Volume de ${label}`}/>
-    <b>{value}%</b>
-  </label>;
-}
-
-function VideoTile({ participant }: { participant: Participant }) {
-  const streams = Object.values(participant.streams ?? {});
-  const screenStream = participant.state.screenStreamId ? participant.streams?.[participant.state.screenStreamId] : undefined;
-  const cameraStream = (participant.state.cameraStreamId ? participant.streams?.[participant.state.cameraStreamId] : undefined)
-    ?? streams.find((stream) => stream.id !== screenStream?.id);
-  const [source, setSource] = useState<"camera" | "screen">("camera");
-  const [userVolume, setUserVolume] = useState(100);
-  const [screenVolume, setScreenVolume] = useState(100);
-
-  useEffect(() => {
-    if (participant.state.screenShare && screenStream) setSource("screen");
-    else if (!participant.state.screenShare) setSource("camera");
-  }, [participant.state.screenShare, screenStream]);
-
-  const selected = source === "screen" ? screenStream : cameraStream;
-  const ref = useRef<HTMLVideoElement>(null);
-  const trackKey = selected?.getVideoTracks().map((track) => track.id).join(":") ?? "";
-  useEffect(() => {
-    if (ref.current) {
-      ref.current.srcObject = selected ?? null;
-      void ref.current.play().catch(() => undefined);
-    }
-  }, [selected, trackKey]);
-
-  const hasVideo = Boolean(selected?.getVideoTracks().length);
-  const canSwitch = participant.state.camera && Boolean(cameraStream && screenStream);
-  const userHasAudio = Boolean(cameraStream?.getAudioTracks().length);
-  const screenHasAudio = Boolean(screenStream?.getAudioTracks().length);
-
-  return <article className={`tile ${source} ${participant.connection === "connected" ? "online" : ""}`}>
-    <video ref={ref} autoPlay playsInline muted className={hasVideo ? source : "hidden-video"}/>
-    {!hasVideo && <div className="video-off"><VideoOff/><span>Vídeo desligado</span></div>}
-    {userHasAudio && <RemoteAudio stream={cameraStream!} volume={userVolume}/>} 
-    {screenHasAudio && <RemoteAudio stream={screenStream!} volume={screenVolume}/>} 
-    {canSwitch && <div className="source-switch">
-      <button className={source === "camera" ? "selected" : ""} onClick={() => setSource("camera")}><Video size={14}/> Câmera</button>
-      <button className={source === "screen" ? "selected" : ""} onClick={() => setSource("screen")}><MonitorUp size={14}/> Tela</button>
-    </div>}
-    {(userHasAudio || screenHasAudio) && <div className="volume-panel">
-      {userHasAudio && <VolumeControl label="Usuário" value={userVolume} onChange={setUserVolume}/>} 
-      {screenHasAudio && <VolumeControl label="Transmissão" value={screenVolume} onChange={setScreenVolume}/>} 
-    </div>}
-    <div className="tile-label"><span>{participant.displayName}</span>{!participant.state.microphone && <MicOff size={15}/>} {participant.state.screenAudio && <em>ÁUDIO DA TELA</em>}</div>
-  </article>;
-}
-
-function LocalVideoTile({ stream, label, mirrored, microphone }: { stream: MediaStream; label: string; mirrored: boolean; microphone: boolean }) {
-  const ref = useRef<HTMLVideoElement>(null);
-  const source = mirrored ? "camera" : "screen";
-  useEffect(() => {
-    if (ref.current) {
-      ref.current.srcObject = stream;
-      void ref.current.play().catch(() => undefined);
-    }
-  }, [stream]);
-  return <article className={`tile local online ${source}`}>
-    <video ref={ref} autoPlay playsInline muted className={`${source}${mirrored ? " mirrored" : ""}`}/>
-    <div className="tile-label"><span>Você · {label}</span>{!microphone && <MicOff size={15}/>}<em>PRÉVIA</em></div>
-  </article>;
 }
 
 function Auth() {
@@ -191,12 +97,13 @@ function Auth() {
 function Modal({ title, children, onClose }: { title: string; children: React.ReactNode; onClose(): void }) {
   return <div className="modal-backdrop" onMouseDown={onClose}>
     <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
-      <button className="modal-close" onClick={onClose}>×</button><h2>{title}</h2>{children}
-    </section>
+      <button className="modal-close" onClick={onClose}>×</button><h2>{title}</h2>{children}</section>
   </div>;
 }
 
 type SocialModal = "friend" | "group" | "channel" | "member" | "joinGroup" | "settings" | null;
+type DeleteTarget = { kind: "friend"; friend: Friend } | { kind: "group"; group: Community } | null;
+type ChannelActionTarget = { mode: "edit" | "delete"; channel: Channel } | null;
 
 function SocialHome() {
   const token = useCallStore((state) => state.token)!;
@@ -213,7 +120,13 @@ function SocialHome() {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [activeChannel, setActiveChannel] = useState<Channel | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [attachments, setAttachments] = useState<ChatAttachmentRecord[]>([]);
+  const [attachmentProgress, setAttachmentProgress] = useState<Record<string, ChatAttachmentProgress | undefined>>({});
   const [modal, setModal] = useState<SocialModal>(null);
+  const [deleteTarget, setDeleteTarget] = useState<DeleteTarget>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [channelAction, setChannelAction] = useState<ChannelActionTarget>(null);
+  const [channelSaving, setChannelSaving] = useState(false);
   const [error, setError] = useState("");
   const [chatStatus, setChatStatus] = useState<ChatConnectionStatus>("disconnected");
 
@@ -226,7 +139,9 @@ function SocialHome() {
     ]);
     const mergedFriends = [...social.friends];
     localFriends.forEach((friend) => {
-      if (!mergedFriends.some((item) => item.id === friend.peerId)) mergedFriends.push({ id: friend.peerId, displayName: friend.displayName, local: true });
+      const existing = mergedFriends.find((item) => item.id === friend.peerId);
+      if (existing) existing.local = true;
+      else mergedFriends.push({ id: friend.peerId, displayName: friend.displayName, local: true });
     });
     const mergedGroups = [...groups];
     localGroups.forEach((group) => {
@@ -306,7 +221,7 @@ function SocialHome() {
 
   useEffect(() => {
     const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
-    if (!conversationId) { setMessages([]); return; }
+    if (!conversationId) { setMessages([]); setAttachments([]); setAttachmentProgress({}); return; }
     let alive = true;
     const offMessage = chat.onMessage((message) => {
       if (!alive) return;
@@ -316,15 +231,31 @@ function SocialHome() {
       });
     });
     const offStatus = chat.onStatus((status) => { if (alive) setChatStatus(status); });
-    void chat.history(conversationId)
-      .then((items) => { if (alive) setMessages([...items].sort((a, b) => a.createdAt.localeCompare(b.createdAt))); })
+    const offAttachment = chat.onAttachment((record) => {
+      if (!alive || record.channelId !== conversationId) return;
+      setAttachments((current) => upsertAttachment(current, record));
+    });
+    const offProgress = chat.onAttachmentProgress((progress) => {
+      if (!alive || progress.record.channelId !== conversationId) return;
+      setAttachmentProgress((current) => ({ ...current, [progress.record.attachmentId]: progress }));
+      setAttachments((current) => upsertAttachment(current, progress.record));
+    });
+    void Promise.all([chat.history(conversationId), chat.attachmentHistory(conversationId)])
+      .then(([chatItems, attachmentItems]) => {
+        if (!alive) return;
+        setMessages([...chatItems].sort((a, b) => a.createdAt.localeCompare(b.createdAt)));
+        setAttachments(dedupeAttachments(attachmentItems));
+      })
       .catch((cause) => setError(cause instanceof Error ? cause.message : "Falha no histórico local"));
     return () => {
       alive = false;
       offMessage();
       offStatus();
+      offAttachment();
+      offProgress();
       void chat.disconnect();
       setChatStatus("disconnected");
+      setAttachmentProgress({});
     };
   }, [activeChannel, activeFriend, privateChannelId]);
 
@@ -372,6 +303,103 @@ function SocialHome() {
     catch (cause) { setError(cause instanceof Error ? cause.message : "Falha ao enviar mensagem"); }
   }
 
+  async function sendFiles(files: File[]) {
+    try {
+      for (const file of files) await chat.sendAttachment(file);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Falha ao enviar arquivo"); }
+  }
+
+  async function attachmentAction(action: (record: ChatAttachmentRecord) => Promise<void>, record: ChatAttachmentRecord) {
+    try { await action(record); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : "Falha na operação com o arquivo"); }
+  }
+
+  async function renameChannel(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedCommunity?.local || channelAction?.mode !== "edit" || channelSaving) return;
+    const name = String(new FormData(event.currentTarget).get("name")).trim();
+    setChannelSaving(true);
+    try {
+      const updated = await renameLocalGroupChannel(selectedCommunity.id, channelAction.channel.id, name);
+      const next: Channel = { ...channelAction.channel, ...updated };
+      setChannels((items) => items.map((item) => item.id === next.id ? next : item));
+      setActiveChannel((current) => current?.id === next.id ? next : current);
+      setChannelAction(null);
+      window.dispatchEvent(new Event("risk:social-updated"));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível renomear o canal.");
+    } finally {
+      setChannelSaving(false);
+    }
+  }
+
+  async function removeChannel() {
+    if (!selectedCommunity?.local || channelAction?.mode !== "delete" || channelSaving) return;
+    const removing = channelAction.channel;
+    setChannelSaving(true);
+    try {
+      await deleteLocalGroupChannel(selectedCommunity.id, removing.id);
+      const remaining = channels.filter((item) => item.id !== removing.id);
+      if (activeChannel?.id === removing.id) {
+        await chat.disconnect().catch(() => undefined);
+        setChatStatus("disconnected");
+        setActiveChannel(remaining.find((item) => item.kind === "text") ?? remaining[0] ?? null);
+      }
+      setChannels(remaining);
+      setChannelAction(null);
+      window.dispatchEvent(new Event("risk:social-updated"));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível apagar o canal.");
+    } finally {
+      setChannelSaving(false);
+    }
+  }
+
+  async function performDelete() {
+    const target = deleteTarget;
+    if (!target || deleting) return;
+    setDeleting(true);
+    try {
+      if (target.kind === "friend") {
+        const results = await Promise.allSettled([
+          deleteLocalFriend(target.friend.id),
+          api.removeFriend(token, target.friend.id),
+        ]);
+        if (results.every((result) => result.status === "rejected")) {
+          const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+          throw failure?.reason ?? new Error("Não foi possível desfazer a amizade.");
+        }
+        if (activeFriend?.id === target.friend.id) {
+          await chat.disconnect().catch(() => undefined);
+          setActiveFriend(null);
+        }
+      } else {
+        const results = await Promise.allSettled([
+          deleteLocalGroup(target.group.id),
+          api.removeCommunity(token, target.group.id),
+        ]);
+        if (results.every((result) => result.status === "rejected")) {
+          const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+          throw failure?.reason ?? new Error("Não foi possível remover o grupo.");
+        }
+        if (selectedCommunity?.id === target.group.id) {
+          await chat.disconnect().catch(() => undefined);
+          setSelectedCommunity(null);
+          setChannels([]);
+          setActiveChannel(null);
+          setGroupMembers([]);
+        }
+      }
+      setDeleteTarget(null);
+      await loadSocial();
+      window.dispatchEvent(new Event("risk:social-updated"));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível concluir a remoção.");
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   async function logout() {
     sessionRestoreSuppressed = true;
     sessionRestore = undefined;
@@ -379,6 +407,19 @@ function SocialHome() {
     catch { /* logout local continua mesmo se a API estiver indisponível */ }
     finally { reset(); }
   }
+
+  const timeline = <ConversationTimeline
+    messages={messages}
+    attachments={attachments}
+    progress={attachmentProgress}
+    connected={chatStatus === "ready"}
+    loadBlob={(record) => chat.attachmentBlob(record)}
+    onDownload={(record) => attachmentAction((item) => chat.downloadAttachment(item), record)}
+    onRequest={(record) => attachmentAction((item) => chat.requestAttachment(item), record)}
+    onPause={(record) => attachmentAction((item) => chat.pauseAttachment(item), record)}
+    onResume={(record) => attachmentAction((item) => chat.resumeAttachment(item), record)}
+    onCancel={(record) => attachmentAction((item) => chat.cancelAttachment(item), record)}
+  />;
 
   return <>
     <main className="social-shell">
@@ -390,12 +431,18 @@ function SocialHome() {
       </aside>
 
       <aside className="navigation">
-        <div className="nav-title">{selectedCommunity?.name ?? activeFriend?.displayName ?? "Risk"}</div>
+        <div className="nav-title"><span>{selectedCommunity?.name ?? activeFriend?.displayName ?? "Risk"}</span>{selectedCommunity && <button className="nav-danger" title="Apagar ou sair do grupo" aria-label="Apagar ou sair do grupo" onClick={() => setDeleteTarget({ kind: "group", group: selectedCommunity })}><Trash2 size={16}/></button>}</div>
         {selectedCommunity ? <>
           <div className="nav-section"><span>CANAIS DE TEXTO</span><button onClick={() => setModal("channel")}><Plus size={15}/></button></div>
-          {channels.filter((item) => item.kind === "text").map((channel) => <button key={channel.id} className={activeChannel?.id === channel.id ? "channel active" : "channel"} onClick={() => setActiveChannel(channel)}><Hash/>{channel.name}</button>)}
+          {channels.filter((item) => item.kind === "text").map((channel) => <div className="channel-item" key={channel.id}>
+            <button className={activeChannel?.id === channel.id ? "channel active" : "channel"} onClick={() => setActiveChannel(channel)}><Hash/><span>{channel.name}</span></button>
+            {selectedCommunity.local && <div className="channel-actions"><button title="Renomear canal" aria-label={`Renomear ${channel.name}`} onClick={() => setChannelAction({ mode: "edit", channel })}><Pencil size={14}/></button><button className="delete" title="Apagar canal" aria-label={`Apagar ${channel.name}`} onClick={() => setChannelAction({ mode: "delete", channel })}><Trash2 size={14}/></button></div>}
+          </div>)}
           <div className="nav-section"><span>SALAS DE VOZ</span><button onClick={() => setModal("channel")}><Plus size={15}/></button></div>
-          {channels.filter((item) => item.kind === "voice").map((channel) => <button key={channel.id} className="channel voice" onClick={() => void enterVoice(channel)}><Headphones/>{channel.name}</button>)}
+          {channels.filter((item) => item.kind === "voice").map((channel) => <div className="channel-item" key={channel.id}>
+            <button className="channel voice" onClick={() => void enterVoice(channel)}><Headphones/><span>{channel.name}</span></button>
+            {selectedCommunity.local && <div className="channel-actions"><button title="Renomear sala de voz" aria-label={`Renomear ${channel.name}`} onClick={() => setChannelAction({ mode: "edit", channel })}><Pencil size={14}/></button><button className="delete" title="Apagar sala de voz" aria-label={`Apagar ${channel.name}`} onClick={() => setChannelAction({ mode: "delete", channel })}><Trash2 size={14}/></button></div>}
+          </div>)}
           <div className="nav-section"><span>MEMBROS</span><button onClick={() => setModal("member")}><UserPlus size={15}/></button></div>
           {groupMembers.slice(0, 8).map((member) => <div className="mini-user" key={member.peerId}><i>{member.displayName[0]?.toUpperCase()}</i><span>{member.displayName}</span></div>)}
         </> : <>
@@ -416,25 +463,25 @@ function SocialHome() {
         {activeFriend ? <>
           <header className="content-header"><MessageCircle/><strong>{activeFriend.displayName}</strong><span>Mensagem direta P2P</span><button className={`chat-connect ${chatStatus}`} disabled={!privateChannelId || chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat privado conectado" : chatStatus === "connected" ? "Aguardando amigo…" : chatStatus === "connecting" ? "Conectando…" : "Conectar P2P"}</button></header>
           <div className="messages">
-            {messages.map((message) => <article key={message.id}><div className="avatar">{message.author[0]}</div><div><strong>{message.author}</strong><time>{new Date(message.createdAt).toLocaleString()}</time><p>{message.content}</p></div></article>)}
-            {!messages.length && <div className="channel-welcome"><MessageCircle/><h2>Conversa com {activeFriend.displayName}</h2><p>Os dois amigos devem abrir esta conversa e clicar em Conectar P2P. Depois disso as mensagens seguem pelo WebRTC DataChannel.</p></div>}
+            {timeline}
+            {!messages.length && !attachments.length && <div className="channel-welcome"><MessageCircle/><h2>Conversa com {activeFriend.displayName}</h2><p>Os dois amigos devem abrir esta conversa e clicar em Conectar P2P. Depois disso mensagens e arquivos seguem diretamente pelo WebRTC.</p></div>}
           </div>
-          <form className="message-box" onSubmit={(event) => void submitMessage(event)}><Plus/><input name="message" maxLength={4000} placeholder={`Mensagem para ${activeFriend.displayName}`} autoComplete="off"/><button><Send/></button></form>
+          <MessageComposer placeholder={`Mensagem para ${activeFriend.displayName}`} canAttach={chatStatus === "ready"} onSubmit={submitMessage} onFiles={sendFiles}/>
         </> : !selectedCommunity ? <>
           <header className="content-header"><Users/><strong>Amigos</strong><button onClick={() => setModal("friend")}>Adicionar amigo</button></header>
           <div className="friends-layout"><div>
             <h3>Seus amigos — {friends.length}</h3>
             {pending.map((request) => <div className="friend-row pending" key={request.requestId}><div className="avatar">{request.displayName[0]}</div><div><strong>{request.displayName}</strong><small>Quer adicionar você</small></div><button onClick={() => void api.acceptFriend(token, request.requestId).then(loadSocial).catch((cause) => setError(cause instanceof Error ? cause.message : "Falha ao aceitar"))}>Aceitar</button></div>)}
-            {friends.map((friend) => <div className="friend-row" key={friend.id}><div className="avatar">{friend.displayName[0]}</div><div><strong>{friend.displayName}</strong><small>{friend.local ? "Amigo P2P neste dispositivo" : "Amigo no Risk"}</small></div><button disabled={!friend.local} title={friend.local ? "Abrir chat privado P2P" : "Chat P2P requer amizade por identidade local"} onClick={() => { setSelectedCommunity(null); setActiveFriend(friend); }}><MessageCircle size={18}/></button></div>)}
+            {friends.map((friend) => <div className="friend-row" key={friend.id}><div className="avatar">{friend.displayName[0]}</div><div><strong>{friend.displayName}</strong><small>{friend.local ? "Amigo P2P neste dispositivo" : "Amigo no Risk"}</small></div><div className="friend-actions"><button disabled={!friend.local} title={friend.local ? "Abrir chat privado P2P" : "Chat P2P requer amizade por identidade local"} onClick={() => { setSelectedCommunity(null); setActiveFriend(friend); }}><MessageCircle size={18}/></button><button className="danger-icon" title="Desfazer amizade" aria-label={`Desfazer amizade com ${friend.displayName}`} onClick={() => setDeleteTarget({ kind: "friend", friend })}><UserMinus size={18}/></button></div></div>)}
             {!friends.length && !pending.length && <div className="empty-social"><Users/><h2>Seu círculo começa aqui</h2><p>Crie um código temporário ou use o código de outra pessoa.</p><button onClick={() => setModal("friend")}>Adicionar primeiro amigo</button></div>}
           </div><aside><h3>Atividade</h3><p>As salas de voz ativas dos seus grupos aparecerão aqui futuramente.</p></aside></div>
         </> : activeChannel?.kind === "text" ? <>
           <header className="content-header"><Hash/><strong>{activeChannel.name}</strong><span>{selectedCommunity.name}</span><button className={`chat-connect ${chatStatus}`} disabled={chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat P2P conectado" : chatStatus === "connected" ? "Aguardando peer…" : chatStatus === "connecting" ? "Conectando…" : "Conectar chat"}</button></header>
           <div className="messages">
-            {messages.map((message) => <article key={message.id}><div className="avatar">{message.author[0]}</div><div><strong>{message.author}</strong><time>{new Date(message.createdAt).toLocaleString()}</time><p>{message.content}</p></div></article>)}
-            {!messages.length && <div className="channel-welcome"><Hash/><h2>Bem-vindo a #{activeChannel.name}</h2><p>Este é o começo deste canal P2P salvo neste dispositivo.</p></div>}
+            {timeline}
+            {!messages.length && !attachments.length && <div className="channel-welcome"><Hash/><h2>Bem-vindo a #{activeChannel.name}</h2><p>Este é o começo deste canal P2P salvo neste dispositivo.</p></div>}
           </div>
-          <form className="message-box" onSubmit={(event) => void submitMessage(event)}><Plus/><input name="message" maxLength={4000} placeholder={`Conversar em #${activeChannel.name}`} autoComplete="off"/><button><Send/></button></form>
+          <MessageComposer placeholder={`Conversar em #${activeChannel.name}`} canAttach={chatStatus === "ready"} onSubmit={submitMessage} onFiles={sendFiles}/>
         </> : <div className="empty-social"><Headphones/><h2>Escolha uma sala</h2><p>Entre em um canal de voz pela barra lateral.</p></div>}
       </section>
 
@@ -474,38 +521,34 @@ function SocialHome() {
       }}><input name="name" minLength={2} maxLength={80} placeholder="Nome do canal" required/><select name="kind"><option value="text">Canal de texto</option><option value="voice">Sala de voz</option></select><button>Criar canal</button></form></Modal>}
       {modal === "member" && selectedCommunity && <Modal title="Adicionar membro" onClose={() => setModal(null)}>{currentUser ? <GroupInvitePanel token={token} displayName={currentUser.displayName} preferredGroupId={selectedCommunity.id} preferredGroupName={selectedCommunity.name} preferredGroupChannels={channels} initialMode="create" onComplete={() => void loadSocial()}/> : <p>Carregando sua identidade…</p>}</Modal>}
       {modal === "joinGroup" && <Modal title="Entrar em grupo" onClose={() => setModal(null)}>{currentUser ? <GroupInvitePanel token={token} displayName={currentUser.displayName} initialMode="join" onComplete={() => { void loadSocial(); setModal(null); }}/> : <p>Carregando sua identidade…</p>}</Modal>}
+      {deleteTarget && <Modal title={deleteTarget.kind === "friend" ? "Desfazer amizade" : "Remover grupo"} onClose={() => { if (!deleting) setDeleteTarget(null); }}><div className="danger-confirm"><div className="danger-confirm-icon">{deleteTarget.kind === "friend" ? <UserMinus/> : <Trash2/>}</div>{deleteTarget.kind === "friend" ? <p>Desfazer amizade com <strong>{deleteTarget.friend.displayName}</strong>? O histórico local não será apagado automaticamente.</p> : <p>Remover <strong>{deleteTarget.group.name}</strong>? Se você for o dono, o grupo será apagado. Caso contrário, você apenas sairá dele.</p>}<div className="danger-confirm-actions"><button className="secondary" disabled={deleting} onClick={() => setDeleteTarget(null)}>Cancelar</button><button className="danger-action" disabled={deleting} onClick={() => void performDelete()}>{deleting ? "Removendo…" : deleteTarget.kind === "friend" ? "Desfazer amizade" : "Remover grupo"}</button></div></div></Modal>}
+      {channelAction?.mode === "edit" && <Modal title={channelAction.channel.kind === "text" ? "Renomear canal" : "Renomear sala de voz"} onClose={() => { if (!channelSaving) setChannelAction(null); }}><form className="channel-edit-form" onSubmit={renameChannel}><input name="name" defaultValue={channelAction.channel.name} minLength={2} maxLength={80} autoFocus required/><small>O tipo do canal será mantido como {channelAction.channel.kind === "text" ? "texto" : "voz"}.</small><button disabled={channelSaving}>{channelSaving ? "Salvando…" : "Salvar nome"}</button></form></Modal>}
+      {channelAction?.mode === "delete" && <Modal title={channelAction.channel.kind === "text" ? "Apagar canal" : "Apagar sala de voz"} onClose={() => { if (!channelSaving) setChannelAction(null); }}><div className="danger-confirm"><div className="danger-confirm-icon"><Trash2/></div><p>Apagar <strong>{channelAction.channel.name}</strong>? {channelAction.channel.kind === "text" ? "O canal deixará de aparecer neste grupo." : "A sala de voz deixará de aparecer neste grupo."}</p><div className="danger-confirm-actions"><button className="secondary" disabled={channelSaving} onClick={() => setChannelAction(null)}>Cancelar</button><button className="danger-action" disabled={channelSaving} onClick={() => void removeChannel()}>{channelSaving ? "Apagando…" : "Apagar canal"}</button></div></div></Modal>}
     </main>
     <button className="floating-invite" onClick={() => setModal("joinGroup")}><UserPlus size={18}/> Entrar em grupo</button>
   </>;
 }
 
-function CallRoom() {
-  const roomId = useCallStore((state) => state.roomId)!;
-  const participants = useCallStore((state) => state.participants);
-  const localPreviews = useCallStore((state) => state.localPreviews);
-  const localState = useCallStore((state) => state.localState);
-  const callError = useCallStore((state) => state.error);
-  const setError = useCallStore((state) => state.setError);
-  const setRoom = useCallStore((state) => state.setRoom);
-  const peers = Object.values(participants);
-  const hasVideo = Boolean(localPreviews.camera || localPreviews.screen);
+function upsertAttachment(current: ChatAttachmentRecord[], record: ChatAttachmentRecord): ChatAttachmentRecord[] {
+  const index = current.findIndex((item) => item.attachmentId === record.attachmentId);
+  if (index < 0) return [...current, record].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  const existing = current[index]!;
+  const replacement = attachmentStateWeight(record.state) >= attachmentStateWeight(existing.state) ? record : existing;
+  const next = [...current];
+  next[index] = replacement;
+  return next.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+}
 
-  return <main className="room">
-    <header><div className="brand"><Sparkles/> Risk</div><div><strong>Sala ao vivo</strong><span>{roomId}</span></div><div className="status"><i/> Conectado · {peers.length + 1}</div></header>
-    {callError && <div className="global-error" onClick={() => setError(null)}>{callError}</div>}
-    <section className="stage">
-      {localPreviews.camera && <LocalVideoTile stream={localPreviews.camera} label="Câmera" mirrored microphone={localState.microphone}/>} 
-      {localPreviews.screen && <LocalVideoTile stream={localPreviews.screen} label={localState.screenAudio ? "Tela · áudio ativo" : "Tela · sem áudio do sistema"} mirrored={false} microphone={localState.microphone}/>} 
-      {peers.map((participant) => <VideoTile key={participant.peerId} participant={participant}/>)}
-      {!hasVideo && !peers.length && <div className="empty"><div className="pulse"><Sparkles/></div><h2>Você chegou primeiro</h2><p>Compartilhe o código <b>{roomId}</b> para alguém entrar.</p></div>}
-    </section>
-    <footer>
-      <button className={localState.microphone ? "" : "off"} onClick={() => void call.toggleMicrophone(roomId)}>{localState.microphone ? <Mic/> : <MicOff/>}<span>Microfone</span></button>
-      <button className={localState.camera ? "active" : ""} onClick={() => void call.toggleCamera(roomId)}>{localState.camera ? <Video/> : <VideoOff/>}<span>Câmera</span></button>
-      <button className={localState.screenShare ? "active" : ""} onClick={() => void call.toggleScreen(roomId)}><MonitorUp/><span>Compartilhar</span></button>
-      <button className="hangup" onClick={() => { setRoom(null); void call.leave(roomId); }}><PhoneOff/><span>Sair</span></button>
-    </footer>
-  </main>;
+function dedupeAttachments(records: ChatAttachmentRecord[]): ChatAttachmentRecord[] {
+  return records.reduce<ChatAttachmentRecord[]>((items, record) => upsertAttachment(items, record), []);
+}
+
+function attachmentStateWeight(state: ChatAttachmentRecord["state"]): number {
+  return ({ offered: 1, waiting: 2, accepted: 3, queued: 4, transferring: 5, paused: 6, verifying: 7, failed: 8, cancelled: 8, completed: 10 })[state];
+}
+
+function CallRoom() {
+  return <CallWorkspace call={call} chat={chat}/>;
 }
 
 function App() {

@@ -28,11 +28,11 @@ export function VoiceVideoSettingsPanel() {
         value={settings.noiseSuppression}
         onChange={(event) => update({ noiseSuppression: event.target.value as NoiseSuppressionMode })}
       >
-        <option value="rnnoise">RNNoise — recomendado</option>
-        <option value="standard">Padrão do WebRTC</option>
+        <option value="standard">Padrão do WebRTC — recomendado</option>
+        <option value="rnnoise">RNNoise — experimental</option>
         <option value="off">Desativada</option>
       </select>
-      <small>RNNoise processa sua voz localmente antes de enviá-la aos outros participantes.</small>
+      <small>O modo padrão é o mais compatível. RNNoise processa a voz localmente em um AudioWorklet e volta automaticamente ao WebRTC se não conseguir iniciar.</small>
     </label>
 
     <label className="settings-toggle">

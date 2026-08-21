@@ -26,10 +26,12 @@ const APP_ICON_PATH = app.isPackaged
   ? path.join(process.resourcesPath, "icon.png")
   : path.resolve(root, "../build/icon.png");
 
+type CapturableSource = Awaited<ReturnType<typeof desktopCapturer.getSources>>[number];
 type PendingDisplaySelection = {
   id: string;
   name?: string;
   displayId?: string;
+  source?: CapturableSource;
 };
 
 let assetServer: Server | undefined;
@@ -231,7 +233,13 @@ function stopBackend(): void {
   child.once("exit", () => clearTimeout(forceTimer));
 }
 
-async function resolveCurrentDisplaySource(selection: PendingDisplaySelection) {
+async function resolveCurrentDisplaySource(selection: PendingDisplaySelection): Promise<CapturableSource | undefined> {
+  // No PipeWire/Wayland, desktopCapturer.getSources() abre/usa o portal de captura
+  // e o source retornado pertence àquela sessão. Reconsultar o portal durante
+  // getDisplayMedia pode invalidar a seleção e resultar em "Invalid capture constraints".
+  if (selection.source) return selection.source;
+  if (process.platform === "linux") return undefined;
+
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const sources = await desktopCapturer.getSources({
       types: ["screen", "window"],
@@ -241,9 +249,6 @@ async function resolveCurrentDisplaySource(selection: PendingDisplaySelection) {
     const selected = sources.find((source) => source.id === selection.id)
       ?? (selection.displayId
         ? sources.find((source) => source.display_id === selection.displayId)
-        : undefined)
-      ?? (selection.name
-        ? sources.find((source) => source.name === selection.name)
         : undefined);
     if (selected) return selected;
     if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 120));
@@ -280,6 +285,7 @@ ipcMain.handle("screen:list", async (event) => {
       id: source.id,
       name: source.name,
       displayId: source.display_id,
+      source,
     });
   });
   return sources.map((source) => ({
@@ -298,6 +304,19 @@ ipcMain.handle("screen:choose", async (event) => {
     fetchWindowIcons: false,
   });
   if (!allSources.length) return null;
+
+  // Em PipeWire o portal do sistema já realizou a escolha e o Electron retorna
+  // apenas aquela fonte. Não mostramos uma segunda caixa de seleção redundante.
+  if (process.platform === "linux" && allSources.length === 1) {
+    const selected = allSources[0]!;
+    knownDisplaySources.set(selected.id, {
+      id: selected.id,
+      name: selected.name,
+      displayId: selected.display_id,
+      source: selected,
+    });
+    return selected.id;
+  }
 
   const sources = allSources.slice(0, 20);
   const buttons = [...sources.map((source) => source.name.slice(0, 80)), "Cancelar"];
@@ -324,6 +343,7 @@ ipcMain.handle("screen:choose", async (event) => {
     id: selected.id,
     name: selected.name,
     displayId: selected.display_id,
+    source: selected,
   });
   return selected.id;
 });
@@ -333,10 +353,11 @@ ipcMain.handle("screen:select", async (event, sourceId: unknown) => {
   if (typeof sourceId !== "string" || sourceId.length === 0 || sourceId.length > 512) {
     throw new Error("Fonte de compartilhamento inválida.");
   }
-  // Não relistamos aqui. No Linux/Wayland os ids do desktopCapturer podem ser
-  // efêmeros e mudar entre a abertura do picker e o getDisplayMedia. Guardamos os
-  // metadados conhecidos e resolvemos a fonte atual apenas quando o Chromium pedir.
-  pendingDisplaySelection = knownDisplaySources.get(sourceId) ?? { id: sourceId };
+  const known = knownDisplaySources.get(sourceId);
+  if (process.platform === "linux" && !known?.source) {
+    throw new Error("A fonte PipeWire selecionada não está mais disponível. Abra o seletor novamente.");
+  }
+  pendingDisplaySelection = known ?? { id: sourceId };
 });
 
 function createWindow(): void {
@@ -393,7 +414,11 @@ if (hasSingleInstanceLock) {
       try {
         const selected = await resolveCurrentDisplaySource(selection);
         if (!selected) {
-          console.warn("Fonte de compartilhamento desapareceu antes do getDisplayMedia", selection);
+          console.warn("Fonte de compartilhamento desapareceu antes do getDisplayMedia", {
+            id: selection.id,
+            name: selection.name,
+            displayId: selection.displayId,
+          });
           callback({});
           return;
         }

@@ -4,6 +4,7 @@ import { api } from "../api";
 import { normalizeRiskInviteCode, type InviteType } from "../services/invites/code";
 import { FriendInviteService, GroupInviteService, type IncomingInviteRequest, type InviteSnapshot, type InviteService } from "../services/invites/service";
 import { getOrCreateLocalIdentity, type PublicGroupMetadata } from "../services/offline/social-storage";
+import { resolveStaticIceConfiguration } from "../services/rtc/ice";
 
 export function P2PInvitePanel({ type, token, displayName, group, initialMode = "create", onComplete }: {
   type: InviteType; token: string; displayName: string; group?: PublicGroupMetadata; initialMode?: "create" | "join"; onComplete?(): void;
@@ -18,8 +19,16 @@ export function P2PInvitePanel({ type, token, displayName, group, initialMode = 
 
   async function getService(): Promise<InviteService> {
     await service.current?.cancel(false);
-    const [identity, turn] = await Promise.all([getOrCreateLocalIdentity(displayName), api.turnCredentials(token)]);
-    const next = type === "friend" ? new FriendInviteService(identity, turn.iceServers) : new GroupInviteService(identity, turn.iceServers);
+    const identityPromise = getOrCreateLocalIdentity(displayName);
+    // O sidecar desktop local não possui credenciais TURN dinâmicas e seu endpoint
+    // /rtc/credentials responde 503 de propósito. Para convites no Electron usamos
+    // diretamente a configuração ICE estática, evitando transformar esse fallback
+    // esperado em erro no backend. Web/API externa continua podendo fornecer TURN.
+    const icePromise = window.desktop?.getBackendConfig
+      ? Promise.resolve(resolveStaticIceConfiguration().iceServers)
+      : api.turnCredentials(token).then((result) => result.iceServers);
+    const [identity, iceServers] = await Promise.all([identityPromise, icePromise]);
+    const next = type === "friend" ? new FriendInviteService(identity, iceServers) : new GroupInviteService(identity, iceServers);
     next.onState(setState); next.onRequest(setRequest); service.current = next; return next;
   }
   async function create() { setError(""); setRequest(undefined); try { const next = await getService(); if (type === "friend") await next.createInvite("friend"); else await next.createInvite("group", group); } catch (cause) { setError(friendly(cause)); } }

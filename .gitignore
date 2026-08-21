@@ -9,6 +9,5 @@ coverage/
 *.tsbuildinfo
 release/
 apps/desktop/resources/backend/
-apps/desktop/build/icon.png
 .risk/
 .DS_Store

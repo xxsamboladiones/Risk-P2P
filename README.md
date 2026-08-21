@@ -2,7 +2,7 @@
 
 **Risk** é um aplicativo desktop de comunicação P2P com chamadas de voz e vídeo, compartilhamento de tela, chat, grupos e transferência de arquivos usando WebRTC.
 
-> **Versão atual: Alpha 0.2.0**
+> **Versão atual: Alpha 0.1.3**
 >
 > O projeto ainda está em fase Alpha. Recursos, protocolo e persistência podem mudar entre versões.
 

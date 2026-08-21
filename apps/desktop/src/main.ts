@@ -226,6 +226,16 @@ ipcMain.handle("backend:config", async (event) => {
   return backendConfig;
 });
 
+ipcMain.handle("window:fullscreen", async (event, enabled: unknown) => {
+  if (!isTrustedRendererUrl(event.sender.getURL())) throw new Error("Origem do renderer não autorizada.");
+  if (typeof enabled !== "boolean") throw new Error("Estado de tela cheia inválido.");
+  const owner = BrowserWindow.fromWebContents(event.sender);
+  if (!owner) throw new Error("Janela do Risk não encontrada.");
+  owner.setFullScreen(enabled);
+  if (enabled) owner.focus();
+  return { fullscreen: enabled };
+});
+
 ipcMain.handle("screen:list", async (event) => {
   if (!isTrustedRendererUrl(event.sender.getURL())) throw new Error("Origem do renderer não autorizada.");
   return (await desktopCapturer.getSources({

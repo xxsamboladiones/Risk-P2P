@@ -143,7 +143,12 @@ function VideoTile({
   const streams = Object.values(participant.streams ?? {});
   const screenStream = participant.state.screenStreamId ? participant.streams?.[participant.state.screenStreamId] : undefined;
   const cameraStream = (participant.state.cameraStreamId ? participant.streams?.[participant.state.cameraStreamId] : undefined)
+    ?? streams.find((stream) => stream.id !== screenStream?.id && stream.getVideoTracks().length > 0)
     ?? streams.find((stream) => stream.id !== screenStream?.id);
+  const microphoneStream = streams.find((stream) =>
+    stream.id !== screenStream?.id
+    && stream.getAudioTracks().some((track) => track.readyState === "live"),
+  ) ?? (cameraStream?.getAudioTracks().length ? cameraStream : undefined);
   const [source, setSource] = useState<"camera" | "screen">("camera");
   const [userVolume, setUserVolume] = useState(100);
   const [screenVolume, setScreenVolume] = useState(100);
@@ -166,8 +171,8 @@ function VideoTile({
 
   const hasVideo = Boolean(selected?.getVideoTracks().length);
   const canSwitch = participant.state.camera && Boolean(cameraStream && screenStream);
-  const userHasAudio = Boolean(cameraStream?.getAudioTracks().length);
-  const screenHasAudio = Boolean(screenStream?.getAudioTracks().length);
+  const userHasAudio = Boolean(microphoneStream?.getAudioTracks().some((track) => track.readyState === "live"));
+  const screenHasAudio = Boolean(screenStream?.getAudioTracks().some((track) => track.readyState === "live"));
 
   return <article
     ref={articleRef}
@@ -180,7 +185,7 @@ function VideoTile({
   >
     <video ref={videoRef} autoPlay playsInline muted className={hasVideo ? source : "hidden-video"}/>
     {!hasVideo && <div className="video-off"><VideoOff/><span>Vídeo desligado</span></div>}
-    {userHasAudio && <RemoteAudio stream={cameraStream!} volume={userVolume}/>} 
+    {userHasAudio && <RemoteAudio stream={microphoneStream!} volume={userVolume}/>} 
     {screenHasAudio && <RemoteAudio stream={screenStream!} volume={screenVolume}/>} 
     <FullscreenButton target={articleRef}/>
     {canSwitch && <div className="source-switch">

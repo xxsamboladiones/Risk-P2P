@@ -22,6 +22,9 @@ const DEVELOPMENT_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:
 const DESKTOP_HOST = "127.0.0.1";
 const DEV_BACKEND_BRIDGE_FILE = path.resolve(root, "../../../.risk/dev-backend.json");
 const WINDOWS_LOOPBACK_WITHOUT_RISK = "loopbackWithoutChrome";
+const APP_ICON_PATH = app.isPackaged
+  ? path.join(process.resourcesPath, "icon.png")
+  : path.resolve(root, "../build/icon.png");
 let assetServer: Server | undefined;
 let pageUrl = "http://localhost:5173";
 let packagedOrigin = "";
@@ -304,6 +307,7 @@ function createWindow(): void {
     minWidth: 900,
     minHeight: 600,
     backgroundColor: "#090b10",
+    icon: APP_ICON_PATH,
     show: false,
     autoHideMenuBar: true,
     webPreferences: {

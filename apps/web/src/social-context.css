@@ -1,0 +1,3 @@
+.social-shell:has(.nav-title .nav-danger) + .floating-invite {
+  display: none;
+}

@@ -22,6 +22,7 @@ let activeFullscreenWorkspace: HTMLElement | null = null;
 let activeFullscreenZoom = 1;
 let swallowFullscreenClickUntil = 0;
 let fullscreenTransition: Promise<void> = Promise.resolve();
+let htmlFullscreenFallback = false;
 
 function installNativeStreamFullscreenStyle(): void {
   if (document.getElementById(FULLSCREEN_STYLE_ID)) return;
@@ -37,12 +38,15 @@ body.risk-native-stream-fullscreen {
   margin: 0 !important;
   padding: 0 !important;
   overflow: hidden !important;
+  overscroll-behavior: none !important;
   scrollbar-width: none !important;
   background: #000 !important;
 }
 html.risk-native-stream-fullscreen::-webkit-scrollbar,
 body.risk-native-stream-fullscreen::-webkit-scrollbar,
-html.risk-native-stream-fullscreen #root::-webkit-scrollbar {
+html.risk-native-stream-fullscreen #root::-webkit-scrollbar,
+.call-workspace[data-risk-native-fullscreen-active="true"]::-webkit-scrollbar,
+.call-workspace[data-risk-native-fullscreen-active="true"] *::-webkit-scrollbar {
   width: 0 !important;
   height: 0 !important;
   display: none !important;
@@ -119,6 +123,7 @@ html.risk-native-stream-fullscreen #root {
   border: 0 !important;
   border-radius: 0 !important;
   overflow: hidden !important;
+  scrollbar-width: none !important;
   background: #000 !important;
   grid-column: auto !important;
   grid-row: auto !important;
@@ -159,6 +164,13 @@ html.risk-native-stream-fullscreen #root {
 }
 `;
   document.head.appendChild(style);
+}
+
+function closestFromEventTarget(target: EventTarget | null, selector: string): HTMLElement | null {
+  if (!target) return null;
+  const candidate = target as EventTarget & { closest?: (value: string) => Element | null };
+  if (typeof candidate.closest !== "function") return null;
+  return candidate.closest(selector) as HTMLElement | null;
 }
 
 function clearFullscreenZoomStyles(tile: HTMLElement | null): void {
@@ -213,18 +225,20 @@ async function exitHtmlFullscreen(): Promise<void> {
 }
 
 async function exitNativeStreamFullscreen(): Promise<void> {
+  htmlFullscreenFallback = false;
   await exitHtmlFullscreen();
   cleanupFullscreenDom();
   await ipcRenderer.invoke("window:fullscreen", false).catch(() => undefined);
 }
 
 async function performEnterNativeStreamFullscreen(tile: HTMLElement): Promise<void> {
-  if (activeFullscreenTile === tile) {
+  if (activeFullscreenTile === tile && !htmlFullscreenFallback) {
     await exitNativeStreamFullscreen();
     return;
   }
 
   if (activeFullscreenTile) await exitNativeStreamFullscreen();
+  htmlFullscreenFallback = false;
   await exitHtmlFullscreen();
 
   const workspace = tile.closest<HTMLElement>(".call-workspace");
@@ -242,9 +256,11 @@ async function performEnterNativeStreamFullscreen(tile: HTMLElement): Promise<vo
     await ipcRenderer.invoke("window:fullscreen", true);
   } catch (error) {
     cleanupFullscreenDom();
+    htmlFullscreenFallback = true;
     try {
       await tile.requestFullscreen();
     } catch {
+      htmlFullscreenFallback = false;
       console.warn("Risk não conseguiu entrar em tela cheia.", error);
     }
   }
@@ -258,11 +274,9 @@ function enterNativeStreamFullscreen(tile: HTMLElement): Promise<void> {
 }
 
 function tileFromFullscreenButton(event: Event): HTMLElement | null {
-  const target = event.target;
-  if (!(target instanceof Element)) return null;
-  const button = target.closest(".tile-fullscreen");
+  const button = closestFromEventTarget(event.target, ".tile-fullscreen");
   if (!button) return null;
-  return button.closest<HTMLElement>(".tile");
+  return button.closest<HTMLElement>(".call-workspace .tile");
 }
 
 function suppressEvent(event: Event): void {
@@ -274,9 +288,10 @@ function suppressEvent(event: Event): void {
 function installNativeStreamFullscreenController(): void {
   installNativeStreamFullscreenStyle();
 
-  // Entra no fullscreen já no pointerdown. O click que o React dispara depois é
-  // engolido abaixo, evitando que element.requestFullscreen() concorra com o
-  // fullscreen nativo da BrowserWindow.
+  // Começa no pointerdown e engole o click posterior. Assim o requestFullscreen()
+  // legado do React nunca concorre com o fullscreen nativo da BrowserWindow.
+  // A busca por closest() é deliberadamente duck-typed: o preload roda em um
+  // isolated world e instanceof Element/HTMLElement não é confiável entre mundos.
   window.addEventListener("pointerdown", (event) => {
     const tile = tileFromFullscreenButton(event);
     if (!tile) return;
@@ -295,9 +310,7 @@ function installNativeStreamFullscreenController(): void {
   }, true);
 
   window.addEventListener("dblclick", (event) => {
-    const target = event.target;
-    if (!(target instanceof Element)) return;
-    const tile = target.closest<HTMLElement>(".call-workspace .tile");
+    const tile = closestFromEventTarget(event.target, ".call-workspace .tile");
     if (!tile) return;
     suppressEvent(event);
     void enterNativeStreamFullscreen(tile);
@@ -316,13 +329,13 @@ function installNativeStreamFullscreenController(): void {
       .then(() => exitNativeStreamFullscreen());
   }, true);
 
-  // Defesa contra qualquer requestFullscreen() legado que ainda consiga passar
-  // pelo renderer: converte automaticamente o fullscreen HTML em fullscreen
-  // nativo, sem exigir um segundo clique do usuário.
+  // Se algum requestFullscreen() HTML legado ainda escapar, convertemos para o
+  // modo nativo. Quando o HTML fullscreen é o fallback deliberado porque o IPC
+  // falhou, não tentamos converter novamente para evitar um loop.
   document.addEventListener("fullscreenchange", () => {
-    const element = document.fullscreenElement;
-    if (!(element instanceof HTMLElement) || !element.matches(".call-workspace .tile")) return;
-    const tile = element;
+    if (htmlFullscreenFallback) return;
+    const tile = closestFromEventTarget(document.fullscreenElement, ".call-workspace .tile");
+    if (!tile || document.fullscreenElement !== tile) return;
     void exitHtmlFullscreen().then(() => enterNativeStreamFullscreen(tile));
   });
 

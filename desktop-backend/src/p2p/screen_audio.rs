@@ -7,11 +7,12 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     process::Stdio,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 #[cfg(target_os = "linux")]
 use tokio::{
+    io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
     sync::Mutex,
     task::JoinHandle,
@@ -31,6 +32,8 @@ const MIX_SINK_LABEL: &str = "Risk Screen Share Mix";
 const RISK_APPLICATION_ID: &str = "com.risk.calls";
 #[cfg(target_os = "linux")]
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(750);
+#[cfg(target_os = "linux")]
+const MIX_NODE_WAIT_ATTEMPTS: usize = 30;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -122,30 +125,25 @@ async fn start_pipewire(exclude_risk: bool) -> anyhow::Result<()> {
         ensure_command(command).await?;
     }
 
-    // Segue o layout recomendado pelo PipeWire para uma virtual source: a
-    // ponta de captura é um Audio/Sink e a ponta de playback é um Audio/Source.
-    // Evitamos node.autoconnect/node.passive aqui porque WirePlumber pode deixar
-    // o endpoint virtual sem publicar/ativar em algumas distribuições.
+    // Mantemos apenas as propriedades documentadas e necessárias. Algumas
+    // combinações WirePlumber/PipeWire rejeitam propriedades adicionais no
+    // pw-loopback antes mesmo de publicar os nós, deixando sink/source ausentes.
     let capture_props = serde_json::json!({
         "node.name": MIX_SINK_NAME,
         "node.description": MIX_SINK_LABEL,
         "media.class": "Audio/Sink",
-        "media.role": "Screen",
-        "audio.position": ["FL", "FR"],
-        "node.virtual": true
+        "audio.position": ["FL", "FR"]
     });
     let playback_props = serde_json::json!({
         "node.name": MIX_SOURCE_NAME,
         "node.description": MIX_SOURCE_LABEL,
         "media.class": "Audio/Source",
-        "media.role": "Screen",
-        "audio.position": ["FL", "FR"],
-        "node.virtual": true
+        "audio.position": ["FL", "FR"]
     });
 
     let mut command = Command::new("pw-loopback");
     command
-        .arg(format!("--name={MIX_SOURCE_LABEL}"))
+        .arg("--name=risk-screen-share-loopback")
         .arg("--channels=2")
         .arg(format!("--capture-props={capture_props}"))
         .arg(format!("--playback-props={playback_props}"))
@@ -156,21 +154,38 @@ async fn start_pipewire(exclude_risk: bool) -> anyhow::Result<()> {
     configure_parent_death_signal(&mut command)?;
     let mut child = command.spawn()?;
 
+    let stderr_lines = Arc::new(Mutex::new(Vec::<String>::new()));
     if let Some(stderr) = child.stderr.take() {
+        let lines = Arc::clone(&stderr_lines);
         tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if !line.trim().is_empty() {
-                    tracing::debug!(message = %line, "pw-loopback");
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                tracing::debug!(message = %trimmed, "pw-loopback");
+                let mut buffered = lines.lock().await;
+                buffered.push(trimmed.to_string());
+                if buffered.len() > 12 {
+                    buffered.remove(0);
                 }
             }
         });
     }
 
-    wait_for_mix_nodes().await?;
+    if let Err(error) = wait_for_mix_nodes(&mut child, &stderr_lines).await {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+        return Err(error);
+    }
+
     let risk_root_pid = parent_pid(std::process::id()).unwrap_or(std::process::id());
-    reconcile_links(exclude_risk, risk_root_pid).await?;
+    if let Err(error) = reconcile_links(exclude_risk, risk_root_pid).await {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+        return Err(error);
+    }
 
     let reconcile_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(RECONCILE_INTERVAL);
@@ -222,21 +237,46 @@ async fn ensure_command(command: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn wait_for_mix_nodes() -> anyhow::Result<()> {
+async fn wait_for_mix_nodes(
+    child: &mut Child,
+    stderr_lines: &Arc<Mutex<Vec<String>>>,
+) -> anyhow::Result<()> {
     let mut last_sink = false;
     let mut last_source = false;
-    for _ in 0..80 {
+    for _ in 0..MIX_NODE_WAIT_ATTEMPTS {
+        if let Some(status) = child.try_wait()? {
+            let detail = stderr_summary(stderr_lines).await;
+            if detail.is_empty() {
+                anyhow::bail!("pw-loopback encerrou antes de publicar os nós virtuais do Risk ({status})");
+            }
+            anyhow::bail!(
+                "pw-loopback encerrou antes de publicar os nós virtuais do Risk ({status}): {detail}"
+            );
+        }
+
         let graph = read_graph().await?;
-        last_sink = graph.iter().any(|object| is_mix_sink(object));
-        last_source = graph.iter().any(|object| is_mix_source(object));
+        last_sink = graph.iter().any(is_mix_sink);
+        last_source = graph.iter().any(is_mix_source);
         if last_sink && last_source {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    let detail = stderr_summary(stderr_lines).await;
+    if detail.is_empty() {
+        anyhow::bail!(
+            "PipeWire não publicou os nós virtuais do Risk dentro do tempo esperado (sink={last_sink}, source={last_source})"
+        );
+    }
     anyhow::bail!(
-        "PipeWire não publicou os nós virtuais do Risk dentro do tempo esperado (sink={last_sink}, source={last_source})"
+        "PipeWire não publicou os nós virtuais do Risk dentro do tempo esperado (sink={last_sink}, source={last_source}). pw-loopback: {detail}"
     )
+}
+
+#[cfg(target_os = "linux")]
+async fn stderr_summary(stderr_lines: &Arc<Mutex<Vec<String>>>) -> String {
+    stderr_lines.lock().await.join(" | ")
 }
 
 #[cfg(target_os = "linux")]

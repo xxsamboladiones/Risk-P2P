@@ -116,6 +116,7 @@ const HISTORY_CHUNK_MESSAGES = 8;
 const MAX_GROUP_SYNC_MEMBERS = 128;
 const LIVE_MESSAGE_MAX_AGE_MS = 120_000;
 const FUTURE_CLOCK_SKEW_MS = 30_000;
+const IDENTITY_HANDSHAKE_RETRY_MS = 1_200;
 
 export class ChatController {
   private signaling?: SignalingProvider;
@@ -134,6 +135,7 @@ export class ChatController {
   private readonly trustedPeers = new Map<string, PublicPeerIdentity>();
   private readonly verifyKeys = new Map<string, Promise<CryptoKey>>();
   private readonly pendingIdentityChallenges = new Map<string, string>();
+  private readonly identityHandshakeTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly historyRequests = new Map<string, string>();
   private readonly messageCallbacks = new Set<(message: LocalChatMessage) => void>();
   private readonly statusCallbacks = new Set<(status: ChatConnectionStatus) => void>();
@@ -141,6 +143,7 @@ export class ChatController {
   private readonly attachmentProgressCallbacks = new Set<(progress: AttachmentRuntimeState) => void>();
   private unsubscribers: Array<() => void> = [];
   private refreshingMembers?: Promise<void>;
+  private sessionToken?: object;
 
   constructor(private readonly createSignaling: () => SignalingProvider = () => new SupabaseSignalingProvider()) {}
 
@@ -183,17 +186,25 @@ export class ChatController {
     this.peerNames.clear();
     this.trustedPeers.forEach((peer) => this.peerNames.set(peer.peerId, peer.displayName));
 
-    this.signaling = this.createSignaling();
-    this.transport = new MeshWebRTCTransport(this.peerId, iceServers, {
-      sendOffer: (targetPeerId, description) => this.signaling!.sendOffer(targetPeerId, description),
-      sendAnswer: (targetPeerId, description) => this.signaling!.sendAnswer(targetPeerId, description),
-      sendIce: (targetPeerId, candidate) => this.signaling!.sendIceCandidate(targetPeerId, candidate),
+    const sessionToken = {};
+    this.sessionToken = sessionToken;
+    const signaling = this.createSignaling();
+    this.signaling = signaling;
+    const transport = new MeshWebRTCTransport(this.peerId, iceServers, {
+      sendOffer: (targetPeerId, description) => signaling.sendOffer(targetPeerId, description),
+      sendAnswer: (targetPeerId, description) => signaling.sendAnswer(targetPeerId, description),
+      sendIce: (targetPeerId, candidate) => signaling.sendIceCandidate(targetPeerId, candidate),
       onRemoteStream: () => undefined,
       onConnectionState: (remotePeerId, state) => {
+        if (this.sessionToken !== sessionToken) return;
         if (state === "failed" || state === "closed") this.forgetPeerConnection(remotePeerId);
       },
-      onDataMessage: (remotePeerId, data) => { void this.receiveData(remotePeerId, data); },
+      onDataMessage: (remotePeerId, data) => {
+        if (this.sessionToken !== sessionToken) return;
+        void this.receiveData(remotePeerId, data);
+      },
       onDataState: (remotePeerId, state) => {
+        if (this.sessionToken !== sessionToken) return;
         if (state === "open") {
           this.dataChannelPeers.add(remotePeerId);
           if (this.identity) void this.beginIdentityHandshake(remotePeerId);
@@ -203,36 +214,52 @@ export class ChatController {
         }
       },
       onTransferMessage: (remotePeerId, data) => {
+        if (this.sessionToken !== sessionToken) return;
         void this.attachmentService?.handleTransferFrame(remotePeerId, data).catch((error) => console.warn("Frame de anexo rejeitado", error));
       },
       onTransferState: (remotePeerId, state) => {
+        if (this.sessionToken !== sessionToken) return;
         if (state === "open" && this.openDataPeers.has(remotePeerId)) void this.attachmentService?.peerReady(remotePeerId).catch(() => undefined);
       },
     }, options.maxRemotePeers);
+    this.transport = transport;
     this.installAttachmentService(new AttachmentService(
-      this.transport,
+      transport,
       channelId,
       this.peerId,
       () => [...this.openDataPeers],
       await createAttachmentStorage(),
     ));
-    this.bindSignaling(this.signaling, this.peerId);
+    if (this.sessionToken !== sessionToken) {
+      await transport.disconnect().catch(() => undefined);
+      throw new DOMException("Conexão do chat substituída por outra sessão.", "AbortError");
+    }
+    this.bindSignaling(signaling, this.peerId);
     if (this.groupId && typeof window !== "undefined") {
       const refresh = () => { void this.refreshGroupMembership(true); };
       window.addEventListener("risk:social-updated", refresh);
       this.unsubscribers.push(() => window.removeEventListener("risk:social-updated", refresh));
     }
     try {
-      await this.signaling.connect(channelId, this.peerId, options.namespace ?? "chat");
+      await signaling.connect(channelId, this.peerId, options.namespace ?? "chat");
+      if (this.sessionToken !== sessionToken) throw new DOMException("Conexão do chat substituída por outra sessão.", "AbortError");
       this.setStatus("connected");
-      await this.signaling.sendPeerProfile(this.displayName);
-    } catch (error) { await this.disconnect(); this.setStatus("error"); throw error; }
+      await signaling.sendPeerProfile(this.displayName);
+    } catch (error) {
+      if (this.sessionToken === sessionToken) await this.disconnect();
+      if (!(error instanceof DOMException && error.name === "AbortError")) this.setStatus("error");
+      throw error;
+    }
   }
 
   async disconnect(): Promise<void> {
-    this.unsubscribers.splice(0).forEach((unsubscribe) => unsubscribe());
-    await this.signaling?.disconnect().catch(() => undefined);
-    await this.transport?.disconnect().catch(() => undefined);
+    const signaling = this.signaling;
+    const transport = this.transport;
+    const unsubscribers = this.unsubscribers.splice(0);
+
+    // Desanexa o estado atual antes de aguardar rede/RTC. Assim um disconnect antigo
+    // não consegue apagar um signaling/transport criado por uma conexão posterior.
+    this.sessionToken = undefined;
     this.signaling = undefined;
     this.transport = undefined;
     this.attachmentService = undefined;
@@ -249,7 +276,13 @@ export class ChatController {
     this.pendingIdentityChallenges.clear();
     this.historyRequests.clear();
     this.processed.clear();
+    for (const timer of this.identityHandshakeTimers.values()) clearTimeout(timer);
+    this.identityHandshakeTimers.clear();
     this.setStatus("disconnected");
+
+    unsubscribers.forEach((unsubscribe) => unsubscribe());
+    await signaling?.disconnect().catch(() => undefined);
+    await transport?.disconnect().catch(() => undefined);
   }
 
   async send(content: string): Promise<LocalChatMessage> {
@@ -415,6 +448,7 @@ export class ChatController {
   }
 
   private forgetPeerConnection(remotePeerId: string): void {
+    this.clearIdentityHandshake(remotePeerId);
     this.dataChannelPeers.delete(remotePeerId);
     this.openDataPeers.delete(remotePeerId);
     this.pendingIdentityChallenges.delete(remotePeerId);
@@ -424,8 +458,8 @@ export class ChatController {
   }
 
   private async beginIdentityHandshake(remotePeerId: string): Promise<void> {
-    if (!this.identity || !this.channelId || !this.transport || !this.dataChannelPeers.has(remotePeerId) || !this.isTrustedRemote(remotePeerId)) return;
-    const nonce = crypto.randomUUID();
+    if (!this.identity || !this.channelId || !this.transport || !this.dataChannelPeers.has(remotePeerId) || !this.isTrustedRemote(remotePeerId) || this.openDataPeers.has(remotePeerId)) return;
+    const nonce = this.pendingIdentityChallenges.get(remotePeerId) ?? crypto.randomUUID();
     const challenge: IdentityChallengeWireMessage = {
       version: 2,
       type: "chat.identity.challenge",
@@ -435,9 +469,26 @@ export class ChatController {
       timestamp: Date.now(),
     };
     this.pendingIdentityChallenges.set(remotePeerId, nonce);
-    if (this.transport.sendData(JSON.stringify(challenge), remotePeerId) === 0) {
-      this.pendingIdentityChallenges.delete(remotePeerId);
-    }
+    this.transport.sendData(JSON.stringify(challenge), remotePeerId);
+    this.scheduleIdentityHandshake(remotePeerId);
+  }
+
+  private scheduleIdentityHandshake(remotePeerId: string): void {
+    this.clearIdentityHandshake(remotePeerId);
+    if (!this.identity || !this.transport || !this.dataChannelPeers.has(remotePeerId) || this.openDataPeers.has(remotePeerId)) return;
+    const timer = setTimeout(() => {
+      this.identityHandshakeTimers.delete(remotePeerId);
+      if (this.dataChannelPeers.has(remotePeerId) && !this.openDataPeers.has(remotePeerId)) {
+        void this.beginIdentityHandshake(remotePeerId);
+      }
+    }, IDENTITY_HANDSHAKE_RETRY_MS);
+    this.identityHandshakeTimers.set(remotePeerId, timer);
+  }
+
+  private clearIdentityHandshake(remotePeerId: string): void {
+    const timer = this.identityHandshakeTimers.get(remotePeerId);
+    if (timer) clearTimeout(timer);
+    this.identityHandshakeTimers.delete(remotePeerId);
   }
 
   private async respondIdentityChallenge(remotePeerId: string, challenge: IdentityChallengeWireMessage): Promise<void> {
@@ -456,19 +507,27 @@ export class ChatController {
       signature: await this.signCanonical(canonicalIdentityProof(unsigned)),
     };
     this.transport.sendData(JSON.stringify(proof), remotePeerId);
+    if (!this.openDataPeers.has(remotePeerId) && !this.pendingIdentityChallenges.has(remotePeerId)) {
+      void this.beginIdentityHandshake(remotePeerId);
+    }
   }
 
   private async acceptIdentityProof(remotePeerId: string, proof: IdentityProofWireMessage): Promise<void> {
     if (!this.identity || proof.fromPeerId !== remotePeerId || proof.toPeerId !== this.identity.peerId) return;
     const expectedNonce = this.pendingIdentityChallenges.get(remotePeerId);
     if (!expectedNonce || proof.nonce !== expectedNonce) return;
-    if (!(await this.verifyCanonical(remotePeerId, proof.signature, canonicalIdentityProof(proof)))) return;
+    if (!(await this.verifyCanonical(remotePeerId, proof.signature, canonicalIdentityProof(proof)))) {
+      console.warn("Prova de identidade P2P inválida", { remotePeerId });
+      return;
+    }
     this.pendingIdentityChallenges.delete(remotePeerId);
+    this.clearIdentityHandshake(remotePeerId);
     this.markPeerReady(remotePeerId);
   }
 
   private markPeerReady(remotePeerId: string): void {
     if (!this.dataChannelPeers.has(remotePeerId) || this.openDataPeers.has(remotePeerId)) return;
+    this.clearIdentityHandshake(remotePeerId);
     this.openDataPeers.add(remotePeerId);
     this.setStatus("ready");
     void (async () => {

@@ -2,6 +2,11 @@ export type InviteType = "friend" | "group";
 
 const ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 const CODE_PATTERN = /^risk-(?:[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{4}-){3}[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{4}$/;
+const CODE_CHUNK = `[${ALPHABET}]{4}`;
+const PREFIXED_CODE_PATTERN = new RegExp(`RISK\\s*-\\s*(${CODE_CHUNK}(?:[\\s-]*${CODE_CHUNK}){3})`);
+const DEEP_LINK_PATTERN = /RISK:\/\/(?:INVITE|FRIEND|GROUP)\/([^\s?#]+)/;
+const UNICODE_DASHES = /[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/g;
+const ZERO_WIDTH = /[\u200B-\u200D\u2060\uFEFF]/g;
 
 export function generateRiskInviteCode(): string {
   const values = new Uint8Array(16);
@@ -11,11 +16,29 @@ export function generateRiskInviteCode(): string {
 }
 
 export function normalizeRiskInviteCode(input: string): string {
-  let value = input.trim();
-  const deepLink = value.match(/^risk:\/\/(?:invite|friend|group)\/(.+)$/i);
+  let value = input
+    .normalize("NFKC")
+    .replace(ZERO_WIDTH, "")
+    .replace(UNICODE_DASHES, "-")
+    .trim()
+    .toUpperCase();
+
+  // Se o código veio dentro de uma mensagem (`risk-...`, por exemplo entre
+  // crases), extraímos apenas o token válido e ignoramos o texto ao redor.
+  const embedded = value.match(PREFIXED_CODE_PATTERN);
+  if (embedded) return formatInviteBody(embedded[1]!);
+
+  // Deep links podem carregar o código com ou sem o prefixo `risk-`.
+  const deepLink = value.match(DEEP_LINK_PATTERN);
   if (deepLink) value = deepLink[1]!;
-  value = value.toUpperCase().replace(/\s+/g, "").replace(/^RISK-?/, "").replace(/-/g, "");
-  const groups = value.match(/.{1,4}/g)?.join("-") ?? "";
+
+  value = value.replace(/^RISK\s*-?\s*/, "");
+  return formatInviteBody(value);
+}
+
+function formatInviteBody(value: string): string {
+  const compact = value.replace(/[\s-]+/g, "");
+  const groups = compact.match(/.{1,4}/g)?.join("-") ?? "";
   return `risk-${groups}`;
 }
 

@@ -173,8 +173,15 @@ export class SupabaseSignalingProvider implements SignalingProvider {
   private acceptMessage(message: OfferMessage | AnswerMessage | IceCandidateMessage | PeerStateMessage | PeerProfileMessage): boolean {
     if (!this.peerId || !this.roomId || message.roomId !== this.roomId || message.fromPeerId === this.peerId) return false;
     if (message.targetPeerId !== undefined && message.targetPeerId !== this.peerId) return false;
-    if (!this.presencePeers.has(message.fromPeerId)) this.reconcilePresence();
-    if (!this.presencePeers.has(message.fromPeerId)) return false;
+
+    if (!this.presencePeers.has(message.fromPeerId)) {
+      this.reconcilePresence();
+      const targetedWebRtcMessage = message.targetPeerId === this.peerId
+        && (message.type === "webrtc.offer" || message.type === "webrtc.answer" || message.type === "webrtc.ice-candidate");
+      if (!this.presencePeers.has(message.fromPeerId) && !targetedWebRtcMessage) return false;
+      if (!this.presencePeers.has(message.fromPeerId)) this.log("accepting WebRTC signaling before presence sync", message.fromPeerId);
+    }
+
     this.pruneCaches();
     if (this.processedMessageIds.has(message.messageId)) return false;
     if (!this.withinRateLimit(message.fromPeerId, message.type)) return false;

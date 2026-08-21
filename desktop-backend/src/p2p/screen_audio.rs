@@ -7,11 +7,12 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     process::Stdio,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 #[cfg(target_os = "linux")]
 use tokio::{
+    io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
     sync::Mutex,
     task::JoinHandle,
@@ -26,9 +27,13 @@ const MIX_SOURCE_NAME: &str = "risk.screen-share.source";
 #[cfg(target_os = "linux")]
 const MIX_SOURCE_LABEL: &str = "Risk Screen Share Audio";
 #[cfg(target_os = "linux")]
+const MIX_SINK_LABEL: &str = "Risk Screen Share Mix";
+#[cfg(target_os = "linux")]
 const RISK_APPLICATION_ID: &str = "com.risk.calls";
 #[cfg(target_os = "linux")]
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(750);
+#[cfg(target_os = "linux")]
+const MIX_NODE_WAIT_ATTEMPTS: usize = 30;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -120,27 +125,25 @@ async fn start_pipewire(exclude_risk: bool) -> anyhow::Result<()> {
         ensure_command(command).await?;
     }
 
+    // Mantemos apenas as propriedades documentadas e necessárias. Algumas
+    // combinações WirePlumber/PipeWire rejeitam propriedades adicionais no
+    // pw-loopback antes mesmo de publicar os nós, deixando sink/source ausentes.
     let capture_props = serde_json::json!({
         "node.name": MIX_SINK_NAME,
-        "node.description": "Risk Screen Share Mix",
+        "node.description": MIX_SINK_LABEL,
         "media.class": "Audio/Sink",
-        "audio.position": ["FL", "FR"],
-        "node.autoconnect": false,
-        "node.virtual": true
+        "audio.position": ["FL", "FR"]
     });
     let playback_props = serde_json::json!({
         "node.name": MIX_SOURCE_NAME,
         "node.description": MIX_SOURCE_LABEL,
         "media.class": "Audio/Source",
-        "audio.position": ["FL", "FR"],
-        "node.autoconnect": false,
-        "node.virtual": true,
-        "node.passive": true
+        "audio.position": ["FL", "FR"]
     });
 
     let mut command = Command::new("pw-loopback");
     command
-        .arg(format!("--name={MIX_SOURCE_LABEL}"))
+        .arg("--name=risk-screen-share-loopback")
         .arg("--channels=2")
         .arg(format!("--capture-props={capture_props}"))
         .arg(format!("--playback-props={playback_props}"))
@@ -151,21 +154,38 @@ async fn start_pipewire(exclude_risk: bool) -> anyhow::Result<()> {
     configure_parent_death_signal(&mut command)?;
     let mut child = command.spawn()?;
 
+    let stderr_lines = Arc::new(Mutex::new(Vec::<String>::new()));
     if let Some(stderr) = child.stderr.take() {
+        let lines = Arc::clone(&stderr_lines);
         tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if !line.trim().is_empty() {
-                    tracing::debug!(message = %line, "pw-loopback");
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                tracing::debug!(message = %trimmed, "pw-loopback");
+                let mut buffered = lines.lock().await;
+                buffered.push(trimmed.to_string());
+                if buffered.len() > 12 {
+                    buffered.remove(0);
                 }
             }
         });
     }
 
-    wait_for_mix_nodes().await?;
+    if let Err(error) = wait_for_mix_nodes(&mut child, &stderr_lines).await {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+        return Err(error);
+    }
+
     let risk_root_pid = parent_pid(std::process::id()).unwrap_or(std::process::id());
-    reconcile_links(exclude_risk, risk_root_pid).await?;
+    if let Err(error) = reconcile_links(exclude_risk, risk_root_pid).await {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+        return Err(error);
+    }
 
     let reconcile_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(RECONCILE_INTERVAL);
@@ -217,21 +237,46 @@ async fn ensure_command(command: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn wait_for_mix_nodes() -> anyhow::Result<()> {
-    for _ in 0..40 {
+async fn wait_for_mix_nodes(
+    child: &mut Child,
+    stderr_lines: &Arc<Mutex<Vec<String>>>,
+) -> anyhow::Result<()> {
+    let mut last_sink = false;
+    let mut last_source = false;
+    for _ in 0..MIX_NODE_WAIT_ATTEMPTS {
+        if let Some(status) = child.try_wait()? {
+            let detail = stderr_summary(stderr_lines).await;
+            if detail.is_empty() {
+                anyhow::bail!("pw-loopback encerrou antes de publicar os nós virtuais do Risk ({status})");
+            }
+            anyhow::bail!(
+                "pw-loopback encerrou antes de publicar os nós virtuais do Risk ({status}): {detail}"
+            );
+        }
+
         let graph = read_graph().await?;
-        let has_sink = graph
-            .iter()
-            .any(|object| node_name(object) == Some(MIX_SINK_NAME));
-        let has_source = graph
-            .iter()
-            .any(|object| node_name(object) == Some(MIX_SOURCE_NAME));
-        if has_sink && has_source {
+        last_sink = graph.iter().any(is_mix_sink);
+        last_source = graph.iter().any(is_mix_source);
+        if last_sink && last_source {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    anyhow::bail!("PipeWire não publicou a fonte virtual do Risk dentro do tempo esperado")
+
+    let detail = stderr_summary(stderr_lines).await;
+    if detail.is_empty() {
+        anyhow::bail!(
+            "PipeWire não publicou os nós virtuais do Risk dentro do tempo esperado (sink={last_sink}, source={last_source})"
+        );
+    }
+    anyhow::bail!(
+        "PipeWire não publicou os nós virtuais do Risk dentro do tempo esperado (sink={last_sink}, source={last_source}). pw-loopback: {detail}"
+    )
+}
+
+#[cfg(target_os = "linux")]
+async fn stderr_summary(stderr_lines: &Arc<Mutex<Vec<String>>>) -> String {
+    stderr_lines.lock().await.join(" | ")
 }
 
 #[cfg(target_os = "linux")]
@@ -260,7 +305,7 @@ async fn reconcile_links(exclude_risk: bool, risk_root_pid: u32) -> anyhow::Resu
         .collect();
     let sink_id = nodes
         .iter()
-        .find_map(|(id, object)| (node_name(object) == Some(MIX_SINK_NAME)).then_some(*id))
+        .find_map(|(id, object)| is_mix_sink(object).then_some(*id))
         .ok_or_else(|| anyhow::anyhow!("sink virtual do Risk não está no grafo PipeWire"))?;
 
     let sink_ports: Vec<&PwObject> = graph
@@ -399,6 +444,35 @@ fn node_name(object: &PwObject) -> Option<&str> {
 }
 
 #[cfg(target_os = "linux")]
+fn matches_virtual_node(object: &PwObject, name: &str, label: &str, media_class: &str) -> bool {
+    if object.prop_str("media.class") != Some(media_class) {
+        return false;
+    }
+    let actual_name = node_name(object).unwrap_or("");
+    let description = object.prop_str("node.description").unwrap_or("");
+    actual_name == name
+        || actual_name
+            .strip_prefix(name)
+            .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with('-'))
+        || description == label
+}
+
+#[cfg(target_os = "linux")]
+fn is_mix_sink(object: &PwObject) -> bool {
+    matches_virtual_node(object, MIX_SINK_NAME, MIX_SINK_LABEL, "Audio/Sink")
+}
+
+#[cfg(target_os = "linux")]
+fn is_mix_source(object: &PwObject) -> bool {
+    matches_virtual_node(
+        object,
+        MIX_SOURCE_NAME,
+        MIX_SOURCE_LABEL,
+        "Audio/Source",
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn is_playback_stream(object: &PwObject) -> bool {
     matches!(
         object.prop_str("media.class"),
@@ -417,8 +491,7 @@ fn is_risk_node(object: &PwObject, risk_root_pid: u32) -> bool {
     {
         return true;
     }
-    let name = node_name(object).unwrap_or("");
-    if name == MIX_SINK_NAME || name == MIX_SOURCE_NAME {
+    if is_mix_sink(object) || is_mix_source(object) {
         return true;
     }
     for key in ["application.process.id", "pipewire.sec.pid"] {
@@ -500,6 +573,20 @@ mod tests {
             "media.class": "Stream/Output/Audio"
         }))));
         assert!(!is_playback_stream(&node(serde_json::json!({
+            "media.class": "Audio/Source"
+        }))));
+    }
+
+    #[test]
+    fn detects_virtual_nodes_with_wireplumber_suffixes() {
+        assert!(is_mix_sink(&node(serde_json::json!({
+            "node.name": "risk.screen-share.mix.2",
+            "node.description": MIX_SINK_LABEL,
+            "media.class": "Audio/Sink"
+        }))));
+        assert!(is_mix_source(&node(serde_json::json!({
+            "node.name": "risk.screen-share.source-3",
+            "node.description": MIX_SOURCE_LABEL,
             "media.class": "Audio/Source"
         }))));
     }

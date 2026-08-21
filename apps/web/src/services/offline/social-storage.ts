@@ -140,21 +140,27 @@ export async function ensureLocalGroup(groupId: string, name: string, owner: Pub
 export async function addLocalGroupMember(group: PublicGroupMetadata, member: PublicPeerIdentity, owner: PublicPeerIdentity): Promise<void> {
   const current = (await loadLocalGroups()).find((item) => item.groupId === group.groupId);
   const members = [...(current?.members ?? [owner])];
-  if (!members.some((item) => item.peerId === member.peerId)) members.push(member);
+  if (!members.some((item) => samePeerIdentity(item, member))) members.push(member);
   await saveLocalGroup({ ...group, members, joinedAt: current?.joinedAt ?? Date.now() });
 }
 
 export async function mergeLocalGroupMembers(groupId: string, incoming: PublicPeerIdentity[]): Promise<LocalGroup> {
   const group = (await loadLocalGroups()).find((item) => item.groupId === groupId);
   if (!group) throw new Error("Grupo local não encontrado para sincronizar membros.");
-  const byPeerId = new Map(group.members.map((member) => [member.peerId, member]));
+  const members = dedupePeerIdentities(group.members);
   for (const member of incoming) {
     if (!validPublicPeerIdentity(member)) continue;
-    const existing = byPeerId.get(member.peerId);
-    if (!existing) byPeerId.set(member.peerId, member);
-    else if (samePublicKey(existing.publicKey, member.publicKey)) byPeerId.set(member.peerId, { ...existing, displayName: member.displayName, avatar: member.avatar });
+    const index = members.findIndex((existing) => samePeerIdentity(existing, member));
+    if (index < 0) {
+      members.push(member);
+      continue;
+    }
+    const existing = members[index]!;
+    if (samePublicKey(existing.publicKey, member.publicKey)) {
+      members[index] = { ...existing, displayName: member.displayName, avatar: member.avatar };
+    }
   }
-  const merged = { ...group, members: [...byPeerId.values()] };
+  const merged = { ...group, members };
   await saveLocalGroup(merged);
   return merged;
 }
@@ -175,16 +181,18 @@ async function reconcileIdentityMembership(
   const self = publicIdentity(identity);
   const reconciled: LocalGroup[] = [];
   for (const group of groups) {
-    const members = [...group.members];
-    const index = members.findIndex((member) => member.peerId === self.peerId);
-    let changed = false;
+    const members = dedupePeerIdentities(group.members, self);
+    let changed = members.length !== group.members.length;
+    const index = members.findIndex((member) => samePeerIdentity(member, self));
     if (index < 0) {
       members.push(self);
       changed = true;
     } else {
       const current = members[index]!;
-      if (samePublicKey(current.publicKey, self.publicKey)
-        && (current.displayName !== self.displayName || current.avatar !== self.avatar)) {
+      if (current.peerId !== self.peerId
+        || !samePublicKey(current.publicKey, self.publicKey)
+        || current.displayName !== self.displayName
+        || current.avatar !== self.avatar) {
         members[index] = self;
         changed = true;
       }
@@ -198,6 +206,29 @@ async function reconcileIdentityMembership(
     reconciled.push(updated);
   }
   return reconciled;
+}
+
+function dedupePeerIdentities(members: PublicPeerIdentity[], preferred?: PublicPeerIdentity): PublicPeerIdentity[] {
+  const unique: PublicPeerIdentity[] = [];
+  for (const member of members) {
+    if (!validPublicPeerIdentity(member)) continue;
+    const index = unique.findIndex((existing) => samePeerIdentity(existing, member));
+    if (index < 0) {
+      unique.push(member);
+      continue;
+    }
+    const existing = unique[index]!;
+    if (preferred && samePeerIdentity(member, preferred)) {
+      unique[index] = preferred;
+    } else if (samePublicKey(existing.publicKey, member.publicKey)) {
+      unique[index] = { ...existing, displayName: member.displayName, avatar: member.avatar };
+    }
+  }
+  return unique;
+}
+
+function samePeerIdentity(left: PublicPeerIdentity, right: PublicPeerIdentity): boolean {
+  return left.peerId === right.peerId || samePublicKey(left.publicKey, right.publicKey);
 }
 
 function validPublicPeerIdentity(identity: PublicPeerIdentity): boolean {

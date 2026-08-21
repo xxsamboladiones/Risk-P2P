@@ -31,6 +31,10 @@ function placeholderParticipant(peerId: string): Participant {
   };
 }
 
+function isLinuxDesktop(): boolean {
+  return Boolean(window.desktop && /Linux/i.test(navigator.userAgent));
+}
+
 async function prepareDesktopScreenAudio(excludeRisk: boolean): Promise<DesktopScreenAudioPreparation | null> {
   if (!window.desktop?.getBackendConfig) return null;
   const config = await window.desktop.getBackendConfig();
@@ -98,12 +102,16 @@ async function waitForPipeWireTrack(preparation: DesktopScreenAudioPreparation):
   return undefined;
 }
 
-async function startPipeWireDesktopShare(preparation: DesktopScreenAudioPreparation, selectedSourceId?: string): Promise<MediaStream> {
-  if (!window.desktop) throw new Error("Bridge desktop indisponível para captura PipeWire.");
+async function startDesktopVideoShare(selectedSourceId?: string): Promise<MediaStream> {
+  if (!window.desktop) throw new Error("Bridge desktop indisponível para captura da tela.");
   const sourceId = selectedSourceId ?? await window.desktop.chooseScreenSource();
   if (!sourceId) throw new DOMException("Compartilhamento cancelado.", "NotAllowedError");
   await window.desktop.selectScreenSource(sourceId);
-  const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+  return navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+}
+
+async function startPipeWireDesktopShare(preparation: DesktopScreenAudioPreparation, selectedSourceId?: string): Promise<MediaStream> {
+  const stream = await startDesktopVideoShare(selectedSourceId);
   if (preparation.mode === "pipewire") {
     const audioTrack = await waitForPipeWireTrack(preparation);
     if (audioTrack) stream.addTrack(audioTrack);
@@ -193,11 +201,12 @@ export class CallController {
     store.setError(null);
     store.setSelf(this.peerId);
 
-    this.signaling = this.createSignaling();
-    this.transport = new MeshWebRTCTransport(this.peerId, iceServers, {
-      sendOffer: (targetPeerId, description) => this.signaling!.sendOffer(targetPeerId, description),
-      sendAnswer: (targetPeerId, description) => this.signaling!.sendAnswer(targetPeerId, description),
-      sendIce: (targetPeerId, candidate) => this.signaling!.sendIceCandidate(targetPeerId, candidate),
+    const signaling = this.createSignaling();
+    this.signaling = signaling;
+    const transport = new MeshWebRTCTransport(this.peerId, iceServers, {
+      sendOffer: (targetPeerId, description) => signaling.sendOffer(targetPeerId, description),
+      sendAnswer: (targetPeerId, description) => signaling.sendAnswer(targetPeerId, description),
+      sendIce: (targetPeerId, candidate) => signaling.sendIceCandidate(targetPeerId, candidate),
       onRemoteStream: (remotePeerId, stream) => {
         const store = useCallStore.getState();
         const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
@@ -211,7 +220,8 @@ export class CallController {
         store.upsert({ ...participant, connection });
       },
     });
-    this.bindSignaling(this.signaling, roomId, this.peerId);
+    this.transport = transport;
+    this.bindSignaling(signaling, roomId, this.peerId);
 
     try {
       const profile = await api.me(token);
@@ -257,13 +267,13 @@ export class CallController {
 
       this.microphoneTrack = microphone;
       this.local.addTrack(microphone);
-      await this.transport.publishTrack(microphone, this.local);
+      await transport.publishTrack(microphone, this.local);
       if (!this.isActive(lifecycle)) throw new DOMException("Entrada na chamada cancelada.", "AbortError");
       this.state.cameraStreamId = this.local.id;
       this.updateLocalPreview();
-      await this.signaling.connect(roomId, this.peerId);
+      await signaling.connect(roomId, this.peerId);
       if (!this.isActive(lifecycle)) throw new DOMException("Entrada na chamada cancelada.", "AbortError");
-      await Promise.all([this.signaling.sendPeerState(this.state), this.signaling.sendPeerProfile(this.displayName)]);
+      await Promise.all([signaling.sendPeerState(this.state), signaling.sendPeerProfile(this.displayName)]);
       return this.local;
     } catch (error) {
       if (this.isActive(lifecycle)) await this.cleanup();
@@ -335,18 +345,36 @@ export class CallController {
     if (this.screenStream) { await this.stopScreen(); return; }
     const lifecycle = this.lifecycleId;
     let desktopAudio: DesktopScreenAudioPreparation | null = null;
+    let linuxAudioPreparation: Promise<DesktopScreenAudioPreparation | null> | undefined;
     let stream: MediaStream | undefined;
     try {
       const voiceSettings = loadVoiceVideoSettings();
-      desktopAudio = await prepareDesktopScreenAudio(voiceSettings.excludeRiskAudioFromScreenShare).catch((error) => {
-        console.warn("Não foi possível consultar o backend de áudio de tela; usando captura padrão.", error);
-        return null;
-      });
+      const linuxDesktop = isLinuxDesktop();
 
-      const pipeWireDesktop = desktopAudio?.mode === "pipewire" || desktopAudio?.mode === "unavailable";
-      stream = pipeWireDesktop
-        ? await startPipeWireDesktopShare(desktopAudio!, sourceId)
-        : await this.screen.startScreenShare(sourceId);
+      if (linuxDesktop) {
+        // Não bloqueia o vídeo esperando PipeWire. O áudio é anexado depois, se
+        // a fonte virtual ficar disponível, sem interromper microfone/chamada.
+        linuxAudioPreparation = prepareDesktopScreenAudio(voiceSettings.excludeRiskAudioFromScreenShare).catch((error) => {
+          console.warn("Não foi possível preparar o áudio PipeWire da tela.", error);
+          return null;
+        });
+        stream = await startDesktopVideoShare(sourceId);
+      } else {
+        desktopAudio = await prepareDesktopScreenAudio(voiceSettings.excludeRiskAudioFromScreenShare).catch((error) => {
+          console.warn("Não foi possível consultar o backend de áudio de tela; usando captura padrão.", error);
+          return null;
+        });
+        const pipeWireDesktop = desktopAudio?.mode === "pipewire" || desktopAudio?.mode === "unavailable";
+        stream = pipeWireDesktop
+          ? await startPipeWireDesktopShare(desktopAudio!, sourceId)
+          : await this.screen.startScreenShare(sourceId);
+      }
+
+      const videoTrack = stream.getVideoTracks()[0];
+      if (!videoTrack) {
+        stream.getTracks().forEach((track) => track.stop());
+        throw new Error("A fonte selecionada não forneceu vídeo");
+      }
 
       if (desktopAudio?.mode === "unavailable") {
         const message = `PipeWire indisponível para áudio da tela: ${desktopAudio.reason ?? "ferramentas PipeWire não encontradas"}. A tela continuará sem áudio do sistema.`;
@@ -356,12 +384,6 @@ export class CallController {
         const message = "A fonte virtual do PipeWire foi criada, mas o Chromium não a expôs como entrada de áudio. A tela continuará sem áudio do sistema.";
         console.warn(message);
         useCallStore.getState().setError(message);
-      }
-
-      const videoTrack = stream.getVideoTracks()[0];
-      if (!videoTrack) {
-        stream.getTracks().forEach((track) => track.stop());
-        throw new Error("A fonte selecionada não forneceu vídeo");
       }
 
       const screenAudioTrack = stream.getAudioTracks()[0];
@@ -411,13 +433,27 @@ export class CallController {
       this.updateLocalPreview();
       void this.signaling?.sendPeerState(this.state).catch((error) => this.reportError(error, "Não foi possível atualizar o compartilhamento de tela."));
 
+      // No Linux o stream começa somente com vídeo. Isso faz a transmissão aparecer
+      // imediatamente; o áudio PipeWire entra depois por uma renegociação separada.
       await Promise.all(stream.getTracks().map((track) => transport.publishTrack(track, stream!)));
       if (!this.isActive(lifecycle)) {
         stream.getTracks().forEach((track) => track.stop());
         await stopDesktopScreenAudio();
         return;
       }
+
+      // Reafirma a track do microfone sem renegociar se ela já estiver publicada.
+      // Isso protege contra implementações que alterem senders durante addTrack.
+      const microphone = this.microphoneTrack;
+      if (microphone?.readyState === "live") await transport.publishTrack(microphone, this.local);
+
+      if (linuxAudioPreparation) {
+        void this.attachLinuxScreenAudio(stream, lifecycle, linuxAudioPreparation, voiceSettings.excludeRiskAudioFromScreenShare);
+      }
     } catch (error) {
+      if (linuxAudioPreparation) {
+        void linuxAudioPreparation.then(() => stopDesktopScreenAudio()).catch(() => undefined);
+      }
       if (stream && this.screenStream === stream) await this.stopScreen().catch(() => undefined);
       else if (desktopAudio?.mode === "pipewire") await stopDesktopScreenAudio();
       if (!(error instanceof DOMException && error.name === "NotAllowedError")) this.reportError(error, "Não foi possível compartilhar a tela.");
@@ -431,6 +467,78 @@ export class CallController {
       signaling: this.signaling?.getDiagnostics() ?? null,
       peerConnections: this.transport?.getDiagnostics() ?? [],
     };
+  }
+
+  private async attachLinuxScreenAudio(
+    stream: MediaStream,
+    lifecycle: number,
+    preparationPromise: Promise<DesktopScreenAudioPreparation | null>,
+    excludeRisk: boolean,
+  ): Promise<void> {
+    try {
+      const preparation = await preparationPromise;
+      if (!this.isActive(lifecycle) || this.screenStream !== stream) {
+        if (preparation?.mode === "pipewire") await stopDesktopScreenAudio();
+        return;
+      }
+      if (!preparation) return;
+      if (preparation.mode === "unavailable") {
+        const message = `PipeWire indisponível para áudio da tela: ${preparation.reason ?? "ferramentas PipeWire não encontradas"}. A tela continuará sem áudio do sistema.`;
+        console.warn(message);
+        useCallStore.getState().setError(message);
+        return;
+      }
+      if (preparation.mode !== "pipewire") return;
+
+      const audioTrack = await waitForPipeWireTrack(preparation);
+      if (!this.isActive(lifecycle) || this.screenStream !== stream) {
+        audioTrack?.stop();
+        await stopDesktopScreenAudio();
+        return;
+      }
+      if (!audioTrack) {
+        const message = "A fonte virtual do PipeWire foi criada, mas o Chromium não a expôs como entrada de áudio. A tela continuará sem áudio do sistema.";
+        console.warn(message);
+        useCallStore.getState().setError(message);
+        return;
+      }
+
+      if (excludeRisk && preparation.excludedRisk) {
+        console.info("Risk screen audio exclusion active", {
+          mode: "pipewire-node-exclusion",
+          source: preparation.sourceName ?? preparation.sourceLabel ?? "unknown",
+        });
+      }
+
+      stream.addTrack(audioTrack);
+      this.state.screenAudio = true;
+      this.updateLocalPreview();
+      void this.signaling?.sendPeerState(this.state).catch((error) => this.reportError(error, "Não foi possível atualizar o áudio da tela."));
+
+      const transport = this.transport;
+      if (!transport) {
+        stream.removeTrack(audioTrack);
+        audioTrack.stop();
+        this.state.screenAudio = false;
+        this.updateLocalPreview();
+        return;
+      }
+
+      try {
+        await transport.publishTrack(audioTrack, stream);
+        const microphone = this.microphoneTrack;
+        if (microphone?.readyState === "live") await transport.publishTrack(microphone, this.local);
+      } catch (error) {
+        stream.removeTrack(audioTrack);
+        audioTrack.stop();
+        this.state.screenAudio = false;
+        this.updateLocalPreview();
+        void this.signaling?.sendPeerState(this.state).catch(() => undefined);
+        this.reportError(error, "Não foi possível transmitir o áudio da tela.");
+      }
+    } catch (error) {
+      console.warn("Falha ao anexar áudio PipeWire à transmissão.", error);
+    }
   }
 
   private bindSignaling(signaling: SignalingProvider, roomId: string, peerId: string): void {
@@ -508,26 +616,44 @@ export class CallController {
 
   private async cleanup(): Promise<void> {
     this.lifecycleId += 1;
-    this.signalingUnsubscribers.splice(0).forEach((unsubscribe) => unsubscribe());
-    await this.signaling?.disconnect().catch(() => undefined);
-    await this.transport?.disconnect().catch(() => undefined);
-    this.local.getTracks().forEach((track) => track.stop());
-    await this.rnnoiseMicrophone?.stop().catch(() => undefined);
-    this.microphoneInputStream?.getTracks().forEach((track) => track.stop());
-    this.screenStream?.getTracks().forEach((track) => track.stop());
-    await this.screen.stopScreenShare().catch(() => undefined);
-    await stopDesktopScreenAudio();
+    const signaling = this.signaling;
+    const transport = this.transport;
+    const local = this.local;
+    const rnnoiseMicrophone = this.rnnoiseMicrophone;
+    const microphoneInputStream = this.microphoneInputStream;
+    const screenStream = this.screenStream;
+    const unsubscribers = this.signalingUnsubscribers.splice(0);
+
+    // O estado é destacado antes dos awaits para impedir que um cleanup antigo
+    // apague a sessão criada por um join posterior.
+    this.signaling = undefined;
+    this.transport = undefined;
+    this.local = new MediaStream();
     this.microphoneInputStream = undefined;
     this.microphoneTrack = undefined;
     this.rnnoiseMicrophone = undefined;
     this.cameraTrack = undefined;
     this.screenStream = undefined;
-    this.signaling = undefined;
-    this.transport = undefined;
     this.roomId = undefined;
     this.peerId = undefined;
     this.displayName = "Participante";
-    useCallStore.getState().clearParticipants();
-    useCallStore.getState().setLocalMedia({ camera: null, screen: null }, { microphone: true, camera: false, screenShare: false });
+    this.state = { microphone: true, camera: false, screenShare: false };
+
+    unsubscribers.forEach((unsubscribe) => unsubscribe());
+    local.getTracks().forEach((track) => track.stop());
+    microphoneInputStream?.getTracks().forEach((track) => track.stop());
+    screenStream?.getTracks().forEach((track) => track.stop());
+    const screenCleanup = this.screen.stopScreenShare().catch(() => undefined);
+    const desktopAudioCleanup = stopDesktopScreenAudio();
+
+    const store = useCallStore.getState();
+    store.clearParticipants();
+    store.setLocalMedia({ camera: null, screen: null }, this.state);
+
+    await signaling?.disconnect().catch(() => undefined);
+    await transport?.disconnect().catch(() => undefined);
+    await rnnoiseMicrophone?.stop().catch(() => undefined);
+    await screenCleanup;
+    await desktopAudioCleanup;
   }
 }

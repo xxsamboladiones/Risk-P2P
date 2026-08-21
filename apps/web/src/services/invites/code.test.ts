@@ -8,11 +8,20 @@ describe("códigos de convite Risk", () => {
     codes.forEach((code) => expect(code).toMatch(/^risk-(?:[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{4}-){3}[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{4}$/));
   });
 
-  it("normaliza caixa, espaços, código cru e deep links futuros", () => {
+  it("normaliza caixa, espaços, código cru e deep links", () => {
     expect(normalizeRiskInviteCode(" Risk-7h4k-m9p2-q8rf-a3dx ")).toBe("risk-7H4K-M9P2-Q8RF-A3DX");
     expect(normalizeRiskInviteCode("7h4km9p2q8rfa3dx")).toBe("risk-7H4K-M9P2-Q8RF-A3DX");
     expect(normalizeRiskInviteCode("risk://friend/risk-7h4k-m9p2-q8rf-a3dx")).toBe("risk-7H4K-M9P2-Q8RF-A3DX");
+    expect(normalizeRiskInviteCode("risk://group/7h4k-m9p2-q8rf-a3dx")).toBe("risk-7H4K-M9P2-Q8RF-A3DX");
     expect(validateRiskInviteCode("risk-123")).toBe(false);
+  });
+
+  it("aceita códigos copiados de mensagens com wrappers e caracteres invisíveis", () => {
+    expect(normalizeRiskInviteCode("`risk-7H4K-M9P2-Q8RF-A3DX`")).toBe("risk-7H4K-M9P2-Q8RF-A3DX");
+    expect(normalizeRiskInviteCode("Meu código é risk-7H4K-M9P2-Q8RF-A3DX, entra aí")).toBe("risk-7H4K-M9P2-Q8RF-A3DX");
+    expect(normalizeRiskInviteCode("risk-7H4K–M9P2–Q8RF–A3DX")).toBe("risk-7H4K-M9P2-Q8RF-A3DX");
+    expect(normalizeRiskInviteCode("risk-7H4K-M9P2\u200B-Q8RF-A3DX")).toBe("risk-7H4K-M9P2-Q8RF-A3DX");
+    expect(validateRiskInviteCode("Compartilhe: `risk-7h4k-m9p2-q8rf-a3dx`" )).toBe(true);
   });
 
   it("deriva rendezvous determinístico com namespaces separados", async () => {

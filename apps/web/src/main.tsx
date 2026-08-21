@@ -105,6 +105,16 @@ type SocialModal = "friend" | "group" | "channel" | "member" | "joinGroup" | "se
 type DeleteTarget = { kind: "friend"; friend: Friend } | { kind: "group"; group: Community } | null;
 type ChannelActionTarget = { mode: "edit" | "delete"; channel: Channel } | null;
 
+function dedupeMembersForDisplay(members: PublicPeerIdentity[]): PublicPeerIdentity[] {
+  const unique = new Map<string, PublicPeerIdentity>();
+  for (const member of members) {
+    const key = member.displayName.trim().normalize("NFKC").toLocaleLowerCase();
+    if (!key || unique.has(key)) continue;
+    unique.set(key, member);
+  }
+  return [...unique.values()];
+}
+
 function SocialHome() {
   const token = useCallStore((state) => state.token)!;
   const reset = useCallStore((state) => state.reset);
@@ -192,7 +202,7 @@ function SocialHome() {
     async function loadMembers() {
       if (!selectedCommunity?.local) { if (alive) setGroupMembers([]); return; }
       const group = (await loadLocalGroups()).find((item) => item.groupId === selectedCommunity.id);
-      if (alive) setGroupMembers(group?.members ?? []);
+      if (alive) setGroupMembers(dedupeMembersForDisplay(group?.members ?? []));
     }
     void loadMembers().catch(() => { if (alive) setGroupMembers([]); });
     const reload = () => { void loadMembers().catch(() => undefined); };
@@ -444,7 +454,7 @@ function SocialHome() {
             {selectedCommunity.local && <div className="channel-actions"><button title="Renomear sala de voz" aria-label={`Renomear ${channel.name}`} onClick={() => setChannelAction({ mode: "edit", channel })}><Pencil size={14}/></button><button className="delete" title="Apagar sala de voz" aria-label={`Apagar ${channel.name}`} onClick={() => setChannelAction({ mode: "delete", channel })}><Trash2 size={14}/></button></div>}
           </div>)}
           <div className="nav-section"><span>MEMBROS</span><button onClick={() => setModal("member")}><UserPlus size={15}/></button></div>
-          {groupMembers.slice(0, 8).map((member) => <div className="mini-user" key={member.peerId}><i>{member.displayName[0]?.toUpperCase()}</i><span>{member.displayName}</span></div>)}
+          {dedupeMembersForDisplay(groupMembers).slice(0, 8).map((member) => <div className="mini-user" key={member.peerId}><i>{member.displayName[0]?.toUpperCase()}</i><span>{member.displayName}</span></div>)}
         </> : <>
           <button className={!activeFriend ? "channel active" : "channel"} onClick={() => setActiveFriend(null)}><Users/>Amigos</button>
           {activeFriend && <button className="channel active"><MessageCircle/>{activeFriend.displayName}</button>}

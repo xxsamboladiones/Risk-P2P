@@ -25,10 +25,20 @@ const WINDOWS_LOOPBACK_WITHOUT_RISK = "loopbackWithoutChrome";
 const APP_ICON_PATH = app.isPackaged
   ? path.join(process.resourcesPath, "icon.png")
   : path.resolve(root, "../build/icon.png");
+
+type CapturableSource = Awaited<ReturnType<typeof desktopCapturer.getSources>>[number];
+type PendingDisplaySelection = {
+  id: string;
+  name?: string;
+  displayId?: string;
+  source?: CapturableSource;
+};
+
 let assetServer: Server | undefined;
 let pageUrl = "http://localhost:5173";
 let packagedOrigin = "";
-let pendingDisplaySourceId: string | undefined;
+let pendingDisplaySelection: PendingDisplaySelection | undefined;
+const knownDisplaySources = new Map<string, PendingDisplaySelection>();
 let backendProcess: ChildProcess | undefined;
 let backendConfig: { baseUrl: string; token: string } | undefined;
 
@@ -223,6 +233,29 @@ function stopBackend(): void {
   child.once("exit", () => clearTimeout(forceTimer));
 }
 
+async function resolveCurrentDisplaySource(selection: PendingDisplaySelection): Promise<CapturableSource | undefined> {
+  // No PipeWire/Wayland, desktopCapturer.getSources() abre/usa o portal de captura
+  // e o source retornado pertence àquela sessão. Reconsultar o portal durante
+  // getDisplayMedia pode invalidar a seleção e resultar em "Invalid capture constraints".
+  if (selection.source) return selection.source;
+  if (process.platform === "linux") return undefined;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const sources = await desktopCapturer.getSources({
+      types: ["screen", "window"],
+      thumbnailSize: { width: 0, height: 0 },
+      fetchWindowIcons: false,
+    });
+    const selected = sources.find((source) => source.id === selection.id)
+      ?? (selection.displayId
+        ? sources.find((source) => source.display_id === selection.displayId)
+        : undefined);
+    if (selected) return selected;
+    if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 120));
+  }
+  return undefined;
+}
+
 ipcMain.handle("backend:config", async (event) => {
   if (!isTrustedRendererUrl(event.sender.getURL())) throw new Error("Origem do renderer não autorizada.");
   if (!backendConfig) throw new Error("Backend local ainda não está pronto.");
@@ -241,11 +274,21 @@ ipcMain.handle("window:fullscreen", async (event, enabled: unknown) => {
 
 ipcMain.handle("screen:list", async (event) => {
   if (!isTrustedRendererUrl(event.sender.getURL())) throw new Error("Origem do renderer não autorizada.");
-  return (await desktopCapturer.getSources({
+  const sources = await desktopCapturer.getSources({
     types: ["screen", "window"],
     thumbnailSize: { width: 320, height: 180 },
     fetchWindowIcons: true,
-  })).map((source) => ({
+  });
+  knownDisplaySources.clear();
+  sources.forEach((source) => {
+    knownDisplaySources.set(source.id, {
+      id: source.id,
+      name: source.name,
+      displayId: source.display_id,
+      source,
+    });
+  });
+  return sources.map((source) => ({
     id: source.id,
     name: source.name,
     displayId: source.display_id,
@@ -261,6 +304,19 @@ ipcMain.handle("screen:choose", async (event) => {
     fetchWindowIcons: false,
   });
   if (!allSources.length) return null;
+
+  // Em PipeWire o portal do sistema já realizou a escolha e o Electron retorna
+  // apenas aquela fonte. Não mostramos uma segunda caixa de seleção redundante.
+  if (process.platform === "linux" && allSources.length === 1) {
+    const selected = allSources[0]!;
+    knownDisplaySources.set(selected.id, {
+      id: selected.id,
+      name: selected.name,
+      displayId: selected.display_id,
+      source: selected,
+    });
+    return selected.id;
+  }
 
   const sources = allSources.slice(0, 20);
   const buttons = [...sources.map((source) => source.name.slice(0, 80)), "Cancelar"];
@@ -281,7 +337,15 @@ ipcMain.handle("screen:choose", async (event) => {
     ? await dialog.showMessageBox(owner, options)
     : await dialog.showMessageBox(options);
   if (result.response < 0 || result.response >= sources.length) return null;
-  return sources[result.response]?.id ?? null;
+  const selected = sources[result.response];
+  if (!selected) return null;
+  knownDisplaySources.set(selected.id, {
+    id: selected.id,
+    name: selected.name,
+    displayId: selected.display_id,
+    source: selected,
+  });
+  return selected.id;
 });
 
 ipcMain.handle("screen:select", async (event, sourceId: unknown) => {
@@ -289,15 +353,11 @@ ipcMain.handle("screen:select", async (event, sourceId: unknown) => {
   if (typeof sourceId !== "string" || sourceId.length === 0 || sourceId.length > 512) {
     throw new Error("Fonte de compartilhamento inválida.");
   }
-  const sources = await desktopCapturer.getSources({
-    types: ["screen", "window"],
-    thumbnailSize: { width: 0, height: 0 },
-    fetchWindowIcons: false,
-  });
-  if (!sources.some((source) => source.id === sourceId)) {
-    throw new Error("A fonte selecionada não está mais disponível.");
+  const known = knownDisplaySources.get(sourceId);
+  if (process.platform === "linux" && !known?.source) {
+    throw new Error("A fonte PipeWire selecionada não está mais disponível. Abra o seletor novamente.");
   }
-  pendingDisplaySourceId = sourceId;
+  pendingDisplaySelection = known ?? { id: sourceId };
 });
 
 function createWindow(): void {
@@ -345,20 +405,20 @@ if (hasSingleInstanceLock) {
       callback(isTrustedRendererUrl(webContents.getURL()) && ["media", "display-capture", "fullscreen"].includes(permission));
     });
     session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
-      const sourceId = pendingDisplaySourceId;
-      pendingDisplaySourceId = undefined;
-      if (!sourceId || !isTrustedRendererUrl(request.securityOrigin)) {
+      const selection = pendingDisplaySelection;
+      pendingDisplaySelection = undefined;
+      if (!selection || !isTrustedRendererUrl(request.securityOrigin)) {
         callback({});
         return;
       }
       try {
-        const sources = await desktopCapturer.getSources({
-          types: ["screen", "window"],
-          thumbnailSize: { width: 0, height: 0 },
-          fetchWindowIcons: false,
-        });
-        const selected = sources.find((source) => source.id === sourceId);
+        const selected = await resolveCurrentDisplaySource(selection);
         if (!selected) {
+          console.warn("Fonte de compartilhamento desapareceu antes do getDisplayMedia", {
+            id: selection.id,
+            name: selection.name,
+            displayId: selection.displayId,
+          });
           callback({});
           return;
         }
@@ -396,7 +456,8 @@ if (hasSingleInstanceLock) {
 }
 
 app.on("before-quit", () => {
-  pendingDisplaySourceId = undefined;
+  pendingDisplaySelection = undefined;
+  knownDisplaySources.clear();
   void clearDevBackendBridge();
   stopBackend();
   assetServer?.close();

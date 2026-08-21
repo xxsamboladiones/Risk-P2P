@@ -25,10 +25,18 @@ const WINDOWS_LOOPBACK_WITHOUT_RISK = "loopbackWithoutChrome";
 const APP_ICON_PATH = app.isPackaged
   ? path.join(process.resourcesPath, "icon.png")
   : path.resolve(root, "../build/icon.png");
+
+type PendingDisplaySelection = {
+  id: string;
+  name?: string;
+  displayId?: string;
+};
+
 let assetServer: Server | undefined;
 let pageUrl = "http://localhost:5173";
 let packagedOrigin = "";
-let pendingDisplaySourceId: string | undefined;
+let pendingDisplaySelection: PendingDisplaySelection | undefined;
+const knownDisplaySources = new Map<string, PendingDisplaySelection>();
 let backendProcess: ChildProcess | undefined;
 let backendConfig: { baseUrl: string; token: string } | undefined;
 
@@ -223,6 +231,26 @@ function stopBackend(): void {
   child.once("exit", () => clearTimeout(forceTimer));
 }
 
+async function resolveCurrentDisplaySource(selection: PendingDisplaySelection) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const sources = await desktopCapturer.getSources({
+      types: ["screen", "window"],
+      thumbnailSize: { width: 0, height: 0 },
+      fetchWindowIcons: false,
+    });
+    const selected = sources.find((source) => source.id === selection.id)
+      ?? (selection.displayId
+        ? sources.find((source) => source.display_id === selection.displayId)
+        : undefined)
+      ?? (selection.name
+        ? sources.find((source) => source.name === selection.name)
+        : undefined);
+    if (selected) return selected;
+    if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 120));
+  }
+  return undefined;
+}
+
 ipcMain.handle("backend:config", async (event) => {
   if (!isTrustedRendererUrl(event.sender.getURL())) throw new Error("Origem do renderer não autorizada.");
   if (!backendConfig) throw new Error("Backend local ainda não está pronto.");
@@ -241,11 +269,20 @@ ipcMain.handle("window:fullscreen", async (event, enabled: unknown) => {
 
 ipcMain.handle("screen:list", async (event) => {
   if (!isTrustedRendererUrl(event.sender.getURL())) throw new Error("Origem do renderer não autorizada.");
-  return (await desktopCapturer.getSources({
+  const sources = await desktopCapturer.getSources({
     types: ["screen", "window"],
     thumbnailSize: { width: 320, height: 180 },
     fetchWindowIcons: true,
-  })).map((source) => ({
+  });
+  knownDisplaySources.clear();
+  sources.forEach((source) => {
+    knownDisplaySources.set(source.id, {
+      id: source.id,
+      name: source.name,
+      displayId: source.display_id,
+    });
+  });
+  return sources.map((source) => ({
     id: source.id,
     name: source.name,
     displayId: source.display_id,
@@ -281,7 +318,14 @@ ipcMain.handle("screen:choose", async (event) => {
     ? await dialog.showMessageBox(owner, options)
     : await dialog.showMessageBox(options);
   if (result.response < 0 || result.response >= sources.length) return null;
-  return sources[result.response]?.id ?? null;
+  const selected = sources[result.response];
+  if (!selected) return null;
+  knownDisplaySources.set(selected.id, {
+    id: selected.id,
+    name: selected.name,
+    displayId: selected.display_id,
+  });
+  return selected.id;
 });
 
 ipcMain.handle("screen:select", async (event, sourceId: unknown) => {
@@ -289,15 +333,10 @@ ipcMain.handle("screen:select", async (event, sourceId: unknown) => {
   if (typeof sourceId !== "string" || sourceId.length === 0 || sourceId.length > 512) {
     throw new Error("Fonte de compartilhamento inválida.");
   }
-  const sources = await desktopCapturer.getSources({
-    types: ["screen", "window"],
-    thumbnailSize: { width: 0, height: 0 },
-    fetchWindowIcons: false,
-  });
-  if (!sources.some((source) => source.id === sourceId)) {
-    throw new Error("A fonte selecionada não está mais disponível.");
-  }
-  pendingDisplaySourceId = sourceId;
+  // Não relistamos aqui. No Linux/Wayland os ids do desktopCapturer podem ser
+  // efêmeros e mudar entre a abertura do picker e o getDisplayMedia. Guardamos os
+  // metadados conhecidos e resolvemos a fonte atual apenas quando o Chromium pedir.
+  pendingDisplaySelection = knownDisplaySources.get(sourceId) ?? { id: sourceId };
 });
 
 function createWindow(): void {
@@ -345,20 +384,16 @@ if (hasSingleInstanceLock) {
       callback(isTrustedRendererUrl(webContents.getURL()) && ["media", "display-capture", "fullscreen"].includes(permission));
     });
     session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
-      const sourceId = pendingDisplaySourceId;
-      pendingDisplaySourceId = undefined;
-      if (!sourceId || !isTrustedRendererUrl(request.securityOrigin)) {
+      const selection = pendingDisplaySelection;
+      pendingDisplaySelection = undefined;
+      if (!selection || !isTrustedRendererUrl(request.securityOrigin)) {
         callback({});
         return;
       }
       try {
-        const sources = await desktopCapturer.getSources({
-          types: ["screen", "window"],
-          thumbnailSize: { width: 0, height: 0 },
-          fetchWindowIcons: false,
-        });
-        const selected = sources.find((source) => source.id === sourceId);
+        const selected = await resolveCurrentDisplaySource(selection);
         if (!selected) {
+          console.warn("Fonte de compartilhamento desapareceu antes do getDisplayMedia", selection);
           callback({});
           return;
         }
@@ -396,7 +431,8 @@ if (hasSingleInstanceLock) {
 }
 
 app.on("before-quit", () => {
-  pendingDisplaySourceId = undefined;
+  pendingDisplaySelection = undefined;
+  knownDisplaySources.clear();
   void clearDevBackendBridge();
   stopBackend();
   assetServer?.close();

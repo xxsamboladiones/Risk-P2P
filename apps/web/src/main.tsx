@@ -5,6 +5,7 @@ import {
   Headphones,
   LogOut,
   MessageCircle,
+  Pencil,
   Plus,
   Settings2,
   Sparkles,
@@ -28,6 +29,7 @@ import { GroupInvitePanel } from "./components/GroupInvitePanel";
 import { MessageComposer } from "./components/MessageComposer";
 import { P2PInvitePanel } from "./components/P2PInvitePanel";
 import { VoiceVideoSettingsPanel } from "./components/VoiceVideoSettingsPanel";
+import { deleteLocalGroupChannel, renameLocalGroupChannel } from "./services/offline/channel-storage";
 import {
   addLocalGroupChannel,
   createLocalGroup,
@@ -101,6 +103,7 @@ function Modal({ title, children, onClose }: { title: string; children: React.Re
 
 type SocialModal = "friend" | "group" | "channel" | "member" | "joinGroup" | "settings" | null;
 type DeleteTarget = { kind: "friend"; friend: Friend } | { kind: "group"; group: Community } | null;
+type ChannelActionTarget = { mode: "edit" | "delete"; channel: Channel } | null;
 
 function SocialHome() {
   const token = useCallStore((state) => state.token)!;
@@ -122,6 +125,8 @@ function SocialHome() {
   const [modal, setModal] = useState<SocialModal>(null);
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget>(null);
   const [deleting, setDeleting] = useState(false);
+  const [channelAction, setChannelAction] = useState<ChannelActionTarget>(null);
+  const [channelSaving, setChannelSaving] = useState(false);
   const [error, setError] = useState("");
   const [chatStatus, setChatStatus] = useState<ChatConnectionStatus>("disconnected");
 
@@ -309,6 +314,47 @@ function SocialHome() {
     catch (cause) { setError(cause instanceof Error ? cause.message : "Falha na operação com o arquivo"); }
   }
 
+  async function renameChannel(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedCommunity?.local || channelAction?.mode !== "edit" || channelSaving) return;
+    const name = String(new FormData(event.currentTarget).get("name")).trim();
+    setChannelSaving(true);
+    try {
+      const updated = await renameLocalGroupChannel(selectedCommunity.id, channelAction.channel.id, name);
+      const next: Channel = { ...channelAction.channel, ...updated };
+      setChannels((items) => items.map((item) => item.id === next.id ? next : item));
+      setActiveChannel((current) => current?.id === next.id ? next : current);
+      setChannelAction(null);
+      window.dispatchEvent(new Event("risk:social-updated"));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível renomear o canal.");
+    } finally {
+      setChannelSaving(false);
+    }
+  }
+
+  async function removeChannel() {
+    if (!selectedCommunity?.local || channelAction?.mode !== "delete" || channelSaving) return;
+    const removing = channelAction.channel;
+    setChannelSaving(true);
+    try {
+      await deleteLocalGroupChannel(selectedCommunity.id, removing.id);
+      const remaining = channels.filter((item) => item.id !== removing.id);
+      if (activeChannel?.id === removing.id) {
+        await chat.disconnect().catch(() => undefined);
+        setChatStatus("disconnected");
+        setActiveChannel(remaining.find((item) => item.kind === "text") ?? remaining[0] ?? null);
+      }
+      setChannels(remaining);
+      setChannelAction(null);
+      window.dispatchEvent(new Event("risk:social-updated"));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível apagar o canal.");
+    } finally {
+      setChannelSaving(false);
+    }
+  }
+
   async function performDelete() {
     const target = deleteTarget;
     if (!target || deleting) return;
@@ -388,9 +434,15 @@ function SocialHome() {
         <div className="nav-title"><span>{selectedCommunity?.name ?? activeFriend?.displayName ?? "Risk"}</span>{selectedCommunity && <button className="nav-danger" title="Apagar ou sair do grupo" aria-label="Apagar ou sair do grupo" onClick={() => setDeleteTarget({ kind: "group", group: selectedCommunity })}><Trash2 size={16}/></button>}</div>
         {selectedCommunity ? <>
           <div className="nav-section"><span>CANAIS DE TEXTO</span><button onClick={() => setModal("channel")}><Plus size={15}/></button></div>
-          {channels.filter((item) => item.kind === "text").map((channel) => <button key={channel.id} className={activeChannel?.id === channel.id ? "channel active" : "channel"} onClick={() => setActiveChannel(channel)}><Hash/>{channel.name}</button>)}
+          {channels.filter((item) => item.kind === "text").map((channel) => <div className="channel-item" key={channel.id}>
+            <button className={activeChannel?.id === channel.id ? "channel active" : "channel"} onClick={() => setActiveChannel(channel)}><Hash/><span>{channel.name}</span></button>
+            {selectedCommunity.local && <div className="channel-actions"><button title="Renomear canal" aria-label={`Renomear ${channel.name}`} onClick={() => setChannelAction({ mode: "edit", channel })}><Pencil size={14}/></button><button className="delete" title="Apagar canal" aria-label={`Apagar ${channel.name}`} onClick={() => setChannelAction({ mode: "delete", channel })}><Trash2 size={14}/></button></div>}
+          </div>)}
           <div className="nav-section"><span>SALAS DE VOZ</span><button onClick={() => setModal("channel")}><Plus size={15}/></button></div>
-          {channels.filter((item) => item.kind === "voice").map((channel) => <button key={channel.id} className="channel voice" onClick={() => void enterVoice(channel)}><Headphones/>{channel.name}</button>)}
+          {channels.filter((item) => item.kind === "voice").map((channel) => <div className="channel-item" key={channel.id}>
+            <button className="channel voice" onClick={() => void enterVoice(channel)}><Headphones/><span>{channel.name}</span></button>
+            {selectedCommunity.local && <div className="channel-actions"><button title="Renomear sala de voz" aria-label={`Renomear ${channel.name}`} onClick={() => setChannelAction({ mode: "edit", channel })}><Pencil size={14}/></button><button className="delete" title="Apagar sala de voz" aria-label={`Apagar ${channel.name}`} onClick={() => setChannelAction({ mode: "delete", channel })}><Trash2 size={14}/></button></div>}
+          </div>)}
           <div className="nav-section"><span>MEMBROS</span><button onClick={() => setModal("member")}><UserPlus size={15}/></button></div>
           {groupMembers.slice(0, 8).map((member) => <div className="mini-user" key={member.peerId}><i>{member.displayName[0]?.toUpperCase()}</i><span>{member.displayName}</span></div>)}
         </> : <>
@@ -470,6 +522,8 @@ function SocialHome() {
       {modal === "member" && selectedCommunity && <Modal title="Adicionar membro" onClose={() => setModal(null)}>{currentUser ? <GroupInvitePanel token={token} displayName={currentUser.displayName} preferredGroupId={selectedCommunity.id} preferredGroupName={selectedCommunity.name} preferredGroupChannels={channels} initialMode="create" onComplete={() => void loadSocial()}/> : <p>Carregando sua identidade…</p>}</Modal>}
       {modal === "joinGroup" && <Modal title="Entrar em grupo" onClose={() => setModal(null)}>{currentUser ? <GroupInvitePanel token={token} displayName={currentUser.displayName} initialMode="join" onComplete={() => { void loadSocial(); setModal(null); }}/> : <p>Carregando sua identidade…</p>}</Modal>}
       {deleteTarget && <Modal title={deleteTarget.kind === "friend" ? "Desfazer amizade" : "Remover grupo"} onClose={() => { if (!deleting) setDeleteTarget(null); }}><div className="danger-confirm"><div className="danger-confirm-icon">{deleteTarget.kind === "friend" ? <UserMinus/> : <Trash2/>}</div>{deleteTarget.kind === "friend" ? <p>Desfazer amizade com <strong>{deleteTarget.friend.displayName}</strong>? O histórico local não será apagado automaticamente.</p> : <p>Remover <strong>{deleteTarget.group.name}</strong>? Se você for o dono, o grupo será apagado. Caso contrário, você apenas sairá dele.</p>}<div className="danger-confirm-actions"><button className="secondary" disabled={deleting} onClick={() => setDeleteTarget(null)}>Cancelar</button><button className="danger-action" disabled={deleting} onClick={() => void performDelete()}>{deleting ? "Removendo…" : deleteTarget.kind === "friend" ? "Desfazer amizade" : "Remover grupo"}</button></div></div></Modal>}
+      {channelAction?.mode === "edit" && <Modal title={channelAction.channel.kind === "text" ? "Renomear canal" : "Renomear sala de voz"} onClose={() => { if (!channelSaving) setChannelAction(null); }}><form className="channel-edit-form" onSubmit={renameChannel}><input name="name" defaultValue={channelAction.channel.name} minLength={2} maxLength={80} autoFocus required/><small>O tipo do canal será mantido como {channelAction.channel.kind === "text" ? "texto" : "voz"}.</small><button disabled={channelSaving}>{channelSaving ? "Salvando…" : "Salvar nome"}</button></form></Modal>}
+      {channelAction?.mode === "delete" && <Modal title={channelAction.channel.kind === "text" ? "Apagar canal" : "Apagar sala de voz"} onClose={() => { if (!channelSaving) setChannelAction(null); }}><div className="danger-confirm"><div className="danger-confirm-icon"><Trash2/></div><p>Apagar <strong>{channelAction.channel.name}</strong>? {channelAction.channel.kind === "text" ? "O canal deixará de aparecer neste grupo." : "A sala de voz deixará de aparecer neste grupo."}</p><div className="danger-confirm-actions"><button className="secondary" disabled={channelSaving} onClick={() => setChannelAction(null)}>Cancelar</button><button className="danger-action" disabled={channelSaving} onClick={() => void removeChannel()}>{channelSaving ? "Apagando…" : "Apagar canal"}</button></div></div></Modal>}
     </main>
     <button className="floating-invite" onClick={() => setModal("joinGroup")}><UserPlus size={18}/> Entrar em grupo</button>
   </>;

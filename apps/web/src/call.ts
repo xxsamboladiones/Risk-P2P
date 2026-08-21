@@ -193,11 +193,12 @@ export class CallController {
     store.setError(null);
     store.setSelf(this.peerId);
 
-    this.signaling = this.createSignaling();
-    this.transport = new MeshWebRTCTransport(this.peerId, iceServers, {
-      sendOffer: (targetPeerId, description) => this.signaling!.sendOffer(targetPeerId, description),
-      sendAnswer: (targetPeerId, description) => this.signaling!.sendAnswer(targetPeerId, description),
-      sendIce: (targetPeerId, candidate) => this.signaling!.sendIceCandidate(targetPeerId, candidate),
+    const signaling = this.createSignaling();
+    this.signaling = signaling;
+    const transport = new MeshWebRTCTransport(this.peerId, iceServers, {
+      sendOffer: (targetPeerId, description) => signaling.sendOffer(targetPeerId, description),
+      sendAnswer: (targetPeerId, description) => signaling.sendAnswer(targetPeerId, description),
+      sendIce: (targetPeerId, candidate) => signaling.sendIceCandidate(targetPeerId, candidate),
       onRemoteStream: (remotePeerId, stream) => {
         const store = useCallStore.getState();
         const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
@@ -211,7 +212,8 @@ export class CallController {
         store.upsert({ ...participant, connection });
       },
     });
-    this.bindSignaling(this.signaling, roomId, this.peerId);
+    this.transport = transport;
+    this.bindSignaling(signaling, roomId, this.peerId);
 
     try {
       const profile = await api.me(token);
@@ -257,13 +259,13 @@ export class CallController {
 
       this.microphoneTrack = microphone;
       this.local.addTrack(microphone);
-      await this.transport.publishTrack(microphone, this.local);
+      await transport.publishTrack(microphone, this.local);
       if (!this.isActive(lifecycle)) throw new DOMException("Entrada na chamada cancelada.", "AbortError");
       this.state.cameraStreamId = this.local.id;
       this.updateLocalPreview();
-      await this.signaling.connect(roomId, this.peerId);
+      await signaling.connect(roomId, this.peerId);
       if (!this.isActive(lifecycle)) throw new DOMException("Entrada na chamada cancelada.", "AbortError");
-      await Promise.all([this.signaling.sendPeerState(this.state), this.signaling.sendPeerProfile(this.displayName)]);
+      await Promise.all([signaling.sendPeerState(this.state), signaling.sendPeerProfile(this.displayName)]);
       return this.local;
     } catch (error) {
       if (this.isActive(lifecycle)) await this.cleanup();
@@ -508,26 +510,44 @@ export class CallController {
 
   private async cleanup(): Promise<void> {
     this.lifecycleId += 1;
-    this.signalingUnsubscribers.splice(0).forEach((unsubscribe) => unsubscribe());
-    await this.signaling?.disconnect().catch(() => undefined);
-    await this.transport?.disconnect().catch(() => undefined);
-    this.local.getTracks().forEach((track) => track.stop());
-    await this.rnnoiseMicrophone?.stop().catch(() => undefined);
-    this.microphoneInputStream?.getTracks().forEach((track) => track.stop());
-    this.screenStream?.getTracks().forEach((track) => track.stop());
-    await this.screen.stopScreenShare().catch(() => undefined);
-    await stopDesktopScreenAudio();
+    const signaling = this.signaling;
+    const transport = this.transport;
+    const local = this.local;
+    const rnnoiseMicrophone = this.rnnoiseMicrophone;
+    const microphoneInputStream = this.microphoneInputStream;
+    const screenStream = this.screenStream;
+    const unsubscribers = this.signalingUnsubscribers.splice(0);
+
+    // O estado é destacado antes dos awaits para impedir que um cleanup antigo
+    // apague a sessão criada por um join posterior.
+    this.signaling = undefined;
+    this.transport = undefined;
+    this.local = new MediaStream();
     this.microphoneInputStream = undefined;
     this.microphoneTrack = undefined;
     this.rnnoiseMicrophone = undefined;
     this.cameraTrack = undefined;
     this.screenStream = undefined;
-    this.signaling = undefined;
-    this.transport = undefined;
     this.roomId = undefined;
     this.peerId = undefined;
     this.displayName = "Participante";
-    useCallStore.getState().clearParticipants();
-    useCallStore.getState().setLocalMedia({ camera: null, screen: null }, { microphone: true, camera: false, screenShare: false });
+    this.state = { microphone: true, camera: false, screenShare: false };
+
+    unsubscribers.forEach((unsubscribe) => unsubscribe());
+    local.getTracks().forEach((track) => track.stop());
+    microphoneInputStream?.getTracks().forEach((track) => track.stop());
+    screenStream?.getTracks().forEach((track) => track.stop());
+    const screenCleanup = this.screen.stopScreenShare().catch(() => undefined);
+    const desktopAudioCleanup = stopDesktopScreenAudio();
+
+    const store = useCallStore.getState();
+    store.clearParticipants();
+    store.setLocalMedia({ camera: null, screen: null }, this.state);
+
+    await signaling?.disconnect().catch(() => undefined);
+    await transport?.disconnect().catch(() => undefined);
+    await rnnoiseMicrophone?.stop().catch(() => undefined);
+    await screenCleanup;
+    await desktopAudioCleanup;
   }
 }

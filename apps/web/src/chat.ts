@@ -183,11 +183,12 @@ export class ChatController {
     this.peerNames.clear();
     this.trustedPeers.forEach((peer) => this.peerNames.set(peer.peerId, peer.displayName));
 
-    this.signaling = this.createSignaling();
-    this.transport = new MeshWebRTCTransport(this.peerId, iceServers, {
-      sendOffer: (targetPeerId, description) => this.signaling!.sendOffer(targetPeerId, description),
-      sendAnswer: (targetPeerId, description) => this.signaling!.sendAnswer(targetPeerId, description),
-      sendIce: (targetPeerId, candidate) => this.signaling!.sendIceCandidate(targetPeerId, candidate),
+    const signaling = this.createSignaling();
+    this.signaling = signaling;
+    const transport = new MeshWebRTCTransport(this.peerId, iceServers, {
+      sendOffer: (targetPeerId, description) => signaling.sendOffer(targetPeerId, description),
+      sendAnswer: (targetPeerId, description) => signaling.sendAnswer(targetPeerId, description),
+      sendIce: (targetPeerId, candidate) => signaling.sendIceCandidate(targetPeerId, candidate),
       onRemoteStream: () => undefined,
       onConnectionState: (remotePeerId, state) => {
         if (state === "failed" || state === "closed") this.forgetPeerConnection(remotePeerId);
@@ -209,30 +210,34 @@ export class ChatController {
         if (state === "open" && this.openDataPeers.has(remotePeerId)) void this.attachmentService?.peerReady(remotePeerId).catch(() => undefined);
       },
     }, options.maxRemotePeers);
+    this.transport = transport;
     this.installAttachmentService(new AttachmentService(
-      this.transport,
+      transport,
       channelId,
       this.peerId,
       () => [...this.openDataPeers],
       await createAttachmentStorage(),
     ));
-    this.bindSignaling(this.signaling, this.peerId);
+    this.bindSignaling(signaling, this.peerId);
     if (this.groupId && typeof window !== "undefined") {
       const refresh = () => { void this.refreshGroupMembership(true); };
       window.addEventListener("risk:social-updated", refresh);
       this.unsubscribers.push(() => window.removeEventListener("risk:social-updated", refresh));
     }
     try {
-      await this.signaling.connect(channelId, this.peerId, options.namespace ?? "chat");
+      await signaling.connect(channelId, this.peerId, options.namespace ?? "chat");
       this.setStatus("connected");
-      await this.signaling.sendPeerProfile(this.displayName);
+      await signaling.sendPeerProfile(this.displayName);
     } catch (error) { await this.disconnect(); this.setStatus("error"); throw error; }
   }
 
   async disconnect(): Promise<void> {
-    this.unsubscribers.splice(0).forEach((unsubscribe) => unsubscribe());
-    await this.signaling?.disconnect().catch(() => undefined);
-    await this.transport?.disconnect().catch(() => undefined);
+    const signaling = this.signaling;
+    const transport = this.transport;
+    const unsubscribers = this.unsubscribers.splice(0);
+
+    // Desanexa o estado atual antes de aguardar rede/RTC. Assim um disconnect antigo
+    // não consegue apagar um signaling/transport criado por uma conexão posterior.
     this.signaling = undefined;
     this.transport = undefined;
     this.attachmentService = undefined;
@@ -250,6 +255,10 @@ export class ChatController {
     this.historyRequests.clear();
     this.processed.clear();
     this.setStatus("disconnected");
+
+    unsubscribers.forEach((unsubscribe) => unsubscribe());
+    await signaling?.disconnect().catch(() => undefined);
+    await transport?.disconnect().catch(() => undefined);
   }
 
   async send(content: string): Promise<LocalChatMessage> {

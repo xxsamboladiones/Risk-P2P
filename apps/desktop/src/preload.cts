@@ -13,8 +13,12 @@ export type DesktopBackendConfig = {
 };
 
 const FULLSCREEN_STYLE_ID = "risk-native-stream-fullscreen-style";
+const MIN_FULLSCREEN_ZOOM = 0.5;
+const MAX_FULLSCREEN_ZOOM = 5;
+const FULLSCREEN_ZOOM_FACTOR = 1.12;
 let activeFullscreenTile: HTMLElement | null = null;
 let activeFullscreenWorkspace: HTMLElement | null = null;
+let activeFullscreenZoom = 1;
 
 function installNativeStreamFullscreenStyle(): void {
   if (document.getElementById(FULLSCREEN_STYLE_ID)) return;
@@ -110,6 +114,10 @@ html.risk-native-stream-fullscreen #root {
   max-height: none !important;
   object-fit: contain !important;
   background: #000 !important;
+  transform: scale(var(--risk-fullscreen-zoom, 1)) !important;
+  transform-origin: var(--risk-fullscreen-origin-x, 50%) var(--risk-fullscreen-origin-y, 50%) !important;
+  transition: transform 70ms ease-out !important;
+  will-change: transform;
 }
 .call-workspace[data-risk-native-fullscreen-active="true"] [data-risk-native-fullscreen="true"] .tile-label,
 .call-workspace[data-risk-native-fullscreen-active="true"] [data-risk-native-fullscreen="true"] .source-switch,
@@ -133,7 +141,44 @@ html.risk-native-stream-fullscreen #root {
   document.head.appendChild(style);
 }
 
+function clearFullscreenZoomStyles(tile: HTMLElement | null): void {
+  activeFullscreenZoom = 1;
+  if (!tile) return;
+  tile.style.removeProperty("--risk-fullscreen-zoom");
+  tile.style.removeProperty("--risk-fullscreen-origin-x");
+  tile.style.removeProperty("--risk-fullscreen-origin-y");
+}
+
+function setFullscreenZoom(tile: HTMLElement, zoom: number, originX: number, originY: number): void {
+  activeFullscreenZoom = zoom;
+  tile.style.setProperty("--risk-fullscreen-zoom", zoom.toFixed(3));
+  tile.style.setProperty("--risk-fullscreen-origin-x", `${originX.toFixed(2)}%`);
+  tile.style.setProperty("--risk-fullscreen-origin-y", `${originY.toFixed(2)}%`);
+}
+
+function adjustFullscreenZoom(event: WheelEvent): void {
+  const tile = activeFullscreenTile;
+  if (!tile || event.deltaY === 0) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  event.stopImmediatePropagation();
+
+  const factor = event.deltaY < 0 ? FULLSCREEN_ZOOM_FACTOR : 1 / FULLSCREEN_ZOOM_FACTOR;
+  const nextZoom = Math.min(MAX_FULLSCREEN_ZOOM, Math.max(MIN_FULLSCREEN_ZOOM, activeFullscreenZoom * factor));
+  if (Math.abs(nextZoom - activeFullscreenZoom) < 0.001) return;
+
+  const rect = tile.getBoundingClientRect();
+  const relativeX = rect.width > 0 ? (event.clientX - rect.left) / rect.width : 0.5;
+  const relativeY = rect.height > 0 ? (event.clientY - rect.top) / rect.height : 0.5;
+  const originX = Math.min(1, Math.max(0, relativeX)) * 100;
+  const originY = Math.min(1, Math.max(0, relativeY)) * 100;
+
+  setFullscreenZoom(tile, nextZoom, originX, originY);
+}
+
 function cleanupFullscreenDom(): void {
+  clearFullscreenZoomStyles(activeFullscreenTile);
   activeFullscreenTile?.removeAttribute("data-risk-native-fullscreen");
   activeFullscreenWorkspace?.removeAttribute("data-risk-native-fullscreen-active");
   document.documentElement.classList.remove("risk-native-stream-fullscreen");
@@ -160,6 +205,7 @@ async function enterNativeStreamFullscreen(tile: HTMLElement): Promise<void> {
 
   activeFullscreenTile = tile;
   activeFullscreenWorkspace = workspace;
+  setFullscreenZoom(tile, 1, 50, 50);
   tile.setAttribute("data-risk-native-fullscreen", "true");
   workspace.setAttribute("data-risk-native-fullscreen-active", "true");
   document.documentElement.classList.add("risk-native-stream-fullscreen");
@@ -207,6 +253,11 @@ function installNativeStreamFullscreenController(): void {
     event.stopImmediatePropagation();
     void enterNativeStreamFullscreen(tile);
   }, true);
+
+  document.addEventListener("wheel", (event) => {
+    if (!activeFullscreenTile) return;
+    adjustFullscreenZoom(event);
+  }, { capture: true, passive: false });
 
   window.addEventListener("keydown", (event) => {
     if (event.key !== "Escape" || !activeFullscreenTile) return;

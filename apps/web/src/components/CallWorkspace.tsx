@@ -7,6 +7,7 @@ import {
   MicOff,
   MonitorUp,
   PhoneOff,
+  Settings2,
   Sparkles,
   Video,
   VideoOff,
@@ -26,6 +27,7 @@ import type {
 import { loadLocalGroups } from "../services/offline/social-storage";
 import { useCallStore, type CallContext, type Participant } from "../store";
 import { ConversationTimeline } from "./ConversationTimeline";
+import { InCallAudioSettings } from "./InCallAudioSettings";
 import { MessageComposer } from "./MessageComposer";
 import "./call-workspace.css";
 
@@ -299,6 +301,7 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
   const [attachments, setAttachments] = useState<ChatAttachmentRecord[]>([]);
   const [attachmentProgress, setAttachmentProgress] = useState<Record<string, ChatAttachmentProgress | undefined>>({});
   const [quality, setQuality] = useState<ScreenQuality>(initialScreenQuality);
+  const [audioSettingsOpen, setAudioSettingsOpen] = useState(false);
   const [sourcePickerOpen, setSourcePickerOpen] = useState(false);
   const [screenSources, setScreenSources] = useState<RiskDesktopSource[]>([]);
   const [screenSourcesLoading, setScreenSourcesLoading] = useState(false);
@@ -560,6 +563,7 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
 
     <footer>
       <button className={localState.microphone ? "" : "off"} onClick={() => void call.toggleMicrophone(roomId)}>{localState.microphone ? <Mic/> : <MicOff/>}<span>Microfone</span></button>
+      <button className={audioSettingsOpen ? "active" : ""} onClick={() => setAudioSettingsOpen((current) => !current)} title="Configurações de áudio"><Settings2/><span>Áudio</span></button>
       <button className={localState.camera ? "active" : ""} onClick={() => void call.toggleCamera(roomId)}>{localState.camera ? <Video/> : <VideoOff/>}<span>Câmera</span></button>
       <div className="share-control">
         <button className={localState.screenShare ? "active" : ""} onClick={() => void showScreenPicker()}><MonitorUp/><span>{localState.screenShare ? "Parar transmissão" : "Compartilhar"}</span></button>
@@ -569,6 +573,7 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
       </div>
       {context?.textChannelId && <button className={view === "chat" ? "active" : ""} onClick={() => setView(view === "chat" ? "call" : "chat")}><MessageCircle/><span>{view === "chat" ? "Chamada" : "Chat"}</span></button>}
       <button className="hangup" onClick={() => {
+        setAudioSettingsOpen(false);
         setRoom(null);
         setCallContext(null);
         void chat.disconnect();
@@ -576,6 +581,7 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
       }}><PhoneOff/><span>Sair</span></button>
     </footer>
 
+    {audioSettingsOpen && <InCallAudioSettings call={call} onClose={() => setAudioSettingsOpen(false)}/>} 
     {sourcePickerOpen && <ScreenSourcePicker
       sources={screenSources}
       loading={screenSourcesLoading}

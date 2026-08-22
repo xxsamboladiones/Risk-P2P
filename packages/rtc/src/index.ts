@@ -124,6 +124,7 @@ export interface CallTransport {
   publishTrack(track: MediaStreamTrack, stream: MediaStream): Promise<void>;
   unpublishTrack(track: MediaStreamTrack): Promise<void>;
   replaceTrack(kind: "audio" | "video", track: MediaStreamTrack | null): Promise<void>;
+  replacePublishedTrack(previousTrack: MediaStreamTrack, nextTrack: MediaStreamTrack, stream: MediaStream): Promise<void>;
 }
 
 type PeerEntry = {
@@ -224,6 +225,28 @@ export class MeshWebRTCTransport implements CallTransport {
     }));
   }
 
+  async replacePublishedTrack(previousTrack: MediaStreamTrack, nextTrack: MediaStreamTrack, stream: MediaStream): Promise<void> {
+    if (previousTrack.kind !== nextTrack.kind) throw new Error("A track substituta precisa ter o mesmo tipo da track publicada.");
+    if (!this.localTracks.has(previousTrack.id)) throw new Error(`Track publicada não encontrada: ${previousTrack.id}`);
+
+    const senders = [...this.peers.values()]
+      .map(({ pc }) => pc.getSenders().find((sender) => sender.track === previousTrack || sender.track?.id === previousTrack.id))
+      .filter((sender): sender is RTCRtpSender => Boolean(sender));
+    const replaced: RTCRtpSender[] = [];
+    try {
+      for (const sender of senders) {
+        await sender.replaceTrack(nextTrack);
+        replaced.push(sender);
+      }
+    } catch (error) {
+      await Promise.all(replaced.map((sender) => sender.replaceTrack(previousTrack).catch(() => undefined)));
+      throw error;
+    }
+
+    this.localTracks.delete(previousTrack.id);
+    this.localTracks.set(nextTrack.id, { track: nextTrack, stream });
+  }
+
   sendData(data: string, targetPeerId?: string): number {
     if (new TextEncoder().encode(data).byteLength > MAX_CONTROL_MESSAGE_BYTES) throw new Error("Mensagem DataChannel excede 64 KiB.");
     let sent = 0;
@@ -262,7 +285,8 @@ export class MeshWebRTCTransport implements CallTransport {
   }
 
   isTransferChannelOpen(peerId: string): boolean {
-    return this.peers.get(peerId)?.transferDataChannel?.readyState === "open";
+    const channel = this.peers.get(peerId)?.transferDataChannel;
+    return channel?.readyState === "open";
   }
 
   ensureTransferChannel(peerId: string): void {

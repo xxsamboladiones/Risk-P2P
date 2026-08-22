@@ -2,8 +2,9 @@ import { MeshWebRTCTransport, WebScreenShareProvider, type PeerConnectionDiagnos
 import type { PeerState } from "@risk/protocol";
 import { useCallStore, type Participant } from "./store";
 import { api } from "./api";
+import { openConfiguredMicrophone } from "./services/audio/microphone";
 import { createRnnoiseMicrophone, type RnnoiseMicrophone } from "./services/audio/rnnoise";
-import { loadVoiceVideoSettings } from "./services/audio/settings";
+import { loadVoiceVideoSettings, type VoiceVideoSettings } from "./services/audio/settings";
 import { SupabaseSignalingProvider } from "./services/supabase/signaling";
 import type { SignalingDiagnostics, SignalingProvider } from "./services/signaling/types";
 
@@ -21,6 +22,12 @@ type DesktopScreenAudioPreparation = {
   reason?: string;
 };
 
+type MicrophoneSession = {
+  inputStream: MediaStream;
+  track: MediaStreamTrack;
+  rnnoise?: RnnoiseMicrophone;
+};
+
 function placeholderParticipant(peerId: string): Participant {
   return {
     peerId,
@@ -29,6 +36,40 @@ function placeholderParticipant(peerId: string): Participant {
     streams: {},
     connection: "new",
   };
+}
+
+async function createMicrophoneSession(settings: VoiceVideoSettings): Promise<MicrophoneSession> {
+  const inputStream = await openConfiguredMicrophone(settings);
+  const inputTrack = inputStream.getAudioTracks()[0];
+  if (!inputTrack) {
+    inputStream.getTracks().forEach((track) => track.stop());
+    throw new Error("Nenhum microfone foi disponibilizado pelo navegador.");
+  }
+
+  console.info("Risk microphone capture", {
+    requestedDeviceId: settings.microphoneDeviceId || "default",
+    deviceId: inputTrack.getSettings().deviceId ?? "unknown",
+    label: inputTrack.label || "unknown",
+    noiseSuppression: settings.noiseSuppression,
+    echoCancellation: settings.echoCancellation,
+  });
+
+  if (settings.noiseSuppression !== "rnnoise") return { inputStream, track: inputTrack };
+
+  try {
+    const rnnoise = await createRnnoiseMicrophone(inputStream);
+    return { inputStream, track: rnnoise.track, rnnoise };
+  } catch (error) {
+    console.warn("RNNoise indisponível; usando supressão de ruído padrão do WebRTC.", error);
+    await inputTrack.applyConstraints({ noiseSuppression: true }).catch(() => undefined);
+    return { inputStream, track: inputTrack };
+  }
+}
+
+async function stopMicrophoneSession(session: MicrophoneSession): Promise<void> {
+  session.inputStream.getTracks().forEach((track) => track.stop());
+  session.track.stop();
+  await session.rnnoise?.stop().catch(() => undefined);
 }
 
 function isLinuxDesktop(): boolean {
@@ -228,46 +269,17 @@ export class CallController {
       if (!this.isActive(lifecycle)) throw new DOMException("Entrada na chamada cancelada.", "AbortError");
       this.displayName = profile.displayName;
 
-      const microphoneStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: voiceSettings.echoCancellation,
-          noiseSuppression: voiceSettings.noiseSuppression === "standard",
-          autoGainControl: true,
-          channelCount: 1,
-        },
-      });
-      this.microphoneInputStream = microphoneStream;
+      const microphoneSession = await createMicrophoneSession(voiceSettings);
       if (!this.isActive(lifecycle)) {
-        microphoneStream.getTracks().forEach((track) => track.stop());
+        await stopMicrophoneSession(microphoneSession);
         throw new DOMException("Entrada na chamada cancelada.", "AbortError");
       }
-      const microphoneInput = microphoneStream.getAudioTracks()[0];
-      if (!microphoneInput) {
-        microphoneStream.getTracks().forEach((track) => track.stop());
-        throw new Error("Nenhum microfone foi disponibilizado pelo navegador.");
-      }
 
-      let microphone = microphoneInput;
-      if (voiceSettings.noiseSuppression === "rnnoise") {
-        try {
-          const rnnoise = await createRnnoiseMicrophone(microphoneStream);
-          if (!this.isActive(lifecycle)) {
-            await rnnoise.stop();
-            microphoneStream.getTracks().forEach((track) => track.stop());
-            throw new DOMException("Entrada na chamada cancelada.", "AbortError");
-          }
-          this.rnnoiseMicrophone = rnnoise;
-          microphone = rnnoise.track;
-        } catch (error) {
-          if (error instanceof DOMException && error.name === "AbortError") throw error;
-          console.warn("RNNoise indisponível; usando supressão de ruído padrão do WebRTC.", error);
-          await microphoneInput.applyConstraints({ noiseSuppression: true }).catch(() => undefined);
-        }
-      }
-
-      this.microphoneTrack = microphone;
-      this.local.addTrack(microphone);
-      await transport.publishTrack(microphone, this.local);
+      this.microphoneInputStream = microphoneSession.inputStream;
+      this.rnnoiseMicrophone = microphoneSession.rnnoise;
+      this.microphoneTrack = microphoneSession.track;
+      this.local.addTrack(microphoneSession.track);
+      await transport.publishTrack(microphoneSession.track, this.local);
       if (!this.isActive(lifecycle)) throw new DOMException("Entrada na chamada cancelada.", "AbortError");
       this.state.cameraStreamId = this.local.id;
       this.updateLocalPreview();
@@ -291,6 +303,61 @@ export class CallController {
       this.updateLocalPreview();
       await this.signaling?.sendPeerState(this.state);
     } catch (error) { this.reportError(error, "Não foi possível alterar o microfone."); }
+  }
+
+  async updateVoiceInput(settings: VoiceVideoSettings): Promise<void> {
+    const lifecycle = this.lifecycleId;
+    const previousTrack = this.microphoneTrack;
+    const previousInputStream = this.microphoneInputStream;
+    const previousRnnoise = this.rnnoiseMicrophone;
+    const transport = this.transport;
+    if (!previousTrack || !previousInputStream || !transport || !this.isActive(lifecycle)) {
+      throw new Error("A chamada não está pronta para trocar o dispositivo de áudio.");
+    }
+
+    const replacement = await createMicrophoneSession(settings);
+    if (!this.isActive(lifecycle) || this.microphoneTrack !== previousTrack) {
+      await stopMicrophoneSession(replacement);
+      throw new DOMException("Troca de microfone cancelada porque a chamada mudou.", "AbortError");
+    }
+
+    const syncEnabledState = () => {
+      const enabled = this.state.microphone;
+      replacement.track.enabled = enabled;
+      replacement.inputStream.getAudioTracks().forEach((track) => { track.enabled = enabled; });
+    };
+    syncEnabledState();
+
+    try {
+      await transport.replacePublishedTrack(previousTrack, replacement.track, this.local);
+    } catch (error) {
+      await stopMicrophoneSession(replacement);
+      throw error;
+    }
+
+    if (!this.isActive(lifecycle)) {
+      await stopMicrophoneSession(replacement);
+      return;
+    }
+
+    syncEnabledState();
+    this.local.removeTrack(previousTrack);
+    this.local.addTrack(replacement.track);
+    this.microphoneInputStream = replacement.inputStream;
+    this.microphoneTrack = replacement.track;
+    this.rnnoiseMicrophone = replacement.rnnoise;
+    this.updateLocalPreview();
+
+    previousInputStream.getTracks().forEach((track) => track.stop());
+    previousTrack.stop();
+    await previousRnnoise?.stop().catch(() => undefined);
+
+    console.info("Risk live microphone settings applied", {
+      deviceId: replacement.inputStream.getAudioTracks()[0]?.getSettings().deviceId ?? "unknown",
+      noiseSuppression: settings.noiseSuppression,
+      echoCancellation: settings.echoCancellation,
+      muted: !this.state.microphone,
+    });
   }
 
   async toggleCamera(_roomId: string): Promise<void> {

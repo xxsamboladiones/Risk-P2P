@@ -1,6 +1,7 @@
 export type NoiseSuppressionMode = "rnnoise" | "standard" | "off";
 
 export type VoiceVideoSettings = {
+  microphoneDeviceId: string;
   noiseSuppression: NoiseSuppressionMode;
   echoCancellation: boolean;
   excludeRiskAudioFromScreenShare: boolean;
@@ -11,8 +12,11 @@ type RiskMediaCaptureOptions = {
 };
 
 const STORAGE_KEY = "risk.voice-video-settings.v1";
+export const VOICE_VIDEO_SETTINGS_EVENT = "risk:voice-video-settings";
+const MAX_DEVICE_ID_LENGTH = 512;
 
 export const DEFAULT_VOICE_VIDEO_SETTINGS: VoiceVideoSettings = {
+  microphoneDeviceId: "",
   noiseSuppression: "standard",
   echoCancellation: true,
   excludeRiskAudioFromScreenShare: true,
@@ -22,6 +26,10 @@ function syncMediaCaptureOptions(settings: VoiceVideoSettings): void {
   (globalThis as typeof globalThis & { __riskMediaCaptureOptions?: RiskMediaCaptureOptions }).__riskMediaCaptureOptions = {
     restrictOwnAudio: settings.excludeRiskAudioFromScreenShare,
   };
+}
+
+function normalizeMicrophoneDeviceId(value: unknown): string {
+  return typeof value === "string" && value.length <= MAX_DEVICE_ID_LENGTH ? value : "";
 }
 
 export function loadVoiceVideoSettings(): VoiceVideoSettings {
@@ -37,6 +45,7 @@ export function loadVoiceVideoSettings(): VoiceVideoSettings {
       ? value.noiseSuppression
       : "standard";
     const settings: VoiceVideoSettings = {
+      microphoneDeviceId: normalizeMicrophoneDeviceId(value.microphoneDeviceId),
       noiseSuppression,
       echoCancellation: value.echoCancellation !== false,
       excludeRiskAudioFromScreenShare: value.excludeRiskAudioFromScreenShare !== false,
@@ -51,7 +60,11 @@ export function loadVoiceVideoSettings(): VoiceVideoSettings {
 }
 
 export function saveVoiceVideoSettings(settings: VoiceVideoSettings): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
-  syncMediaCaptureOptions(settings);
-  window.dispatchEvent(new CustomEvent<VoiceVideoSettings>("risk:voice-video-settings", { detail: settings }));
+  const normalized: VoiceVideoSettings = {
+    ...settings,
+    microphoneDeviceId: normalizeMicrophoneDeviceId(settings.microphoneDeviceId),
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
+  syncMediaCaptureOptions(normalized);
+  window.dispatchEvent(new CustomEvent<VoiceVideoSettings>(VOICE_VIDEO_SETTINGS_EVENT, { detail: normalized }));
 }

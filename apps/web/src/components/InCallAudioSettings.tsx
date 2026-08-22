@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
+import { RefreshCw, X } from "lucide-react";
+import type { CallController } from "../call";
 import {
   loadVoiceVideoSettings,
   saveVoiceVideoSettings,
   type NoiseSuppressionMode,
   type VoiceVideoSettings,
 } from "../services/audio/settings";
-import "./voice-video-settings.css";
+import "./in-call-audio-settings.css";
 
 type MicrophoneOption = {
   deviceId: string;
@@ -20,46 +22,41 @@ function microphoneLabel(device: MediaDeviceInfo, index: number): string {
   return `Microfone ${index + 1}`;
 }
 
-export function VoiceVideoSettingsPanel() {
+export function InCallAudioSettings({ call, onClose }: { call: CallController; onClose(): void }) {
   const [settings, setSettings] = useState<VoiceVideoSettings>(() => loadVoiceVideoSettings());
   const [microphones, setMicrophones] = useState<MicrophoneOption[]>([]);
-  const [loadingMicrophones, setLoadingMicrophones] = useState(false);
-  const [microphoneError, setMicrophoneError] = useState<string | null>(null);
-  const [savedAt, setSavedAt] = useState<number>(() => Date.now());
+  const [busy, setBusy] = useState(false);
+  const [loadingDevices, setLoadingDevices] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   async function refreshMicrophones(requestPermission = false) {
     if (!navigator.mediaDevices?.enumerateDevices) {
-      setMicrophoneError("Este ambiente não permite listar dispositivos de áudio.");
+      setError("Este ambiente não permite listar dispositivos de áudio.");
       return;
     }
-    setLoadingMicrophones(true);
-    setMicrophoneError(null);
+    setLoadingDevices(true);
     let permissionStream: MediaStream | undefined;
     try {
-      if (requestPermission) {
-        permissionStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-      }
+      if (requestPermission) permissionStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
       const devices = await navigator.mediaDevices.enumerateDevices();
       const seen = new Set<string>();
-      const options = devices
+      setMicrophones(devices
         .filter((device) => device.kind === "audioinput" && Boolean(device.deviceId))
         .filter((device) => {
           if (seen.has(device.deviceId)) return false;
           seen.add(device.deviceId);
           return true;
         })
-        .map((device, index) => ({ deviceId: device.deviceId, label: microphoneLabel(device, index) }));
-      setMicrophones(options);
-    } catch (error) {
-      setMicrophoneError(error instanceof Error ? error.message : "Não foi possível listar os microfones.");
+        .map((device, index) => ({ deviceId: device.deviceId, label: microphoneLabel(device, index) })));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível atualizar os microfones.");
     } finally {
       permissionStream?.getTracks().forEach((track) => track.stop());
-      setLoadingMicrophones(false);
+      setLoadingDevices(false);
     }
   }
 
   useEffect(() => {
-    setSettings(loadVoiceVideoSettings());
     void refreshMicrophones(false);
     const mediaDevices = navigator.mediaDevices;
     if (!mediaDevices?.addEventListener) return undefined;
@@ -82,71 +79,79 @@ export function VoiceVideoSettingsPanel() {
     return !microphones.some((device) => device.deviceId === settings.microphoneDeviceId);
   }, [microphones, settings.microphoneDeviceId]);
 
-  function update(patch: Partial<VoiceVideoSettings>) {
+  async function apply(patch: Partial<VoiceVideoSettings>) {
+    if (busy) return;
     const next = { ...settings, ...patch };
-    setSettings(next);
-    saveVoiceVideoSettings(next);
-    setSavedAt(Date.now());
+    setBusy(true);
+    setError(null);
+    try {
+      await call.updateVoiceInput(next);
+      saveVoiceVideoSettings(next);
+      setSettings(next);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível aplicar a configuração de áudio.");
+    } finally {
+      setBusy(false);
+    }
   }
 
-  return <div className="voice-video-settings">
-    <label className="settings-field">
+  return <section className="in-call-audio-settings" aria-label="Configurações de áudio da chamada">
+    <header>
+      <div>
+        <strong>Áudio da chamada</strong>
+        <small>As alterações são aplicadas sem sair da ligação e ficam salvas para as próximas chamadas.</small>
+      </div>
+      <button type="button" onClick={onClose} aria-label="Fechar configurações de áudio"><X size={17}/></button>
+    </header>
+
+    <label>
       <span>Microfone</span>
       <select
         value={settings.microphoneDeviceId}
-        onChange={(event) => update({ microphoneDeviceId: event.target.value })}
+        disabled={busy}
+        onChange={(event) => { void apply({ microphoneDeviceId: event.target.value }); }}
       >
         <option value="">Padrão do sistema</option>
         {selectedMicrophoneMissing && <option value={settings.microphoneDeviceId}>Microfone salvo — indisponível</option>}
         {microphones.map((microphone) => <option key={microphone.deviceId} value={microphone.deviceId}>{microphone.label}</option>)}
       </select>
-      <small>Escolha o dispositivo de entrada usado nas chamadas. Funciona no Windows e Linux. Se o dispositivo salvo estiver desconectado, o Risk usa o microfone padrão como fallback.</small>
     </label>
 
     <button
       type="button"
-      className="settings-secondary-button"
-      disabled={loadingMicrophones}
+      className="audio-refresh"
+      disabled={busy || loadingDevices}
       onClick={() => { void refreshMicrophones(true); }}
     >
-      {loadingMicrophones ? "Atualizando microfones…" : "Atualizar microfones"}
+      <RefreshCw size={14}/>{loadingDevices ? "Atualizando…" : "Atualizar microfones"}
     </button>
-    {microphoneError && <div className="settings-device-error">{microphoneError}</div>}
 
-    <label className="settings-field">
+    <label>
       <span>Supressão de ruído</span>
       <select
         value={settings.noiseSuppression}
-        onChange={(event) => update({ noiseSuppression: event.target.value as NoiseSuppressionMode })}
+        disabled={busy}
+        onChange={(event) => { void apply({ noiseSuppression: event.target.value as NoiseSuppressionMode }); }}
       >
-        <option value="standard">Padrão do WebRTC — recomendado</option>
-        <option value="rnnoise">RNNoise — experimental</option>
+        <option value="standard">Padrão do WebRTC</option>
+        <option value="rnnoise">RNNoise</option>
         <option value="off">Desativada</option>
       </select>
-      <small>O modo padrão é o mais compatível. RNNoise processa a voz localmente em um AudioWorklet e volta automaticamente ao WebRTC se não conseguir iniciar.</small>
     </label>
 
-    <label className="settings-toggle">
+    <label className="audio-toggle">
       <input
         type="checkbox"
         checked={settings.echoCancellation}
-        onChange={(event) => update({ echoCancellation: event.target.checked })}
+        disabled={busy}
+        onChange={(event) => { void apply({ echoCancellation: event.target.checked }); }}
       />
-      <span><strong>Cancelamento de eco</strong><small>Evita que o áudio dos alto-falantes volte pelo microfone.</small></span>
+      <span><strong>Cancelamento de eco</strong><small>Também é reaplicado sem desconectar a chamada.</small></span>
     </label>
 
-    <label className="settings-toggle">
-      <input
-        type="checkbox"
-        checked={settings.excludeRiskAudioFromScreenShare}
-        onChange={(event) => update({ excludeRiskAudioFromScreenShare: event.target.checked })}
-      />
-      <span><strong>Excluir áudio do Risk da transmissão</strong><small>Ao compartilhar a tela, tenta capturar o PC sem retransmitir as vozes reproduzidas pelo próprio Risk.</small></span>
-    </label>
-
-    <div className="settings-note">
-      Configurações salvas automaticamente. Mudanças de microfone e anti-noise entram em vigor na próxima entrada em uma sala de voz; durante uma chamada, use o painel Áudio para aplicá-las sem desconectar. A exclusão do áudio do Risk vale no próximo compartilhamento de tela.
-      <span className="settings-autosave" key={savedAt}>Salvo automaticamente</span>
+    <div className={`audio-apply-status ${busy ? "busy" : ""}`}>
+      {busy ? "Trocando a track de áudio…" : "Configuração atual aplicada e salva"}
     </div>
-  </div>;
+    {error && <div className="audio-apply-error">{error}</div>}
+  </section>;
 }

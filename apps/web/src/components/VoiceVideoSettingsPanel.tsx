@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   loadVoiceVideoSettings,
   saveVoiceVideoSettings,
@@ -7,9 +7,70 @@ import {
 } from "../services/audio/settings";
 import "./voice-video-settings.css";
 
+type MicrophoneOption = {
+  deviceId: string;
+  label: string;
+};
+
+function microphoneLabel(device: MediaDeviceInfo, index: number): string {
+  const label = device.label.trim();
+  if (label) return label;
+  if (device.deviceId === "default") return "Microfone padrão";
+  if (device.deviceId === "communications") return "Dispositivo de comunicação padrão";
+  return `Microfone ${index + 1}`;
+}
+
 export function VoiceVideoSettingsPanel() {
   const [settings, setSettings] = useState<VoiceVideoSettings>(() => loadVoiceVideoSettings());
+  const [microphones, setMicrophones] = useState<MicrophoneOption[]>([]);
+  const [loadingMicrophones, setLoadingMicrophones] = useState(false);
+  const [microphoneError, setMicrophoneError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+
+  async function refreshMicrophones(requestPermission = false) {
+    if (!navigator.mediaDevices?.enumerateDevices) {
+      setMicrophoneError("Este ambiente não permite listar dispositivos de áudio.");
+      return;
+    }
+    setLoadingMicrophones(true);
+    setMicrophoneError(null);
+    let permissionStream: MediaStream | undefined;
+    try {
+      if (requestPermission) {
+        permissionStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      }
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const seen = new Set<string>();
+      const options = devices
+        .filter((device) => device.kind === "audioinput" && Boolean(device.deviceId))
+        .filter((device) => {
+          if (seen.has(device.deviceId)) return false;
+          seen.add(device.deviceId);
+          return true;
+        })
+        .map((device, index) => ({ deviceId: device.deviceId, label: microphoneLabel(device, index) }));
+      setMicrophones(options);
+    } catch (error) {
+      setMicrophoneError(error instanceof Error ? error.message : "Não foi possível listar os microfones.");
+    } finally {
+      permissionStream?.getTracks().forEach((track) => track.stop());
+      setLoadingMicrophones(false);
+    }
+  }
+
+  useEffect(() => {
+    void refreshMicrophones(false);
+    const mediaDevices = navigator.mediaDevices;
+    if (!mediaDevices?.addEventListener) return undefined;
+    const onDeviceChange = () => { void refreshMicrophones(false); };
+    mediaDevices.addEventListener("devicechange", onDeviceChange);
+    return () => mediaDevices.removeEventListener("devicechange", onDeviceChange);
+  }, []);
+
+  const selectedMicrophoneMissing = useMemo(() => {
+    if (!settings.microphoneDeviceId || microphones.length === 0) return false;
+    return !microphones.some((device) => device.deviceId === settings.microphoneDeviceId);
+  }, [microphones, settings.microphoneDeviceId]);
 
   function update(patch: Partial<VoiceVideoSettings>) {
     setSettings((current) => ({ ...current, ...patch }));
@@ -22,6 +83,29 @@ export function VoiceVideoSettingsPanel() {
   }
 
   return <div className="voice-video-settings">
+    <label className="settings-field">
+      <span>Microfone</span>
+      <select
+        value={settings.microphoneDeviceId}
+        onChange={(event) => update({ microphoneDeviceId: event.target.value })}
+      >
+        <option value="">Padrão do sistema</option>
+        {selectedMicrophoneMissing && <option value={settings.microphoneDeviceId}>Microfone salvo — indisponível</option>}
+        {microphones.map((microphone) => <option key={microphone.deviceId} value={microphone.deviceId}>{microphone.label}</option>)}
+      </select>
+      <small>Escolha o dispositivo de entrada usado nas chamadas. Funciona no Windows e Linux. Se o dispositivo salvo estiver desconectado, o Risk usa o microfone padrão como fallback.</small>
+    </label>
+
+    <button
+      type="button"
+      className="settings-secondary-button"
+      disabled={loadingMicrophones}
+      onClick={() => { void refreshMicrophones(true); }}
+    >
+      {loadingMicrophones ? "Atualizando microfones…" : "Atualizar microfones"}
+    </button>
+    {microphoneError && <div className="settings-device-error">{microphoneError}</div>}
+
     <label className="settings-field">
       <span>Supressão de ruído</span>
       <select

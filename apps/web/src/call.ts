@@ -2,6 +2,7 @@ import { MeshWebRTCTransport, WebScreenShareProvider, type PeerConnectionDiagnos
 import type { PeerState } from "@risk/protocol";
 import { useCallStore, type Participant } from "./store";
 import { api } from "./api";
+import { openConfiguredMicrophone } from "./services/audio/microphone";
 import { createRnnoiseMicrophone, type RnnoiseMicrophone } from "./services/audio/rnnoise";
 import { loadVoiceVideoSettings } from "./services/audio/settings";
 import { SupabaseSignalingProvider } from "./services/supabase/signaling";
@@ -228,14 +229,7 @@ export class CallController {
       if (!this.isActive(lifecycle)) throw new DOMException("Entrada na chamada cancelada.", "AbortError");
       this.displayName = profile.displayName;
 
-      const microphoneStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: voiceSettings.echoCancellation,
-          noiseSuppression: voiceSettings.noiseSuppression === "standard",
-          autoGainControl: true,
-          channelCount: 1,
-        },
-      });
+      const microphoneStream = await openConfiguredMicrophone(voiceSettings);
       this.microphoneInputStream = microphoneStream;
       if (!this.isActive(lifecycle)) {
         microphoneStream.getTracks().forEach((track) => track.stop());
@@ -246,6 +240,11 @@ export class CallController {
         microphoneStream.getTracks().forEach((track) => track.stop());
         throw new Error("Nenhum microfone foi disponibilizado pelo navegador.");
       }
+      console.info("Risk microphone capture", {
+        requestedDeviceId: voiceSettings.microphoneDeviceId || "default",
+        deviceId: microphoneInput.getSettings().deviceId ?? "unknown",
+        label: microphoneInput.label || "unknown",
+      });
 
       let microphone = microphoneInput;
       if (voiceSettings.noiseSuppression === "rnnoise") {

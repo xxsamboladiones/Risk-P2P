@@ -12,6 +12,7 @@ type RiskMediaCaptureOptions = {
 };
 
 const STORAGE_KEY = "risk.voice-video-settings.v1";
+export const VOICE_VIDEO_SETTINGS_EVENT = "risk:voice-video-settings";
 const MAX_DEVICE_ID_LENGTH = 512;
 
 export const DEFAULT_VOICE_VIDEO_SETTINGS: VoiceVideoSettings = {
@@ -65,5 +66,5 @@ export function saveVoiceVideoSettings(settings: VoiceVideoSettings): void {
   };
   localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
   syncMediaCaptureOptions(normalized);
-  window.dispatchEvent(new CustomEvent<VoiceVideoSettings>("risk:voice-video-settings", { detail: normalized }));
+  window.dispatchEvent(new CustomEvent<VoiceVideoSettings>(VOICE_VIDEO_SETTINGS_EVENT, { detail: normalized }));
 }

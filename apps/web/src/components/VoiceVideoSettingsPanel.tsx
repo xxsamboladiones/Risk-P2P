@@ -82,12 +82,10 @@ export function VoiceVideoSettingsPanel() {
   }, [microphones, settings.microphoneDeviceId]);
 
   function update(patch: Partial<VoiceVideoSettings>) {
-    setSettings((current) => {
-      const next = { ...current, ...patch };
-      saveVoiceVideoSettings(next);
-      setSavedAt(Date.now());
-      return next;
-    });
+    const next = { ...settings, ...patch };
+    setSettings(next);
+    saveVoiceVideoSettings(next);
+    setSavedAt(Date.now());
   }
 
   return <div className="voice-video-settings">

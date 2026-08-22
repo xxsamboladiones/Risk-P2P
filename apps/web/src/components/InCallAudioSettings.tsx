@@ -65,6 +65,15 @@ export function InCallAudioSettings({ call, onClose }: { call: CallController; o
     return () => mediaDevices.removeEventListener("devicechange", onDeviceChange);
   }, []);
 
+  useEffect(() => {
+    const onSettingsChanged = (event: Event) => {
+      const detail = (event as CustomEvent<VoiceVideoSettings>).detail;
+      if (detail) setSettings(detail);
+    };
+    window.addEventListener("risk:voice-video-settings", onSettingsChanged);
+    return () => window.removeEventListener("risk:voice-video-settings", onSettingsChanged);
+  }, []);
+
   const selectedMicrophoneMissing = useMemo(() => {
     if (!settings.microphoneDeviceId || microphones.length === 0) return false;
     return !microphones.some((device) => device.deviceId === settings.microphoneDeviceId);
@@ -90,7 +99,7 @@ export function InCallAudioSettings({ call, onClose }: { call: CallController; o
     <header>
       <div>
         <strong>Áudio da chamada</strong>
-        <small>As alterações são aplicadas sem sair da ligação.</small>
+        <small>As alterações são aplicadas sem sair da ligação e ficam salvas para as próximas chamadas.</small>
       </div>
       <button type="button" onClick={onClose} aria-label="Fechar configurações de áudio"><X size={17}/></button>
     </header>
@@ -141,7 +150,7 @@ export function InCallAudioSettings({ call, onClose }: { call: CallController; o
     </label>
 
     <div className={`audio-apply-status ${busy ? "busy" : ""}`}>
-      {busy ? "Trocando a track de áudio…" : "Configuração atual aplicada"}
+      {busy ? "Trocando a track de áudio…" : "Configuração atual aplicada e salva"}
     </div>
     {error && <div className="audio-apply-error">{error}</div>}
   </section>;

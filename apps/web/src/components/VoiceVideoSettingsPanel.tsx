@@ -59,6 +59,7 @@ export function VoiceVideoSettingsPanel() {
   }
 
   useEffect(() => {
+    setSettings(loadVoiceVideoSettings());
     void refreshMicrophones(false);
     const mediaDevices = navigator.mediaDevices;
     if (!mediaDevices?.addEventListener) return undefined;

@@ -25,7 +25,7 @@ export function VoiceVideoSettingsPanel() {
   const [microphones, setMicrophones] = useState<MicrophoneOption[]>([]);
   const [loadingMicrophones, setLoadingMicrophones] = useState(false);
   const [microphoneError, setMicrophoneError] = useState<string | null>(null);
-  const [saved, setSaved] = useState(false);
+  const [savedAt, setSavedAt] = useState<number>(() => Date.now());
 
   async function refreshMicrophones(requestPermission = false) {
     if (!navigator.mediaDevices?.enumerateDevices) {
@@ -67,19 +67,27 @@ export function VoiceVideoSettingsPanel() {
     return () => mediaDevices.removeEventListener("devicechange", onDeviceChange);
   }, []);
 
+  useEffect(() => {
+    const onSettingsChanged = (event: Event) => {
+      const detail = (event as CustomEvent<VoiceVideoSettings>).detail;
+      if (detail) setSettings(detail);
+    };
+    window.addEventListener("risk:voice-video-settings", onSettingsChanged);
+    return () => window.removeEventListener("risk:voice-video-settings", onSettingsChanged);
+  }, []);
+
   const selectedMicrophoneMissing = useMemo(() => {
     if (!settings.microphoneDeviceId || microphones.length === 0) return false;
     return !microphones.some((device) => device.deviceId === settings.microphoneDeviceId);
   }, [microphones, settings.microphoneDeviceId]);
 
   function update(patch: Partial<VoiceVideoSettings>) {
-    setSettings((current) => ({ ...current, ...patch }));
-    setSaved(false);
-  }
-
-  function save() {
-    saveVoiceVideoSettings(settings);
-    setSaved(true);
+    setSettings((current) => {
+      const next = { ...current, ...patch };
+      saveVoiceVideoSettings(next);
+      setSavedAt(Date.now());
+      return next;
+    });
   }
 
   return <div className="voice-video-settings">
@@ -137,7 +145,9 @@ export function VoiceVideoSettingsPanel() {
       <span><strong>Excluir áudio do Risk da transmissão</strong><small>Ao compartilhar a tela, tenta capturar o PC sem retransmitir as vozes reproduzidas pelo próprio Risk.</small></span>
     </label>
 
-    <div className="settings-note">Mudanças de microfone entram em vigor na próxima entrada em uma sala de voz. A exclusão do áudio do Risk vale no próximo compartilhamento de tela.</div>
-    <button onClick={save}>{saved ? "Configurações salvas" : "Salvar configurações"}</button>
+    <div className="settings-note">
+      Configurações salvas automaticamente. Mudanças de microfone e anti-noise entram em vigor na próxima entrada em uma sala de voz; durante uma chamada, use o painel Áudio para aplicá-las sem desconectar. A exclusão do áudio do Risk vale no próximo compartilhamento de tela.
+      <span className="settings-autosave" key={savedAt}>Salvo automaticamente</span>
+    </div>
   </div>;
 }

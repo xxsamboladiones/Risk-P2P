@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TransportEvents } from "@risk/rtc";
 import { InMemorySignalingHub, InMemorySignalingProvider } from "../signaling/in-memory";
 import type { LocalIdentity } from "../offline/social-storage";
@@ -20,12 +20,31 @@ class DataTransportHub {
   create(peerId: string, events: TransportEvents): FakeTransport { const transport = new FakeTransport(peerId, events, this); this.transports.set(peerId, transport); return transport; }
 }
 class FakeTransport implements InviteTransport {
-  remote?: string; closed = false;
+  remote?: string; closed = false; readonly dropTypes = new Set<string>();
   constructor(readonly peerId: string, readonly events: TransportEvents, private readonly hub: DataTransportHub) {}
-  async connect(peerId: string): Promise<void> { this.remote = peerId; const other = this.hub.transports.get(peerId); if (other?.remote === this.peerId) queueMicrotask(() => { this.events.onDataState?.(peerId, "open"); other.events.onDataState?.(this.peerId, "open"); }); }
+  async connect(peerId: string): Promise<void> {
+    this.remote = peerId;
+    const other = this.hub.transports.get(peerId);
+    if (other?.remote === this.peerId) queueMicrotask(() => { this.events.onDataState?.(peerId, "open"); other.events.onDataState?.(this.peerId, "open"); });
+  }
   async acceptOffer(): Promise<void> {} async acceptAnswer(): Promise<void> {} async addIceCandidate(): Promise<void> {}
-  sendData(data: string, targetPeerId?: string): number { const target = this.hub.transports.get(targetPeerId ?? this.remote ?? ""); if (!target || target.closed) return 0; queueMicrotask(() => target.events.onDataMessage?.(this.peerId, data)); return 1; }
-  async disconnect(): Promise<void> { this.closed = true; }
+  sendData(data: string, targetPeerId?: string): number {
+    const target = this.hub.transports.get(targetPeerId ?? this.remote ?? "");
+    if (!target || target.closed) return 0;
+    let type = "";
+    try { type = String((JSON.parse(data) as { type?: unknown }).type ?? ""); } catch { /* invalid payload is delivered to parser */ }
+    if (this.dropTypes.has(type)) return 1;
+    queueMicrotask(() => target.events.onDataMessage?.(this.peerId, data));
+    return 1;
+  }
+  async disconnect(peerId?: string): Promise<void> {
+    if (peerId) {
+      if (this.remote === peerId) this.remote = undefined;
+      return;
+    }
+    this.closed = true;
+    this.remote = undefined;
+  }
 }
 
 function dependencies(signalingHub: InMemorySignalingHub, dataHub: DataTransportHub): InviteDependencies {
@@ -34,6 +53,8 @@ function dependencies(signalingHub: InMemorySignalingHub, dataHub: DataTransport
 
 describe("convites P2P descartáveis", () => {
   beforeEach(() => { savedFriends.length = 0; savedGroups.length = 0; members.length = 0; });
+  afterEach(() => { vi.useRealTimers(); });
+
   it("conclui pedido e aceite de amizade pelo DataChannel e limpa o rendezvous", async () => {
     const signaling = new InMemorySignalingHub(); const data = new DataTransportHub(); const deps = dependencies(signaling, data);
     const creator = new FriendInviteService(await identity("Ana"), [], deps); const joiner = new FriendInviteService(await identity("Beto"), [], deps);
@@ -41,7 +62,8 @@ describe("convites P2P descartáveis", () => {
     const invite = await creator.createFriendInvite(); await joiner.joinFriendInvite(invite.code);
     await vi.waitFor(() => expect(incoming).toBe(true)); await creator.accept();
     await vi.waitFor(() => expect(joiner.state?.status).toBe("accepted"));
-    expect(savedFriends).toHaveLength(2); expect(signaling.roomSize(`friend:${await import("./code").then(({ deriveInviteRendezvousId }) => deriveInviteRendezvousId("friend", invite.code))}`)).toBe(0);
+    await vi.waitFor(() => expect(savedFriends).toHaveLength(2));
+    expect(signaling.roomSize(`friend:${await import("./code").then(({ deriveInviteRendezvousId }) => deriveInviteRendezvousId("friend", invite.code))}`)).toBe(0);
   });
 
   it("transmite grupo no aceite e permite recusar sem salvar", async () => {
@@ -50,10 +72,43 @@ describe("convites P2P descartáveis", () => {
     const group = { groupId: crypto.randomUUID(), name: "Jogatina", channels: [{ id: crypto.randomUUID(), name: "geral", kind: "text" as const }] };
     const invite = await creator.createGroupInvite(group); await joiner.joinGroupInvite(invite.code);
     await vi.waitFor(() => expect(creator.state?.status).toBe("approval")); await creator.accept();
-    await vi.waitFor(() => expect(joiner.state?.status).toBe("accepted")); expect(members).toHaveLength(1); expect(savedGroups).toHaveLength(1);
+    await vi.waitFor(() => expect(joiner.state?.status).toBe("accepted"));
+    await vi.waitFor(() => expect(members).toHaveLength(1));
+    expect(savedGroups).toHaveLength(1);
     const creator2 = new FriendInviteService(await identity("C"), [], deps); const joiner2 = new FriendInviteService(await identity("D"), [], deps);
     const second = await creator2.createFriendInvite(); await joiner2.joinFriendInvite(second.code); await vi.waitFor(() => expect(creator2.state?.status).toBe("approval")); await creator2.reject();
     await vi.waitFor(() => expect(joiner2.state?.status).toBe("rejected")); expect(savedFriends).toHaveLength(0);
+  });
+
+  it("não fica preso quando o DataChannel fecha depois de abrir", async () => {
+    const signaling = new InMemorySignalingHub(); const data = new DataTransportHub(); const deps = dependencies(signaling, data);
+    const creator = new FriendInviteService(await identity("Ana"), [], deps); const joiner = new FriendInviteService(await identity("Beto"), [], deps);
+    const invite = await creator.createFriendInvite(); await joiner.joinFriendInvite(invite.code);
+    await vi.waitFor(() => expect(creator.state?.status).toBe("approval"));
+    const [creatorTransport, joinerTransport] = [...data.transports.values()];
+    expect(creatorTransport && joinerTransport).toBeTruthy();
+    creatorTransport!.events.onDataState?.(joinerTransport!.peerId, "closed");
+    joinerTransport!.events.onDataState?.(creatorTransport!.peerId, "closed");
+    await vi.waitFor(() => expect(joiner.state?.status).toBe("error"));
+    expect(["waiting", "connecting"]).toContain(creator.state?.status);
+    await creator.cancel(false);
+  });
+
+  it("volta para aprovação quando uma decisão não recebe confirmação", async () => {
+    const signaling = new InMemorySignalingHub(); const data = new DataTransportHub(); const deps = dependencies(signaling, data);
+    const creator = new FriendInviteService(await identity("Ana"), [], deps); const joiner = new FriendInviteService(await identity("Beto"), [], deps);
+    const invite = await creator.createFriendInvite(); await joiner.joinFriendInvite(invite.code);
+    await vi.waitFor(() => expect(creator.state?.status).toBe("approval"));
+    const creatorTransport = [...data.transports.values()][0]!;
+    creatorTransport.dropTypes.add("friend.accept");
+    vi.useFakeTimers();
+    await creator.accept();
+    expect(creator.state?.status).toBe("confirming");
+    await vi.advanceTimersByTimeAsync(15_100);
+    expect(creator.state?.status).toBe("approval");
+    expect(creator.state?.message).toContain("tentar novamente");
+    vi.useRealTimers();
+    await Promise.all([creator.cancel(false), joiner.cancel(false)]);
   });
 
   it("cancela e executa cleanup de signaling e transporte", async () => {

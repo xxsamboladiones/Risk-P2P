@@ -63,7 +63,8 @@ describe("convites P2P descartáveis", () => {
     await vi.waitFor(() => expect(incoming).toBe(true)); await creator.accept();
     await vi.waitFor(() => expect(joiner.state?.status).toBe("accepted"));
     await vi.waitFor(() => expect(savedFriends).toHaveLength(2));
-    expect(signaling.roomSize(`friend:${await import("./code").then(({ deriveInviteRendezvousId }) => deriveInviteRendezvousId("friend", invite.code))}`)).toBe(0);
+    const rendezvous = await import("./code").then(({ deriveInviteRendezvousId }) => deriveInviteRendezvousId("friend", invite.code));
+    await vi.waitFor(() => expect(signaling.roomSize(`friend:${rendezvous}`)).toBe(0));
   });
 
   it("transmite grupo no aceite e permite recusar sem salvar", async () => {

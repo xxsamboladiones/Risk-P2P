@@ -14,7 +14,11 @@ const temporaryDirectory = await mkdtemp(path.join(tmpdir(), "risk-packaged-orig
 const reportFile = path.join(temporaryDirectory, "origin.json");
 const userDataDirectory = path.join(temporaryDirectory, "profile");
 const args = [`--user-data-dir=${userDataDirectory}`];
-if (process.platform === "linux" && typeof process.getuid === "function" && process.getuid() === 0) {
+// O diretório linux-unpacked do CI não instala chrome-sandbox como root:4755.
+// O bypass vale somente para este processo efêmero de smoke test.
+const linuxNeedsSandboxBypass = process.platform === "linux"
+  && (process.env.CI === "true" || (typeof process.getuid === "function" && process.getuid() === 0));
+if (linuxNeedsSandboxBypass) {
   args.push("--no-sandbox");
 }
 

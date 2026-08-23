@@ -12,6 +12,7 @@
     "build:backend:desktop:debug": "node scripts/prepare-desktop-backend.mjs --debug",
     "build:desktop": "pnpm build:backend:desktop && pnpm build:web && pnpm --filter @risk/desktop build",
     "verify:build-env": "node scripts/verify-build-env.mjs",
+    "verify:packaged-origin": "node scripts/verify-packaged-renderer-origin.mjs",
     "package:win": "pnpm verify:build-env && pnpm build:backend:desktop && pnpm build:web && pnpm --filter @risk/desktop build:win",
     "package:linux": "pnpm verify:build-env && pnpm build:backend:desktop && pnpm build:web && pnpm --filter @risk/desktop build:linux",
     "package:linux:docker": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-linux-docker.ps1",

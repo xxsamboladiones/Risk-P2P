@@ -21,6 +21,7 @@ const PACKAGED_SCHEME = "risk";
 const PACKAGED_HOST = "app";
 const PACKAGED_ORIGIN = `${PACKAGED_SCHEME}://${PACKAGED_HOST}`;
 const PACKAGED_ENTRY_URL = `${PACKAGED_ORIGIN}/index.html`;
+const PACKAGED_ORIGIN_REPORT_FILE = process.env.RISK_PACKAGED_ORIGIN_REPORT_FILE?.trim();
 const DEV_BACKEND_BRIDGE_FILE = path.resolve(root, "../../../.risk/dev-backend.json");
 const WINDOWS_LOOPBACK_WITHOUT_RISK = "loopbackWithoutChrome";
 const APP_ICON_PATH = app.isPackaged
@@ -344,6 +345,7 @@ ipcMain.handle("screen:select", async (event, sourceId: unknown) => {
 });
 
 function createWindow(): void {
+  const reportingPackagedOrigin = app.isPackaged && Boolean(PACKAGED_ORIGIN_REPORT_FILE);
   const window = new BrowserWindow({
     width: 1280,
     height: 800,
@@ -364,10 +366,31 @@ function createWindow(): void {
   window.webContents.on("will-navigate", (event, targetUrl) => {
     if (!isTrustedRendererUrl(targetUrl)) event.preventDefault();
   });
-  window.once("ready-to-show", () => window.show());
+  window.webContents.once("did-finish-load", () => {
+    if (!reportingPackagedOrigin || !PACKAGED_ORIGIN_REPORT_FILE) return;
+    void (async () => {
+      const location = await window.webContents.executeJavaScript(
+        "({ origin: window.location.origin, href: window.location.href })",
+        true,
+      ) as { origin?: unknown; href?: unknown };
+      await writeFile(PACKAGED_ORIGIN_REPORT_FILE, JSON.stringify({
+        packaged: app.isPackaged,
+        origin: location.origin,
+        href: location.href,
+      }), "utf8");
+      app.quit();
+    })().catch((error) => {
+      console.error("Falha ao verificar a origem do renderer empacotado", error);
+      app.exit(1);
+    });
+  });
+  window.once("ready-to-show", () => {
+    if (!reportingPackagedOrigin) window.show();
+  });
   void window.loadURL(pageUrl).catch((error) => {
     console.error("Falha ao carregar a interface do Risk", error);
-    window.show();
+    if (!reportingPackagedOrigin) window.show();
+    else app.exit(1);
   });
 }
 

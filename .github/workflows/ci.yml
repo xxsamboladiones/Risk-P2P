@@ -25,6 +25,8 @@ jobs:
         run: |
           pnpm --filter @risk/desktop exec tsc
           pnpm --filter @risk/desktop exec electron-builder --dir
+      - name: Smoke-test packaged renderer origin
+        run: xvfb-run -a pnpm verify:packaged-origin apps/desktop/release/linux-unpacked/risk
 
   rust:
     runs-on: ubuntu-latest

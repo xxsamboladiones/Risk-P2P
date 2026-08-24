@@ -28,6 +28,8 @@ use tokio::io::AsyncReadExt;
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 use uuid::Uuid;
 
+pub(crate) const MAX_ATTACHMENT_CHUNK_BYTES: usize = 256 * 1024;
+
 const LOCAL_TOKEN_HEADER: &str = "x-risk-desktop-token";
 const ACCESS_TOKEN_TTL_SECONDS: i64 = 12 * 60 * 60;
 
@@ -189,7 +191,10 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .merge(protected)
-        .layer(RequestBodyLimitLayer::new(64 * 1024))
+        // O endpoint binário de anexos aceita chunks de até 256 KiB. O limite
+        // global precisa permitir o mesmo tamanho; os handlers JSON continuam
+        // aplicando suas próprias validações de campos e comprimentos.
+        .layer(RequestBodyLimitLayer::new(MAX_ATTACHMENT_CHUNK_BYTES))
         .layer(
             CorsLayer::new()
                 .allow_origin(web_origin.parse::<HeaderValue>()?)
@@ -382,13 +387,13 @@ async fn send_friend_request(
             .bind(email)
             .fetch_optional(&state.db)
             .await
-            .map_err(internal)?
-            .ok_or_else(|| {
-                ApiError::Bad(
-                    "Usuário local não encontrado. Para outro dispositivo, use convite P2P por código."
-                        .into(),
-                )
-            })?;
+            .map_err(internal)?;
+    let recipient = recipient.ok_or_else(|| {
+        ApiError::Bad(
+            "Usuário local não encontrado. Para outro dispositivo, use convite P2P por código."
+                .into(),
+        )
+    })?;
     if recipient == user {
         return Err(ApiError::Bad("Você não pode adicionar a si mesmo".into()));
     }
@@ -866,5 +871,36 @@ fn map_unique(message: &'static str) -> impl FnOnce(sqlx::Error) -> ApiError {
         } else {
             ApiError::Internal(error.into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_email_and_rejects_invalid_values() {
+        assert_eq!(
+            normalize_email("  USER@Example.COM ").unwrap(),
+            "user@example.com"
+        );
+        assert!(normalize_email("sem-arroba").is_err());
+        assert!(normalize_email(&format!("{}@example.com", "a".repeat(320))).is_err());
+    }
+
+    #[test]
+    fn validates_password_and_display_names() {
+        assert!(validate_password("senha-segura").is_ok());
+        assert!(validate_password("curta").is_err());
+        assert!(validate_name("Risk User", 80, "nome inválido").is_ok());
+        assert!(validate_name(" ", 80, "nome inválido").is_err());
+    }
+
+    #[test]
+    fn canonical_pair_is_order_independent() {
+        let left = Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let right = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        assert_eq!(canonical_pair(left, right), canonical_pair(right, left));
+        assert_eq!(canonical_pair(left, right), (right, left));
     }
 }

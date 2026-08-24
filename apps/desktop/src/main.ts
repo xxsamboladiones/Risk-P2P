@@ -1,7 +1,7 @@
 import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, net, protocol, session } from "electron";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, readFileSync } from "node:fs";
 import { access, mkdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -11,6 +11,43 @@ if (process.platform === "linux") {
   // o cliente Pulse permite que o mixer Linux identifique o Risk mesmo nesse caminho.
   process.env["PULSE_PROP_application.name"] = "Risk";
   process.env["PULSE_PROP_application.id"] = "com.risk.calls";
+}
+
+function shouldUseLinuxSoftwareRendering(): boolean {
+  if (process.platform !== "linux" || process.env.RISK_FORCE_GPU === "1") return false;
+  if (process.env.RISK_DISABLE_GPU === "1") return true;
+
+  const identityFiles = [
+    "/sys/class/dmi/id/sys_vendor",
+    "/sys/class/dmi/id/product_name",
+    "/sys/class/dmi/id/board_vendor",
+  ];
+  const identity = identityFiles.map((file) => {
+    try { return readFileSync(file, "utf8"); }
+    catch { return ""; }
+  }).join(" ").toLocaleLowerCase().replace(/\s+/g, " ");
+
+  return [
+    "vmware",
+    "virtualbox",
+    "qemu",
+    "kvm",
+    "hyper-v",
+    "microsoft corporation virtual machine",
+    "parallels",
+    "bochs",
+    "xen",
+  ]
+    .some((marker) => identity.includes(marker));
+}
+
+if (shouldUseLinuxSoftwareRendering()) {
+  // VMs sem aceleração 3D podem fazer o processo GPU/VA-API do Chromium falhar
+  // antes que a interface seja desenhada. O software rasterizer preserva vídeo,
+  // WebRTC e captura de tela, apenas com menor desempenho gráfico.
+  app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch("disable-features", "VaapiVideoDecoder,VaapiVideoEncoder");
+  console.info("[desktop] Máquina virtual Linux detectada; usando renderização por software.");
 }
 
 app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
@@ -370,13 +407,27 @@ function createWindow(): void {
     if (!reportingPackagedOrigin || !PACKAGED_ORIGIN_REPORT_FILE) return;
     void (async () => {
       const location = await window.webContents.executeJavaScript(
-        "({ origin: window.location.origin, href: window.location.href })",
+        `(async () => {
+          const deadline = Date.now() + 10_000;
+          while ((document.getElementById("root")?.childElementCount ?? 0) === 0 && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          const root = document.getElementById("root");
+          return {
+            origin: window.location.origin,
+            href: window.location.href,
+            rootChildren: root?.childElementCount ?? 0,
+            rootTextLength: root?.textContent?.trim().length ?? 0,
+          };
+        })()`,
         true,
-      ) as { origin?: unknown; href?: unknown };
+      ) as { origin?: unknown; href?: unknown; rootChildren?: unknown; rootTextLength?: unknown };
       await writeFile(PACKAGED_ORIGIN_REPORT_FILE, JSON.stringify({
         packaged: app.isPackaged,
         origin: location.origin,
         href: location.href,
+        rootChildren: location.rootChildren,
+        rootTextLength: location.rootTextLength,
       }), "utf8");
       app.quit();
     })().catch((error) => {

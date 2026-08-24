@@ -120,7 +120,7 @@ O receptor valida canal, UUID da mensagem, tamanho, conteúdo e timestamp. O cam
 
 O transporte rejeita payloads acima de 64 KiB. O chat usa limite menor na validação e mensagens de até 4.000 caracteres. Quando `RTCDataChannel.bufferedAmount` ultrapassa o limite local de segurança, novas mensagens deixam de ser enfileiradas e o envio retorna falha ao chamador.
 
-O conteúdo do chat não passa pelo Supabase. A cópia recebida é salva no IndexedDB local.
+O conteúdo do chat não passa pelo Supabase. No desktop, a cópia recebida é salva no SQLite local do sidecar; no modo web sem sidecar, o fallback usa IndexedDB.
 
 ## Convites temporários
 

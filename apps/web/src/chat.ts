@@ -624,7 +624,10 @@ export class ChatController {
         dataChannelPeers: [...this.dataChannelPeers],
         failedIdentityPeers: [...this.identityHandshakeFailedPeers],
       });
-      this.setStatus("error");
+      // Estar sozinho não é uma falha: Presence e signaling permanecem ativos e
+      // o chat pode ficar pronto assim que outro participante entrar. Reservamos
+      // `error` para falhas reais de signaling/negociação.
+      this.setStatus("connected");
     }, CHAT_READY_TIMEOUT_MS);
   }
 

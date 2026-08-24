@@ -63,7 +63,10 @@ try {
   if (typeof report.href !== "string" || !report.href.startsWith("risk://app/")) {
     throw new Error(`URL empacotada inesperada: ${String(report.href)}.`);
   }
-  console.log(`Renderer empacotado validado em ${report.origin} (${report.href}).`);
+  if (!Number.isInteger(report.rootChildren) || report.rootChildren < 1 || !Number.isInteger(report.rootTextLength) || report.rootTextLength < 1) {
+    throw new Error("A origem foi carregada, mas o React não renderizou conteúdo. Possível tela preta no pacote.");
+  }
+  console.log(`Renderer empacotado e interface React validados em ${report.origin} (${report.href}).`);
 } catch (error) {
   if (stdout.trim()) console.error(`stdout do aplicativo:\n${stdout.trim()}`);
   if (stderr.trim()) console.error(`stderr do aplicativo:\n${stderr.trim()}`);

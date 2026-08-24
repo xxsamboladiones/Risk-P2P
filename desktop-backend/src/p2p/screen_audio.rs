@@ -80,13 +80,13 @@ async fn prepare(Json(input): Json<PrepareInput>) -> Json<PrepareResponse> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = input.exclude_risk;
-        return Json(PrepareResponse {
+        Json(PrepareResponse {
             mode: "display",
             source_name: None,
             source_label: None,
             excluded_risk: false,
             reason: None,
-        });
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -202,7 +202,12 @@ async fn start_pipewire(exclude_risk: bool) -> anyhow::Result<()> {
         loopback: child,
         reconcile_task,
     });
-    tracing::info!(exclude_risk, risk_root_pid, source = MIX_SOURCE_NAME, "PipeWire screen audio active");
+    tracing::info!(
+        exclude_risk,
+        risk_root_pid,
+        source = MIX_SOURCE_NAME,
+        "PipeWire screen audio active"
+    );
     Ok(())
 }
 
@@ -247,7 +252,9 @@ async fn wait_for_mix_nodes(
         if let Some(status) = child.try_wait()? {
             let detail = stderr_summary(stderr_lines).await;
             if detail.is_empty() {
-                anyhow::bail!("pw-loopback encerrou antes de publicar os nós virtuais do Risk ({status})");
+                anyhow::bail!(
+                    "pw-loopback encerrou antes de publicar os nós virtuais do Risk ({status})"
+                );
             }
             anyhow::bail!(
                 "pw-loopback encerrou antes de publicar os nós virtuais do Risk ({status}): {detail}"
@@ -464,20 +471,13 @@ fn is_mix_sink(object: &PwObject) -> bool {
 
 #[cfg(target_os = "linux")]
 fn is_mix_source(object: &PwObject) -> bool {
-    matches_virtual_node(
-        object,
-        MIX_SOURCE_NAME,
-        MIX_SOURCE_LABEL,
-        "Audio/Source",
-    )
+    matches_virtual_node(object, MIX_SOURCE_NAME, MIX_SOURCE_LABEL, "Audio/Source")
 }
 
 #[cfg(target_os = "linux")]
 fn is_playback_stream(object: &PwObject) -> bool {
-    matches!(
-        object.prop_str("media.class"),
-        Some("Stream/Output/Audio")
-    ) || matches!(object.prop_str("media.category"), Some("Playback"))
+    matches!(object.prop_str("media.class"), Some("Stream/Output/Audio"))
+        || matches!(object.prop_str("media.category"), Some("Playback"))
 }
 
 #[cfg(target_os = "linux")]
@@ -526,8 +526,8 @@ fn is_descendant_or_self(mut pid: u32, root: u32) -> bool {
 
 #[cfg(target_os = "linux")]
 fn parent_pid(pid: u32) -> Option<u32> {
-    let stat = std::fs::read_to_string(PathBuf::from("/proc").join(pid.to_string()).join("stat"))
-        .ok()?;
+    let stat =
+        std::fs::read_to_string(PathBuf::from("/proc").join(pid.to_string()).join("stat")).ok()?;
     let close = stat.rfind(')')?;
     let fields: Vec<&str> = stat.get(close + 1..)?.split_whitespace().collect();
     fields.get(1)?.parse().ok()

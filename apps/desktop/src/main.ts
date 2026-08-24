@@ -1,12 +1,10 @@
-import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, session } from "electron";
+import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, net, protocol, session } from "electron";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { constants as fsConstants, createReadStream } from "node:fs";
-import { access, mkdir, stat, unlink, writeFile } from "node:fs/promises";
-import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { constants as fsConstants, readFileSync } from "node:fs";
+import { access, mkdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 if (process.platform === "linux") {
   // pipewire-pulse pode expor o PID do daemon em vez do PID do cliente. Marcar
@@ -15,16 +13,76 @@ if (process.platform === "linux") {
   process.env["PULSE_PROP_application.id"] = "com.risk.calls";
 }
 
+function shouldUseLinuxSoftwareRendering(): boolean {
+  if (process.platform !== "linux" || process.env.RISK_FORCE_GPU === "1") return false;
+  if (process.env.RISK_DISABLE_GPU === "1") return true;
+
+  const identityFiles = [
+    "/sys/class/dmi/id/sys_vendor",
+    "/sys/class/dmi/id/product_name",
+    "/sys/class/dmi/id/board_vendor",
+  ];
+  const identity = identityFiles.map((file) => {
+    try { return readFileSync(file, "utf8"); }
+    catch { return ""; }
+  }).join(" ").toLocaleLowerCase().replace(/\s+/g, " ");
+
+  return [
+    "vmware",
+    "virtualbox",
+    "qemu",
+    "kvm",
+    "hyper-v",
+    "microsoft corporation virtual machine",
+    "parallels",
+    "bochs",
+    "xen",
+  ]
+    .some((marker) => identity.includes(marker));
+}
+
+if (shouldUseLinuxSoftwareRendering()) {
+  // VMs sem aceleração 3D podem fazer o processo GPU/VA-API do Chromium falhar
+  // antes que a interface seja desenhada. O software rasterizer preserva vídeo,
+  // WebRTC e captura de tela, apenas com menor desempenho gráfico.
+  app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch("disable-features", "VaapiVideoDecoder,VaapiVideoEncoder");
+  console.info("[desktop] Máquina virtual Linux detectada; usando renderização por software.");
+}
+
 app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const DEVELOPMENT_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:5173"]);
-const DESKTOP_HOST = "127.0.0.1";
+const PACKAGED_SCHEME = "risk";
+const PACKAGED_HOST = "app";
+const PACKAGED_ORIGIN = `${PACKAGED_SCHEME}://${PACKAGED_HOST}`;
+const PACKAGED_ENTRY_URL = `${PACKAGED_ORIGIN}/index.html`;
+const PACKAGED_ORIGIN_REPORT_FILE = process.env.RISK_PACKAGED_ORIGIN_REPORT_FILE?.trim();
 const DEV_BACKEND_BRIDGE_FILE = path.resolve(root, "../../../.risk/dev-backend.json");
 const WINDOWS_LOOPBACK_WITHOUT_RISK = "loopbackWithoutChrome";
 const APP_ICON_PATH = app.isPackaged
   ? path.join(process.resourcesPath, "icon.png")
   : path.resolve(root, "../build/icon.png");
+
+// A versão empacotada precisa de uma origem estável. O servidor HTTP anterior usava
+// uma porta aleatória em cada inicialização, criando uma origem nova e, portanto,
+// outro IndexedDB/localStorage. A identidade ECDSA do P2P acabava podendo mudar.
+// Um esquema standard mantém Web Storage/IndexedDB habilitados; secure preserva o
+// contexto seguro necessário às APIs de mídia do Chromium.
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: PACKAGED_SCHEME,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      corsEnabled: true,
+      stream: true,
+      codeCache: true,
+    },
+  },
+]);
 
 type CapturableSource = Awaited<ReturnType<typeof desktopCapturer.getSources>>[number];
 type PendingDisplaySelection = {
@@ -34,9 +92,7 @@ type PendingDisplaySelection = {
   source?: CapturableSource;
 };
 
-let assetServer: Server | undefined;
 let pageUrl = "http://localhost:5173";
-let packagedOrigin = "";
 let pendingDisplaySelection: PendingDisplaySelection | undefined;
 const knownDisplaySources = new Map<string, PendingDisplaySelection>();
 let backendProcess: ChildProcess | undefined;
@@ -47,11 +103,35 @@ if (!hasSingleInstanceLock) app.quit();
 
 function isTrustedRendererUrl(value: string): boolean {
   try {
-    const origin = new URL(value).origin;
-    return app.isPackaged ? origin === packagedOrigin : DEVELOPMENT_ORIGINS.has(origin);
+    const parsed = new URL(value);
+    if (app.isPackaged) return parsed.protocol === `${PACKAGED_SCHEME}:` && parsed.host === PACKAGED_HOST;
+    return DEVELOPMENT_ORIGINS.has(parsed.origin);
   } catch {
     return false;
   }
+}
+
+async function registerPackagedProtocol(): Promise<void> {
+  const webRoot = path.resolve(process.resourcesPath, "web");
+  await protocol.handle(PACKAGED_SCHEME, async (request) => {
+    try {
+      const requestUrl = new URL(request.url);
+      if (requestUrl.host !== PACKAGED_HOST) return new Response("Not found", { status: 404 });
+
+      const decodedPath = decodeURIComponent(requestUrl.pathname);
+      const relativePath = decodedPath === "/" ? "index.html" : decodedPath.replace(/^\/+/, "");
+      const filePath = path.resolve(webRoot, relativePath);
+      const relative = path.relative(webRoot, filePath);
+      if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        return new Response("Forbidden", { status: 403 });
+      }
+
+      return await net.fetch(pathToFileURL(filePath).toString());
+    } catch (error) {
+      console.warn("Falha ao servir recurso do bundle Risk", { url: request.url, error });
+      return new Response("Not found", { status: 404 });
+    }
+  });
 }
 
 async function publishDevBackendBridge(config: { baseUrl: string; token: string }): Promise<void> {
@@ -68,65 +148,6 @@ async function clearDevBackendBridge(): Promise<void> {
   await unlink(DEV_BACKEND_BRIDGE_FILE).catch((error: NodeJS.ErrnoException) => {
     if (error.code !== "ENOENT") console.warn("Falha ao remover bridge temporário do backend", error);
   });
-}
-
-function contentType(filePath: string): string {
-  switch (path.extname(filePath).toLowerCase()) {
-    case ".html": return "text/html; charset=utf-8";
-    case ".js": return "text/javascript; charset=utf-8";
-    case ".css": return "text/css; charset=utf-8";
-    case ".json": return "application/json; charset=utf-8";
-    case ".wasm": return "application/wasm";
-    case ".svg": return "image/svg+xml";
-    case ".png": return "image/png";
-    case ".jpg": case ".jpeg": return "image/jpeg";
-    case ".webp": return "image/webp";
-    case ".ico": return "image/x-icon";
-    case ".woff2": return "font/woff2";
-    default: return "application/octet-stream";
-  }
-}
-
-async function startPackagedWebServer(): Promise<string> {
-  if (assetServer && packagedOrigin) return packagedOrigin;
-  const webRoot = path.resolve(process.resourcesPath, "web");
-  assetServer = createServer(async (request, response) => {
-    try {
-      const requestUrl = new URL(request.url ?? "/", "http://localhost");
-      const decodedPath = decodeURIComponent(requestUrl.pathname);
-      const relativePath = decodedPath === "/" ? "index.html" : decodedPath.replace(/^\/+/, "");
-      const filePath = path.resolve(webRoot, relativePath);
-      if (filePath !== webRoot && !filePath.startsWith(`${webRoot}${path.sep}`)) {
-        response.writeHead(403).end("Forbidden");
-        return;
-      }
-      const metadata = await stat(filePath);
-      if (!metadata.isFile()) {
-        response.writeHead(404).end("Not found");
-        return;
-      }
-      response.writeHead(200, {
-        "content-type": contentType(filePath),
-        "cache-control": filePath.endsWith("index.html") ? "no-store" : "public, max-age=31536000, immutable",
-        "x-content-type-options": "nosniff",
-      });
-      if (request.method === "HEAD") response.end();
-      else createReadStream(filePath).pipe(response);
-    } catch {
-      response.writeHead(404).end("Not found");
-    }
-  });
-  await new Promise<void>((resolve, reject) => {
-    assetServer!.once("error", reject);
-    assetServer!.listen(0, DESKTOP_HOST, () => {
-      assetServer!.off("error", reject);
-      resolve();
-    });
-  });
-  const address = assetServer.address() as AddressInfo | null;
-  if (!address) throw new Error("Servidor local da interface não informou uma porta.");
-  packagedOrigin = `http://${DESKTOP_HOST}:${address.port}`;
-  return packagedOrigin;
 }
 
 function backendExecutableName(): string {
@@ -361,6 +382,7 @@ ipcMain.handle("screen:select", async (event, sourceId: unknown) => {
 });
 
 function createWindow(): void {
+  const reportingPackagedOrigin = app.isPackaged && Boolean(PACKAGED_ORIGIN_REPORT_FILE);
   const window = new BrowserWindow({
     width: 1280,
     height: 800,
@@ -381,10 +403,45 @@ function createWindow(): void {
   window.webContents.on("will-navigate", (event, targetUrl) => {
     if (!isTrustedRendererUrl(targetUrl)) event.preventDefault();
   });
-  window.once("ready-to-show", () => window.show());
+  window.webContents.once("did-finish-load", () => {
+    if (!reportingPackagedOrigin || !PACKAGED_ORIGIN_REPORT_FILE) return;
+    void (async () => {
+      const location = await window.webContents.executeJavaScript(
+        `(async () => {
+          const deadline = Date.now() + 10_000;
+          while ((document.getElementById("root")?.childElementCount ?? 0) === 0 && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          const root = document.getElementById("root");
+          return {
+            origin: window.location.origin,
+            href: window.location.href,
+            rootChildren: root?.childElementCount ?? 0,
+            rootTextLength: root?.textContent?.trim().length ?? 0,
+          };
+        })()`,
+        true,
+      ) as { origin?: unknown; href?: unknown; rootChildren?: unknown; rootTextLength?: unknown };
+      await writeFile(PACKAGED_ORIGIN_REPORT_FILE, JSON.stringify({
+        packaged: app.isPackaged,
+        origin: location.origin,
+        href: location.href,
+        rootChildren: location.rootChildren,
+        rootTextLength: location.rootTextLength,
+      }), "utf8");
+      app.quit();
+    })().catch((error) => {
+      console.error("Falha ao verificar a origem do renderer empacotado", error);
+      app.exit(1);
+    });
+  });
+  window.once("ready-to-show", () => {
+    if (!reportingPackagedOrigin) window.show();
+  });
   void window.loadURL(pageUrl).catch((error) => {
     console.error("Falha ao carregar a interface do Risk", error);
-    window.show();
+    if (!reportingPackagedOrigin) window.show();
+    else app.exit(1);
   });
 }
 
@@ -397,9 +454,15 @@ if (hasSingleInstanceLock) {
   });
 
   app.whenReady().then(async () => {
-    if (!app.isPackaged) await clearDevBackendBridge();
-    pageUrl = app.isPackaged ? await startPackagedWebServer() : "http://localhost:5173";
-    backendConfig = await startBackend(pageUrl);
+    if (app.isPackaged) {
+      await registerPackagedProtocol();
+      pageUrl = PACKAGED_ENTRY_URL;
+    } else {
+      await clearDevBackendBridge();
+      pageUrl = "http://localhost:5173";
+    }
+    const webOrigin = app.isPackaged ? PACKAGED_ORIGIN : pageUrl;
+    backendConfig = await startBackend(webOrigin);
     await publishDevBackendBridge(backendConfig);
     session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
       callback(isTrustedRendererUrl(webContents.getURL()) && ["media", "display-capture", "fullscreen"].includes(permission));
@@ -460,8 +523,6 @@ app.on("before-quit", () => {
   knownDisplaySources.clear();
   void clearDevBackendBridge();
   stopBackend();
-  assetServer?.close();
-  assetServer = undefined;
 });
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();

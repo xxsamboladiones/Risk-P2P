@@ -1227,3 +1227,35 @@ async fn turn_credentials(
         ]
     })))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_email_and_rejects_invalid_values() {
+        assert_eq!(
+            normalize_email("  USER@Example.COM ").unwrap(),
+            "user@example.com"
+        );
+        assert!(normalize_email("sem-arroba").is_err());
+        assert!(normalize_email(&format!("{}@example.com", "a".repeat(320))).is_err());
+    }
+
+    #[test]
+    fn validates_account_fields() {
+        assert!(validate_display_name("Risk User").is_ok());
+        assert!(validate_display_name(" ").is_err());
+        assert!(validate_password("senha-segura").is_ok());
+        assert!(validate_password("curta").is_err());
+    }
+
+    #[test]
+    fn refresh_token_hash_is_deterministic_and_not_plaintext() {
+        let token = "risk-refresh-token";
+        let first = token_hash(token);
+        assert_eq!(first, token_hash(token));
+        assert_ne!(first, token);
+        assert_eq!(first.len(), 64);
+    }
+}

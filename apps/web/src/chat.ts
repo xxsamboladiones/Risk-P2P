@@ -117,6 +117,8 @@ const MAX_GROUP_SYNC_MEMBERS = 128;
 const LIVE_MESSAGE_MAX_AGE_MS = 120_000;
 const FUTURE_CLOCK_SKEW_MS = 30_000;
 const IDENTITY_HANDSHAKE_RETRY_MS = 1_200;
+const IDENTITY_HANDSHAKE_TIMEOUT_MS = 12_000;
+const CHAT_READY_TIMEOUT_MS = 15_000;
 
 export class ChatController {
   private signaling?: SignalingProvider;
@@ -136,6 +138,8 @@ export class ChatController {
   private readonly verifyKeys = new Map<string, Promise<CryptoKey>>();
   private readonly pendingIdentityChallenges = new Map<string, string>();
   private readonly identityHandshakeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly identityHandshakeStartedAt = new Map<string, number>();
+  private readonly identityHandshakeFailedPeers = new Set<string>();
   private readonly historyRequests = new Map<string, string>();
   private readonly messageCallbacks = new Set<(message: LocalChatMessage) => void>();
   private readonly statusCallbacks = new Set<(status: ChatConnectionStatus) => void>();
@@ -144,6 +148,7 @@ export class ChatController {
   private unsubscribers: Array<() => void> = [];
   private refreshingMembers?: Promise<void>;
   private sessionToken?: object;
+  private readyTimer?: ReturnType<typeof setTimeout>;
 
   constructor(private readonly createSignaling: () => SignalingProvider = () => new SupabaseSignalingProvider()) {}
 
@@ -207,6 +212,7 @@ export class ChatController {
         if (this.sessionToken !== sessionToken) return;
         if (state === "open") {
           this.dataChannelPeers.add(remotePeerId);
+          this.identityHandshakeFailedPeers.delete(remotePeerId);
           if (this.identity) void this.beginIdentityHandshake(remotePeerId);
           else this.markPeerReady(remotePeerId);
         } else {
@@ -244,7 +250,10 @@ export class ChatController {
       await signaling.connect(channelId, this.peerId, options.namespace ?? "chat");
       if (this.sessionToken !== sessionToken) throw new DOMException("Conexão do chat substituída por outra sessão.", "AbortError");
       this.setStatus("connected");
+      this.armReadyTimeout(sessionToken);
       await signaling.sendPeerProfile(this.displayName);
+      if (this.groupId) await this.refreshGroupMembership(false);
+      else await this.connectPresentTrustedPeers();
     } catch (error) {
       if (this.sessionToken === sessionToken) await this.disconnect();
       if (!(error instanceof DOMException && error.name === "AbortError")) this.setStatus("error");
@@ -268,12 +277,15 @@ export class ChatController {
     this.peerId = undefined;
     this.identity = undefined;
     this.refreshingMembers = undefined;
+    this.clearReadyTimeout();
     this.dataChannelPeers.clear();
     this.openDataPeers.clear();
     this.peerNames.clear();
     this.trustedPeers.clear();
     this.verifyKeys.clear();
     this.pendingIdentityChallenges.clear();
+    this.identityHandshakeStartedAt.clear();
+    this.identityHandshakeFailedPeers.clear();
     this.historyRequests.clear();
     this.processed.clear();
     for (const timer of this.identityHandshakeTimers.values()) clearTimeout(timer);
@@ -398,7 +410,16 @@ export class ChatController {
         if (!this.isTrustedRemote(peer.peerId)) {
           if (this.groupId) {
             void this.refreshGroupMembership(true).then(() => {
-              if (this.isTrustedRemote(peer.peerId)) void this.connectTrustedPeer(peer.peerId, peerId);
+              if (this.isTrustedRemote(peer.peerId)) {
+                void this.connectTrustedPeer(peer.peerId, peerId);
+              } else if (this.openDataPeers.size === 0) {
+                console.warn("Peer presente no chat não corresponde a uma identidade confiável do grupo", {
+                  remotePeerId: peer.peerId,
+                  localPeerId: this.peerId,
+                  channelId: this.channelId,
+                  trustedPeerIds: [...this.trustedPeers.keys()],
+                });
+              }
             });
           }
           return;
@@ -428,6 +449,11 @@ export class ChatController {
         if (!this.peerNames.has(message.fromPeerId)) this.peerNames.set(message.fromPeerId, message.payload.displayName);
       }),
       signaling.onStatusChange((status) => {
+        if (status === "connected" && this.openDataPeers.size === 0) {
+          this.setStatus("connected");
+          if (this.sessionToken) this.armReadyTimeout(this.sessionToken);
+          void (this.groupId ? this.refreshGroupMembership(false) : this.connectPresentTrustedPeers());
+        }
         if (status === "reconnecting" && this.openDataPeers.size === 0) this.setStatus("connecting");
         if (status === "error" && this.openDataPeers.size === 0) this.setStatus("error");
       }),
@@ -436,8 +462,10 @@ export class ChatController {
 
   private async connectTrustedPeer(remotePeerId: string, localPeerId = this.peerId): Promise<void> {
     if (!localPeerId || !this.transport || !this.isTrustedRemote(remotePeerId)) return;
-    await this.transport.connect(remotePeerId, localPeerId < remotePeerId).catch(() => {
+    await this.transport.connect(remotePeerId, localPeerId < remotePeerId).catch((error) => {
+      console.warn("Falha ao conectar peer confiável do chat", { remotePeerId, error });
       this.setStatus(this.openDataPeers.size ? "ready" : "connected");
+      if (this.sessionToken && this.openDataPeers.size === 0) this.armReadyTimeout(this.sessionToken);
     });
     await this.signaling?.sendPeerProfile(this.displayName).catch(() => undefined);
   }
@@ -449,16 +477,26 @@ export class ChatController {
 
   private forgetPeerConnection(remotePeerId: string): void {
     this.clearIdentityHandshake(remotePeerId);
+    this.identityHandshakeFailedPeers.delete(remotePeerId);
     this.dataChannelPeers.delete(remotePeerId);
     this.openDataPeers.delete(remotePeerId);
     this.pendingIdentityChallenges.delete(remotePeerId);
     this.historyRequests.delete(remotePeerId);
     this.attachmentService?.forgetPeer(remotePeerId);
-    this.setStatus(this.openDataPeers.size > 0 ? "ready" : this.dataChannelPeers.size > 0 ? "connected" : "connected");
+    this.setStatus(this.openDataPeers.size > 0 ? "ready" : "connected");
+    if (this.sessionToken && this.openDataPeers.size === 0) this.armReadyTimeout(this.sessionToken);
   }
 
   private async beginIdentityHandshake(remotePeerId: string): Promise<void> {
-    if (!this.identity || !this.channelId || !this.transport || !this.dataChannelPeers.has(remotePeerId) || !this.isTrustedRemote(remotePeerId) || this.openDataPeers.has(remotePeerId)) return;
+    if (!this.identity || !this.channelId || !this.transport || !this.dataChannelPeers.has(remotePeerId) || !this.isTrustedRemote(remotePeerId) || this.openDataPeers.has(remotePeerId) || this.identityHandshakeFailedPeers.has(remotePeerId)) return;
+    const now = Date.now();
+    const startedAt = this.identityHandshakeStartedAt.get(remotePeerId) ?? now;
+    this.identityHandshakeStartedAt.set(remotePeerId, startedAt);
+    if (now - startedAt >= IDENTITY_HANDSHAKE_TIMEOUT_MS) {
+      this.failIdentityHandshake(remotePeerId, "timeout");
+      return;
+    }
+
     const nonce = this.pendingIdentityChallenges.get(remotePeerId) ?? crypto.randomUUID();
     const challenge: IdentityChallengeWireMessage = {
       version: 2,
@@ -466,7 +504,7 @@ export class ChatController {
       channelId: this.channelId,
       fromPeerId: this.identity.peerId,
       nonce,
-      timestamp: Date.now(),
+      timestamp: now,
     };
     this.pendingIdentityChallenges.set(remotePeerId, nonce);
     this.transport.sendData(JSON.stringify(challenge), remotePeerId);
@@ -474,21 +512,51 @@ export class ChatController {
   }
 
   private scheduleIdentityHandshake(remotePeerId: string): void {
-    this.clearIdentityHandshake(remotePeerId);
-    if (!this.identity || !this.transport || !this.dataChannelPeers.has(remotePeerId) || this.openDataPeers.has(remotePeerId)) return;
+    this.clearIdentityHandshakeTimer(remotePeerId);
+    if (!this.identity || !this.transport || !this.dataChannelPeers.has(remotePeerId) || this.openDataPeers.has(remotePeerId) || this.identityHandshakeFailedPeers.has(remotePeerId)) return;
+    const startedAt = this.identityHandshakeStartedAt.get(remotePeerId) ?? Date.now();
+    this.identityHandshakeStartedAt.set(remotePeerId, startedAt);
+    const remaining = IDENTITY_HANDSHAKE_TIMEOUT_MS - (Date.now() - startedAt);
+    if (remaining <= 0) {
+      this.failIdentityHandshake(remotePeerId, "timeout");
+      return;
+    }
     const timer = setTimeout(() => {
       this.identityHandshakeTimers.delete(remotePeerId);
-      if (this.dataChannelPeers.has(remotePeerId) && !this.openDataPeers.has(remotePeerId)) {
-        void this.beginIdentityHandshake(remotePeerId);
+      if (!this.dataChannelPeers.has(remotePeerId) || this.openDataPeers.has(remotePeerId)) return;
+      if (Date.now() - startedAt >= IDENTITY_HANDSHAKE_TIMEOUT_MS) {
+        this.failIdentityHandshake(remotePeerId, "timeout");
+        return;
       }
-    }, IDENTITY_HANDSHAKE_RETRY_MS);
+      void this.beginIdentityHandshake(remotePeerId);
+    }, Math.min(IDENTITY_HANDSHAKE_RETRY_MS, remaining));
     this.identityHandshakeTimers.set(remotePeerId, timer);
   }
 
-  private clearIdentityHandshake(remotePeerId: string): void {
+  private clearIdentityHandshakeTimer(remotePeerId: string): void {
     const timer = this.identityHandshakeTimers.get(remotePeerId);
     if (timer) clearTimeout(timer);
     this.identityHandshakeTimers.delete(remotePeerId);
+  }
+
+  private clearIdentityHandshake(remotePeerId: string): void {
+    this.clearIdentityHandshakeTimer(remotePeerId);
+    this.identityHandshakeStartedAt.delete(remotePeerId);
+  }
+
+  private failIdentityHandshake(remotePeerId: string, reason: "timeout" | "invalid-proof"): void {
+    this.clearIdentityHandshake(remotePeerId);
+    this.pendingIdentityChallenges.delete(remotePeerId);
+    this.identityHandshakeFailedPeers.add(remotePeerId);
+    console.warn("Autenticação de identidade do chat P2P não foi concluída", {
+      reason,
+      remotePeerId,
+      localPeerId: this.peerId,
+      channelId: this.channelId,
+      trustedPeer: this.trustedPeers.has(remotePeerId),
+      presencePeers: this.signaling?.getDiagnostics().presencePeers ?? [],
+    });
+    if (this.openDataPeers.size === 0) this.setStatus("error");
   }
 
   private async respondIdentityChallenge(remotePeerId: string, challenge: IdentityChallengeWireMessage): Promise<void> {
@@ -507,7 +575,7 @@ export class ChatController {
       signature: await this.signCanonical(canonicalIdentityProof(unsigned)),
     };
     this.transport.sendData(JSON.stringify(proof), remotePeerId);
-    if (!this.openDataPeers.has(remotePeerId) && !this.pendingIdentityChallenges.has(remotePeerId)) {
+    if (!this.openDataPeers.has(remotePeerId) && !this.pendingIdentityChallenges.has(remotePeerId) && !this.identityHandshakeFailedPeers.has(remotePeerId)) {
       void this.beginIdentityHandshake(remotePeerId);
     }
   }
@@ -518,23 +586,54 @@ export class ChatController {
     if (!expectedNonce || proof.nonce !== expectedNonce) return;
     if (!(await this.verifyCanonical(remotePeerId, proof.signature, canonicalIdentityProof(proof)))) {
       console.warn("Prova de identidade P2P inválida", { remotePeerId });
+      this.failIdentityHandshake(remotePeerId, "invalid-proof");
       return;
     }
     this.pendingIdentityChallenges.delete(remotePeerId);
     this.clearIdentityHandshake(remotePeerId);
+    this.identityHandshakeFailedPeers.delete(remotePeerId);
     this.markPeerReady(remotePeerId);
   }
 
   private markPeerReady(remotePeerId: string): void {
     if (!this.dataChannelPeers.has(remotePeerId) || this.openDataPeers.has(remotePeerId)) return;
     this.clearIdentityHandshake(remotePeerId);
+    this.identityHandshakeFailedPeers.delete(remotePeerId);
     this.openDataPeers.add(remotePeerId);
+    this.clearReadyTimeout();
     this.setStatus("ready");
     void (async () => {
       await this.sendGroupMembership(remotePeerId);
       await this.requestHistory(remotePeerId);
       await this.attachmentService?.peerReady(remotePeerId);
     })();
+  }
+
+  private armReadyTimeout(sessionToken: object): void {
+    this.clearReadyTimeout();
+    if (this.openDataPeers.size > 0 || this.sessionToken !== sessionToken) return;
+    this.readyTimer = setTimeout(() => {
+      this.readyTimer = undefined;
+      if (this.sessionToken !== sessionToken || this.openDataPeers.size > 0) return;
+      const diagnostics = this.signaling?.getDiagnostics();
+      console.warn("Tempo esgotado aguardando chat P2P ficar pronto", {
+        channelId: this.channelId,
+        localPeerId: this.peerId,
+        presencePeers: diagnostics?.presencePeers ?? [],
+        trustedPeerIds: [...this.trustedPeers.keys()],
+        dataChannelPeers: [...this.dataChannelPeers],
+        failedIdentityPeers: [...this.identityHandshakeFailedPeers],
+      });
+      // Estar sozinho não é uma falha: Presence e signaling permanecem ativos e
+      // o chat pode ficar pronto assim que outro participante entrar. Reservamos
+      // `error` para falhas reais de signaling/negociação.
+      this.setStatus("connected");
+    }, CHAT_READY_TIMEOUT_MS);
+  }
+
+  private clearReadyTimeout(): void {
+    if (this.readyTimer) clearTimeout(this.readyTimer);
+    this.readyTimer = undefined;
   }
 
   private async receive(remotePeerId: string, raw: string): Promise<void> {

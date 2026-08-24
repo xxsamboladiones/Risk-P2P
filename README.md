@@ -23,6 +23,8 @@
 
 No Windows, o compartilhamento de tela pode capturar o áudio do sistema usando o caminho nativo do Electron. No Linux existe um caminho experimental via PipeWire para compartilhar áudio do sistema sem retransmitir o próprio áudio reproduzido pelo Risk; quando esse caminho não está disponível, o compartilhamento continua somente com vídeo.
 
+Em máquinas virtuais Linux conhecidas (VMware, VirtualBox, QEMU/KVM, Hyper-V e Parallels), o Risk ativa automaticamente renderização por software para evitar falhas do Chromium quando a aceleração 3D não está disponível. É possível forçar esse comportamento com `RISK_DISABLE_GPU=1` ou manter a GPU com `RISK_FORCE_GPU=1`.
+
 ## Como o Risk funciona
 
 O desktop é entregue como **um único aplicativo**, mas internamente possui dois processos:
@@ -127,9 +129,11 @@ Quando o Electron inicia:
 4. o backend abre/cria o SQLite e executa migrations;
 5. escolhe uma porta loopback livre;
 6. o Electron valida `/health`;
-7. a janela do Risk é aberta.
+7. registra e carrega a origem persistente `risk://app`;
+8. a janela do Risk é aberta.
 
 A API local escuta apenas em `127.0.0.1` e, exceto por `/health`, exige `X-Risk-Desktop-Token`.
+Os arquivos da interface empacotada são servidos pelo protocolo seguro `risk://app`; não existe uma segunda porta HTTP para os assets.
 
 ## Configuração
 
@@ -238,8 +242,9 @@ pnpm test
 ```
 
 A CI valida TypeScript, testes Web/P2P, build Web, Electron e o código Rust dos backends.
+O backend desktop também é verificado no Windows para cobrir os caminhos específicos de captura de áudio desse sistema.
 
-## Alpha 0.2.0
+## Destaques da versão Alpha atual
 
 Esta versão adiciona e melhora principalmente:
 

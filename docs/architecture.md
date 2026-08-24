@@ -7,9 +7,9 @@ O Risk Desktop usa Electron para a aplicação principal, React no renderer e um
 │                                                                      │
 │  Electron Main                                                       │
 │      │                                                               │
-│      ├── frontend React                                              │
+│      ├── frontend React em risk://app                                │
 │      │       │                                                       │
-│      │       └── HTTP local + token efêmero                         │
+│      │       └── HTTP loopback + token efêmero para o sidecar       │
 │      │                                                               │
 │      └── risk-desktop-backend                                        │
 │              │                                                       │
@@ -29,7 +29,7 @@ O Risk Desktop usa Electron para a aplicação principal, React no renderer e um
 
 Na inicialização:
 
-1. o Electron escolhe/abre uma origem HTTP local para os assets;
+1. o Electron registra a origem estável e segura `risk://app` para os assets;
 2. gera `RISK_LOCAL_TOKEN` aleatório;
 3. inicia o sidecar;
 4. fornece `RISK_DATA_DIR=app.getPath("userData")`;
@@ -38,7 +38,7 @@ Na inicialização:
 7. o sidecar escreve `RISK_BACKEND_READY {"url":"http://127.0.0.1:..."}`;
 8. Electron valida `/health` e só então cria a janela.
 
-O endpoint é dinâmico. Não existe uma porta fixa obrigatória para o backend ou para o servidor de assets do aplicativo empacotado.
+O endpoint HTTP do backend é dinâmico e usa uma porta loopback livre. Os assets não abrem servidor HTTP: são servidos pelo protocolo `risk://app`, mantendo a mesma origem entre inicializações e preservando IndexedDB/localStorage.
 
 Toda rota da API local, exceto `/health`, exige `X-Risk-Desktop-Token`. O token é criado novamente a cada execução e entregue ao renderer somente pelo preload/IPC.
 

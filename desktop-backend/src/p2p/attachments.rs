@@ -1,4 +1,4 @@
-use super::super::{ApiError, AppState};
+use super::super::{ApiError, AppState, MAX_ATTACHMENT_CHUNK_BYTES};
 use axum::{
     body::{Body, Bytes},
     extract::Path,
@@ -18,7 +18,6 @@ use tokio::{
 use tokio_util::io::ReaderStream;
 
 const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024 * 1024;
-const MAX_CHUNK_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,7 +82,7 @@ async fn write_chunk(
         return Err(ApiError::Bad("Índice de chunk inválido".into()));
     }
     let expected = expected_chunk_size(&manifest, index)?;
-    if body.len() != expected || body.len() > MAX_CHUNK_BYTES {
+    if body.len() != expected || body.len() > MAX_ATTACHMENT_CHUNK_BYTES {
         return Err(ApiError::Bad("Tamanho do chunk inválido".into()));
     }
     let directory = transfer_dir(&transfer_id)?;
@@ -120,7 +119,9 @@ async fn finalize(Path(transfer_id): Path<String>) -> Result<Json<Value>, ApiErr
             .await
             .map_err(|_| ApiError::Bad(format!("Chunk {index} ausente")))?;
         if chunk.len() != expected_chunk_size(&manifest, index)? {
-            return Err(ApiError::Bad(format!("Chunk {index} possui tamanho inválido")));
+            return Err(ApiError::Bad(format!(
+                "Chunk {index} possui tamanho inválido"
+            )));
         }
         total = total
             .checked_add(chunk.len() as u64)
@@ -145,7 +146,9 @@ async fn finalize(Path(transfer_id): Path<String>) -> Result<Json<Value>, ApiErr
     if fs::try_exists(&final_path).await.map_err(internal)? {
         fs::remove_file(&final_path).await.map_err(internal)?;
     }
-    fs::rename(&temporary_path, &final_path).await.map_err(internal)?;
+    fs::rename(&temporary_path, &final_path)
+        .await
+        .map_err(internal)?;
     fs::write(
         destination_directory.join("manifest.json"),
         serde_json::to_vec(&manifest).map_err(internal)?,
@@ -174,7 +177,9 @@ async fn content(Path(attachment_id): Path<String>) -> Result<Response, ApiError
     let manifest: AttachmentDiskManifest = serde_json::from_slice(&encoded).map_err(internal)?;
     validate_manifest(&manifest)?;
     let filename = sanitize_filename(&manifest.filename);
-    let file = File::open(directory.join(filename)).await.map_err(internal)?;
+    let file = File::open(directory.join(filename))
+        .await
+        .map_err(internal)?;
     let mut builder = Response::builder().status(StatusCode::OK);
     if let Ok(value) = HeaderValue::from_str(&manifest.mime_type) {
         builder = builder.header(header::CONTENT_TYPE, value);
@@ -215,10 +220,12 @@ fn validate_manifest(manifest: &AttachmentDiskManifest) -> Result<(), ApiError> 
         || manifest.mime_type.len() > 127
         || manifest.size > MAX_ATTACHMENT_BYTES
         || manifest.chunk_size == 0
-        || manifest.chunk_size as usize > MAX_CHUNK_BYTES
+        || manifest.chunk_size as usize > MAX_ATTACHMENT_CHUNK_BYTES
         || manifest.chunk_count != manifest.size.div_ceil(manifest.chunk_size)
         || !is_sha256(&manifest.content_hash)
-        || !manifest.attachment_id.eq_ignore_ascii_case(&manifest.content_hash)
+        || !manifest
+            .attachment_id
+            .eq_ignore_ascii_case(&manifest.content_hash)
     {
         return Err(ApiError::Bad("Manifesto de anexo inválido".into()));
     }
@@ -256,7 +263,9 @@ fn sanitize_filename(value: &str) -> String {
         .trim()
         .chars()
         .map(|character| {
-            if character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
+            if character.is_control()
+                || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+            {
                 '_'
             } else {
                 character
@@ -289,4 +298,33 @@ fn content_dir(attachment_id: &str) -> Result<PathBuf, ApiError> {
 
 fn internal(error: impl Into<anyhow::Error>) -> ApiError {
     ApiError::Internal(error.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(chunk_size: u64) -> AttachmentDiskManifest {
+        AttachmentDiskManifest {
+            attachment_id: "a".repeat(64),
+            filename: "foto.png".into(),
+            mime_type: "image/png".into(),
+            size: chunk_size,
+            chunk_size,
+            chunk_count: 1,
+            content_hash: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn validates_the_same_maximum_chunk_size_as_the_http_layer() {
+        assert!(validate_manifest(&manifest(MAX_ATTACHMENT_CHUNK_BYTES as u64)).is_ok());
+        assert!(validate_manifest(&manifest(MAX_ATTACHMENT_CHUNK_BYTES as u64 + 1)).is_err());
+    }
+
+    #[test]
+    fn sanitizes_paths_and_windows_unsafe_characters() {
+        assert_eq!(sanitize_filename("../pasta/foto?.png"), "foto_.png");
+        assert_eq!(sanitize_filename("..."), "attachment");
+    }
 }

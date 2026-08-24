@@ -13,9 +13,8 @@ const resilientDesktopInviteDependencies: InviteDependencies = {
   createTransport: (peerId, iceServers, events) => new MeshWebRTCTransport(peerId, iceServers, {
     ...events,
     // MeshWebRTCTransport executa ICE restart quando a conexão entra em `failed`.
-    // O InviteService antigo tratava esse estado como terminal e fechava o peer
-    // antes do restart conseguir negociar. No desktop deixamos o transporte
-    // recuperar; `closed` e o timeout do convite continuam encerrando falhas reais.
+    // O serviço mantém seus próprios timeouts e também reage ao fechamento real
+    // do DataChannel, então deixamos o transporte tentar a recuperação primeiro.
     onConnectionState: (remotePeerId, state) => {
       if (state === "failed") return;
       events.onConnectionState(remotePeerId, state);
@@ -33,12 +32,32 @@ export function P2PInvitePanel({ type, token, displayName, group, initialMode = 
   const [code, setCode] = useState(""); const [state, setState] = useState<InviteSnapshot>();
   const [request, setRequest] = useState<IncomingInviteRequest>(); const [error, setError] = useState("");
   const [copied, setCopied] = useState(false); const [now, setNow] = useState(Date.now());
+  const [busy, setBusy] = useState(false);
   const service = useRef<InviteService | undefined>(undefined);
-  useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1_000); return () => { window.clearInterval(timer); void service.current?.cancel(false); }; }, []);
-  useEffect(() => { if (state?.status === "accepted") onComplete?.(); }, [state?.status, onComplete]);
+  const completedInvite = useRef<string | undefined>(undefined);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => {
+      window.clearInterval(timer);
+      const current = service.current;
+      service.current = undefined;
+      void current?.cancel(false);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (state?.status !== "accepted") return;
+    const key = `${state.type}:${state.code}`;
+    if (completedInvite.current === key) return;
+    completedInvite.current = key;
+    onComplete?.();
+  }, [state?.code, state?.status, state?.type, onComplete]);
 
   async function getService(): Promise<InviteService> {
-    await service.current?.cancel(false);
+    const previous = service.current;
+    service.current = undefined;
+    await previous?.cancel(false);
     const identityPromise = getOrCreateLocalIdentity(displayName);
     // O sidecar desktop local não possui credenciais TURN dinâmicas e seu endpoint
     // /rtc/credentials responde 503 de propósito. Para convites no Electron usamos
@@ -53,12 +72,71 @@ export function P2PInvitePanel({ type, token, displayName, group, initialMode = 
     const next = type === "friend"
       ? new FriendInviteService(identity, iceServers, dependencies)
       : new GroupInviteService(identity, iceServers, dependencies);
-    next.onState(setState); next.onRequest(setRequest); service.current = next; return next;
+    next.onState(setState);
+    next.onRequest(setRequest);
+    service.current = next;
+    return next;
   }
-  async function create() { setError(""); setRequest(undefined); try { const next = await getService(); if (type === "friend") await next.createInvite("friend"); else await next.createInvite("group", group); } catch (cause) { setError(friendly(cause)); } }
-  async function join(event: React.FormEvent) { event.preventDefault(); setError(""); setRequest(undefined); try { const next = await getService(); await next.joinInvite(type, code); } catch (cause) { setError(friendly(cause)); } }
-  async function decide(accept: boolean) { setError(""); try { if (accept) await service.current?.accept(); else await service.current?.reject(); } catch (cause) { setError(friendly(cause)); } }
-  async function cancel() { await service.current?.cancel(); setRequest(undefined); }
+
+  async function runAction(action: () => Promise<void>): Promise<void> {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await action();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function create() {
+    await runAction(async () => {
+      setError("");
+      setRequest(undefined);
+      completedInvite.current = undefined;
+      try {
+        const next = await getService();
+        if (type === "friend") await next.createInvite("friend");
+        else await next.createInvite("group", group);
+      } catch (cause) {
+        setError(friendly(cause));
+      }
+    });
+  }
+
+  async function join(event: React.FormEvent) {
+    event.preventDefault();
+    await runAction(async () => {
+      setError("");
+      setRequest(undefined);
+      completedInvite.current = undefined;
+      try {
+        const next = await getService();
+        await next.joinInvite(type, code);
+      } catch (cause) {
+        setError(friendly(cause));
+      }
+    });
+  }
+
+  async function decide(accept: boolean) {
+    await runAction(async () => {
+      setError("");
+      try {
+        if (accept) await service.current?.accept();
+        else await service.current?.reject();
+      } catch (cause) {
+        setError(friendly(cause));
+      }
+    });
+  }
+
+  async function cancel() {
+    await runAction(async () => {
+      await service.current?.cancel();
+      setRequest(undefined);
+    });
+  }
+
   async function copy() {
     if (!state) return;
     setError("");
@@ -70,20 +148,25 @@ export function P2PInvitePanel({ type, token, displayName, group, initialMode = 
       setError("Não foi possível copiar o código automaticamente. Selecione o código acima e use Ctrl+C.");
     }
   }
-  const remaining = Math.max(0, Math.ceil(((state?.expiresAt ?? now) - now) / 1000));
 
+  const remaining = Math.max(0, Math.ceil(((state?.expiresAt ?? now) - now) / 1000));
   const canCreate = type === "friend" || Boolean(group);
   const terminal = state && ["accepted", "rejected", "expired", "cancelled", "error"].includes(state.status);
+  const active = Boolean(state && !terminal);
+
   return <div className="p2p-invite">
-    <div className="invite-tabs"><button disabled={!canCreate} className={mode === "create" ? "active" : ""} onClick={() => setMode("create")}>Criar convite</button><button className={mode === "join" ? "active" : ""} onClick={() => setMode("join")}>Usar código</button></div>
-    {!state && mode === "create" && <div className="invite-start"><Link2/><p>{type === "friend" ? "Crie um código temporário para outra pessoa adicionar você." : group ? `Crie um código temporário para entrar em ${group.name}.` : "Selecione primeiro o grupo que receberá o novo membro."}</p><button disabled={!canCreate} onClick={() => void create()}>Criar convite P2P</button></div>}
-    {!state && mode === "join" && <form className="invite-code-form" onSubmit={(event) => void join(event)}><label>Código de convite</label><input value={code} onChange={(event) => setCode(event.target.value)} onBlur={() => setCode((current) => normalizeRiskInviteCode(current))} placeholder="risk-____-____-____-____" autoComplete="off" maxLength={256}/><button>Conectar por WebRTC</button></form>}
+    <div className="invite-tabs">
+      <button disabled={!canCreate || busy || active} className={mode === "create" ? "active" : ""} onClick={() => setMode("create")}>Criar convite</button>
+      <button disabled={busy || active} className={mode === "join" ? "active" : ""} onClick={() => setMode("join")}>Usar código</button>
+    </div>
+    {!state && mode === "create" && <div className="invite-start"><Link2/><p>{type === "friend" ? "Crie um código temporário para outra pessoa adicionar você." : group ? `Crie um código temporário para entrar em ${group.name}.` : "Selecione primeiro o grupo que receberá o novo membro."}</p><button disabled={!canCreate || busy} onClick={() => void create()}>{busy ? "Preparando…" : "Criar convite P2P"}</button></div>}
+    {!state && mode === "join" && <form className="invite-code-form" onSubmit={(event) => void join(event)}><label>Código de convite</label><input disabled={busy} value={code} onChange={(event) => setCode(event.target.value)} onBlur={() => setCode((current) => normalizeRiskInviteCode(current))} placeholder="risk-____-____-____-____" autoComplete="off" maxLength={256}/><button disabled={busy}>{busy ? "Conectando…" : "Conectar por WebRTC"}</button></form>}
     {state && <div className={`invite-progress ${state.status}`}>
-      {state.role === "creator" && <><small>Compartilhe somente este código</small><strong className="invite-code">{state.code}</strong><button className="copy-code" onClick={() => void copy()}>{copied ? <Check/> : <Clipboard/>}{copied ? "Código copiado!" : "Copiar código"}</button><span>Expira em {Math.floor(remaining / 60)}:{String(remaining % 60).padStart(2, "0")}</span></>}
+      {state.role === "creator" && <><small>Compartilhe somente este código</small><strong className="invite-code">{state.code}</strong><button className="copy-code" disabled={busy} onClick={() => void copy()}>{copied ? <Check/> : <Clipboard/>}{copied ? "Código copiado!" : "Copiar código"}</button><span>Expira em {Math.floor(remaining / 60)}:{String(remaining % 60).padStart(2, "0")}</span></>}
       <p>{state.message}</p>
-      {request && state.status === "approval" && <div className="incoming-request"><div className="avatar">{request.identity.displayName[0]?.toUpperCase()}</div><div><strong>{request.identity.displayName}</strong><small>{type === "friend" ? "quer adicionar você" : `quer entrar em ${group?.name ?? "seu grupo"}`}</small></div><button className="reject" onClick={() => void decide(false)}><X/>Recusar</button><button onClick={() => void decide(true)}><Check/>Aceitar</button></div>}
-      {!terminal && <button className="cancel-invite" onClick={() => void cancel()}>Cancelar convite</button>}
-      {terminal && <button onClick={() => { setState(undefined); setRequest(undefined); setError(""); }}>Novo convite</button>}
+      {request && state.status === "approval" && <div className="incoming-request"><div className="avatar">{request.identity.displayName[0]?.toUpperCase()}</div><div><strong>{request.identity.displayName}</strong><small>{type === "friend" ? "quer adicionar você" : `quer entrar em ${group?.name ?? "seu grupo"}`}</small></div><button className="reject" disabled={busy} onClick={() => void decide(false)}><X/>Recusar</button><button disabled={busy} onClick={() => void decide(true)}><Check/>Aceitar</button></div>}
+      {!terminal && <button className="cancel-invite" disabled={busy} onClick={() => void cancel()}>{busy ? "Aguarde…" : "Cancelar convite"}</button>}
+      {terminal && <button disabled={busy} onClick={() => { setState(undefined); setRequest(undefined); setError(""); completedInvite.current = undefined; }}>Novo convite</button>}
     </div>}
     {error && <div className="invite-notice error">{error}</div>}
     <small className="privacy-note">O Supabase só ajuda os peers a se encontrarem. A solicitação e os dados sociais passam pelo WebRTC e ficam neste dispositivo.</small>

@@ -73,6 +73,7 @@
       "icon": "build/icon.ico"
     },
     "linux": {
+      "executableName": "risk",
       "target": [
         "AppImage",
         "deb"

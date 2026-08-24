@@ -25,8 +25,10 @@ import {
 } from "./protocol";
 
 export const DEFAULT_INVITE_TTL_MS = 10 * 60 * 1000;
-const CANDIDATE_CONNECT_TIMEOUT_MS = 15_000;
-const DECISION_ACK_TIMEOUT_MS = 5_000;
+const CANDIDATE_CONNECT_TIMEOUT_MS = 20_000;
+const DECISION_ACK_TIMEOUT_MS = 15_000;
+const FINAL_ACK_GRACE_MS = 400;
+const CREATOR_RETRY_DELAY_MS = 1_000;
 const sharedAttemptLimiter = new InviteAttemptLimiter();
 
 export type InviteStatus =
@@ -103,6 +105,7 @@ export class InviteService {
   private availabilityTimer?: ReturnType<typeof setTimeout>;
   private candidateTimer?: ReturnType<typeof setTimeout>;
   private decisionTimer?: ReturnType<typeof setTimeout>;
+  private creatorRetryTimer?: ReturnType<typeof setTimeout>;
   private unsubscribers: Array<() => void> = [];
   private readonly stateListeners = new Set<(snapshot: InviteSnapshot) => void>();
   private readonly requestListeners = new Set<(request: IncomingInviteRequest) => void>();
@@ -163,31 +166,19 @@ export class InviteService {
     if (this.snapshot?.role !== "creator" || !this.request || !this.candidatePeerId) {
       throw new Error("Não há solicitação aguardando aprovação.");
     }
-    const type = this.snapshot.type === "friend" ? "friend.accept" : "group.join.accept";
-    await this.send(
-      type,
-      this.request.requestId,
-      this.snapshot.type === "group" ? this.group : undefined,
-    );
-    this.pendingDecision = "accept";
-    this.update("confirming", "Aceite enviado. Aguardando confirmação do outro dispositivo…");
-    this.armDecisionTimeout();
+    await this.sendDecision("accept");
   }
 
   async reject(): Promise<void> {
     if (this.snapshot?.role !== "creator" || !this.request || !this.candidatePeerId) return;
-    const type = this.snapshot.type === "friend" ? "friend.reject" : "group.join.reject";
-    await this.send(type, this.request.requestId);
-    this.pendingDecision = "reject";
-    this.update("confirming", "Recusa enviada. Aguardando confirmação…");
-    this.armDecisionTimeout();
+    await this.sendDecision("reject");
   }
 
   async cancel(markCancelled = true): Promise<void> {
     if (
       markCancelled
       && this.snapshot
-      && !["accepted", "rejected", "expired"].includes(this.snapshot.status)
+      && !isTerminalStatus(this.snapshot.status)
     ) {
       this.update("cancelled", "Convite cancelado");
     }
@@ -211,6 +202,8 @@ export class InviteService {
       message: role === "creator" ? "Aguardando alguém entrar…" : "Procurando convite…",
     };
     this.pendingDecision = undefined;
+    this.request = undefined;
+    this.requestId = undefined;
     this.emitState();
     this.localPeerId = crypto.randomUUID();
     this.signaling = this.dependencies.createSignaling();
@@ -231,6 +224,7 @@ export class InviteService {
     }
 
     this.expiryTimer = this.dependencies.setTimer(() => {
+      if (!this.snapshot || isTerminalStatus(this.snapshot.status)) return;
       this.update("expired", "Convite expirado");
       void this.cleanup();
     }, ttlMs);
@@ -243,6 +237,8 @@ export class InviteService {
         }
       }, Math.min(12_000, ttlMs));
     }
+
+    this.reconcilePresentCandidates();
     return this.snapshot;
   }
 
@@ -250,21 +246,13 @@ export class InviteService {
     const signaling = this.signaling!;
     this.unsubscribers.push(
       signaling.onPeerJoined((peer) => {
-        if (!this.snapshot || this.candidatePeerId === peer.peerId || this.candidatePeerId) return;
-        this.candidatePeerId = peer.peerId;
-        if (this.availabilityTimer) this.dependencies.clearTimer(this.availabilityTimer);
-        this.availabilityTimer = undefined;
-        this.update("connecting", "Negociando conexão P2P…");
-        this.armCandidateTimeout(peer.peerId);
-        void this.transport!
-          .connect(peer.peerId, this.snapshot.role === "creator")
-          .catch(() => this.failCandidate(peer.peerId));
+        this.considerCandidate(peer.peerId);
       }),
       signaling.onPeerLeft((peerId) => {
         if (
           peerId === this.candidatePeerId
           && this.snapshot
-          && !["accepted", "rejected", "expired", "cancelled"].includes(this.snapshot.status)
+          && !isTerminalStatus(this.snapshot.status)
         ) {
           void this.failCandidate(peerId);
         }
@@ -300,21 +288,17 @@ export class InviteService {
       sendIce: (peerId, candidate) => this.signaling!.sendIceCandidate(peerId, candidate),
       onRemoteStream: () => undefined,
       onConnectionState: (peerId, state) => {
-        if ((state === "failed" || state === "closed") && this.snapshot?.status !== "accepted") {
+        if ((state === "failed" || state === "closed") && this.snapshot && !isTerminalStatus(this.snapshot.status)) {
           void this.failCandidate(peerId);
         }
       },
       onDataState: (peerId, state) => {
-        if (peerId !== this.candidatePeerId || state !== "open" || !this.snapshot) return;
-        this.clearCandidateTimeout();
-        this.update("connected", "Conexão P2P estabelecida");
-        if (this.snapshot.role === "joiner") {
-          this.requestId = crypto.randomUUID();
-          const type = this.snapshot.type === "friend" ? "friend.request" : "group.join.request";
-          void this.send(type, this.requestId)
-            .then(() => this.update("approval", "Solicitação enviada. Aguardando aprovação…"))
-            .catch(() => this.failCurrent("Não foi possível enviar a solicitação."));
+        if (peerId !== this.candidatePeerId || !this.snapshot || isTerminalStatus(this.snapshot.status)) return;
+        if (state === "open") {
+          this.handleDataChannelOpen(peerId);
+          return;
         }
+        if (state === "closed") void this.failCandidate(peerId);
       },
       onDataMessage: (peerId, data) => {
         if (peerId === this.candidatePeerId) {
@@ -327,9 +311,33 @@ export class InviteService {
     };
   }
 
+  private handleDataChannelOpen(peerId: string): void {
+    if (!this.snapshot || peerId !== this.candidatePeerId || isTerminalStatus(this.snapshot.status)) return;
+    this.clearCandidateTimeout();
+    if (this.snapshot.role === "creator") {
+      if (["waiting", "connecting"].includes(this.snapshot.status)) {
+        this.update("connected", "Conexão P2P estabelecida");
+      }
+      return;
+    }
+
+    const requestId = this.requestId ?? crypto.randomUUID();
+    this.requestId = requestId;
+    if (this.snapshot.status === "connecting") {
+      this.update("connected", "Conexão P2P estabelecida");
+    }
+    const type = this.snapshot.type === "friend" ? "friend.request" : "group.join.request";
+    void this.send(type, requestId)
+      .then(() => {
+        if (!this.snapshot || this.snapshot.role !== "joiner" || this.requestId !== requestId || isTerminalStatus(this.snapshot.status)) return;
+        this.update("approval", "Solicitação enviada. Aguardando aprovação…");
+      })
+      .catch(() => this.failCurrent("Não foi possível enviar a solicitação."));
+  }
+
   private async receive(raw: string): Promise<void> {
     const message = await parseAndVerifyInviteMessage(raw, this.dependencies.now());
-    if (!message || !this.snapshot) return;
+    if (!message || !this.snapshot || isTerminalStatus(this.snapshot.status)) return;
     const expectedRequest = this.snapshot.type === "friend" ? "friend.request" : "group.join.request";
 
     if (this.snapshot.role === "creator") {
@@ -341,6 +349,7 @@ export class InviteService {
       ) {
         const decision = this.pendingDecision;
         this.pendingDecision = undefined;
+        this.clearDecisionTimeout();
         if (decision === "accept") {
           const remote = this.request.identity;
           if (this.snapshot.type === "friend") {
@@ -360,7 +369,11 @@ export class InviteService {
         return;
       }
 
-      if (message.type !== expectedRequest || this.request || this.pendingDecision) return;
+      if (message.type !== expectedRequest || this.pendingDecision) return;
+      if (this.request) {
+        if (this.request.requestId === message.requestId && this.request.identity.peerId === message.identity.peerId) return;
+        return;
+      }
       this.request = {
         requestId: message.requestId,
         identity: message.identity,
@@ -409,6 +422,41 @@ export class InviteService {
     }
   }
 
+  private async sendDecision(decision: "accept" | "reject"): Promise<void> {
+    if (this.snapshot?.role !== "creator" || !this.request || !this.candidatePeerId) {
+      throw new Error("Não há solicitação aguardando aprovação.");
+    }
+    if (this.pendingDecision) throw new Error("Já existe uma decisão aguardando confirmação.");
+
+    const type = decision === "accept"
+      ? this.snapshot.type === "friend" ? "friend.accept" : "group.join.accept"
+      : this.snapshot.type === "friend" ? "friend.reject" : "group.join.reject";
+    const requestId = this.request.requestId;
+    this.pendingDecision = decision;
+    this.update(
+      "confirming",
+      decision === "accept"
+        ? "Aceite enviado. Aguardando confirmação do outro dispositivo…"
+        : "Recusa enviada. Aguardando confirmação…",
+    );
+    this.armDecisionTimeout();
+
+    try {
+      await this.send(
+        type,
+        requestId,
+        decision === "accept" && this.snapshot.type === "group" ? this.group : undefined,
+      );
+    } catch (error) {
+      this.clearDecisionTimeout();
+      this.pendingDecision = undefined;
+      if (this.snapshot && !isTerminalStatus(this.snapshot.status)) {
+        this.update("approval", "Não foi possível entregar a decisão. Tente novamente.");
+      }
+      throw error;
+    }
+  }
+
   private async send(
     type: SignedInviteMessage["type"],
     requestId: string,
@@ -444,6 +492,27 @@ export class InviteService {
       : new Error("Não foi possível confirmar o convite.");
   }
 
+  private considerCandidate(peerId: string): void {
+    if (!this.snapshot || !this.transport || isTerminalStatus(this.snapshot.status)) return;
+    if (this.candidatePeerId === peerId || this.candidatePeerId) return;
+    if (this.snapshot.role === "creator" && !["waiting", "connecting"].includes(this.snapshot.status)) return;
+    if (this.snapshot.role === "joiner" && this.snapshot.status !== "connecting") return;
+
+    this.candidatePeerId = peerId;
+    this.clearAvailabilityTimeout();
+    this.update("connecting", "Negociando conexão P2P…");
+    this.armCandidateTimeout(peerId);
+    void this.transport
+      .connect(peerId, this.snapshot.role === "creator")
+      .catch(() => this.failCandidate(peerId));
+  }
+
+  private reconcilePresentCandidates(): void {
+    if (!this.signaling || this.candidatePeerId || !this.snapshot || isTerminalStatus(this.snapshot.status)) return;
+    const peerId = this.signaling.getDiagnostics().presencePeers[0];
+    if (peerId) this.considerCandidate(peerId);
+  }
+
   private armCandidateTimeout(peerId: string): void {
     this.clearCandidateTimeout();
     const remaining = Math.max(
@@ -466,19 +535,37 @@ export class InviteService {
     this.candidateTimer = undefined;
   }
 
+  private clearAvailabilityTimeout(): void {
+    if (this.availabilityTimer) this.dependencies.clearTimer(this.availabilityTimer);
+    this.availabilityTimer = undefined;
+  }
+
   private armDecisionTimeout(): void {
-    if (this.decisionTimer) this.dependencies.clearTimer(this.decisionTimer);
+    this.clearDecisionTimeout();
     this.decisionTimer = this.dependencies.setTimer(() => {
-      if (this.snapshot?.status === "confirming") {
-        this.pendingDecision = undefined;
-        this.failCurrent("O outro dispositivo não confirmou a operação. Tente novamente.");
+      if (this.snapshot?.status !== "confirming") return;
+      this.pendingDecision = undefined;
+      if (this.request && this.candidatePeerId) {
+        this.update("approval", "O outro dispositivo não confirmou. Você pode tentar novamente.");
+      } else {
+        this.failCurrent("A conexão foi perdida antes da confirmação.");
       }
     }, DECISION_ACK_TIMEOUT_MS);
   }
 
+  private clearDecisionTimeout(): void {
+    if (this.decisionTimer) this.dependencies.clearTimer(this.decisionTimer);
+    this.decisionTimer = undefined;
+  }
+
   private acceptCandidate(peerId: string): boolean {
+    if (!this.snapshot || !this.transport || isTerminalStatus(this.snapshot.status)) return false;
     if (!this.candidatePeerId) {
       this.candidatePeerId = peerId;
+      this.clearAvailabilityTimeout();
+      if (["waiting", "connecting"].includes(this.snapshot.status)) {
+        this.update("connecting", "Negociando conexão P2P…");
+      }
       this.armCandidateTimeout(peerId);
     }
     return this.candidatePeerId === peerId;
@@ -486,23 +573,33 @@ export class InviteService {
 
   private async failCandidate(peerId: string): Promise<void> {
     if (peerId !== this.candidatePeerId || !this.snapshot) return;
-    if (["accepted", "rejected", "expired", "cancelled"].includes(this.snapshot.status)) return;
+    if (isTerminalStatus(this.snapshot.status)) return;
     this.clearCandidateTimeout();
+    this.clearDecisionTimeout();
     await this.transport?.disconnect(peerId).catch(() => undefined);
     this.candidatePeerId = undefined;
     this.request = undefined;
     this.requestId = undefined;
     this.pendingDecision = undefined;
     if (this.snapshot.role === "creator" && this.dependencies.now() < this.snapshot.expiresAt) {
-      this.update("waiting", "Aguardando alguém entrar…");
+      this.update("waiting", "Conexão perdida. Aguardando o participante reconectar…");
+      this.scheduleCreatorRetry();
     } else {
       this.update("error", "Não foi possível estabelecer conexão.");
       await this.cleanup();
     }
   }
 
+  private scheduleCreatorRetry(): void {
+    if (this.creatorRetryTimer) this.dependencies.clearTimer(this.creatorRetryTimer);
+    this.creatorRetryTimer = this.dependencies.setTimer(() => {
+      this.creatorRetryTimer = undefined;
+      this.reconcilePresentCandidates();
+    }, CREATOR_RETRY_DELAY_MS);
+  }
+
   private failCurrent(message: string): void {
-    if (!this.snapshot || ["accepted", "rejected", "expired", "cancelled"].includes(this.snapshot.status)) return;
+    if (!this.snapshot || isTerminalStatus(this.snapshot.status)) return;
     this.update("error", message);
     void this.cleanup();
   }
@@ -518,9 +615,10 @@ export class InviteService {
   }
 
   private async finishWithStatus(status: "accepted" | "rejected", message: string): Promise<void> {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await this.cleanup();
+    this.clearDecisionTimeout();
     this.update(status, message);
+    await new Promise((resolve) => setTimeout(resolve, FINAL_ACK_GRACE_MS));
+    await this.cleanup();
     if (typeof window !== "undefined") {
       window.dispatchEvent(new Event("risk:social-updated"));
     }
@@ -533,10 +631,12 @@ export class InviteService {
     if (this.availabilityTimer) this.dependencies.clearTimer(this.availabilityTimer);
     if (this.candidateTimer) this.dependencies.clearTimer(this.candidateTimer);
     if (this.decisionTimer) this.dependencies.clearTimer(this.decisionTimer);
+    if (this.creatorRetryTimer) this.dependencies.clearTimer(this.creatorRetryTimer);
     this.expiryTimer = undefined;
     this.availabilityTimer = undefined;
     this.candidateTimer = undefined;
     this.decisionTimer = undefined;
+    this.creatorRetryTimer = undefined;
     this.unsubscribers.splice(0).forEach((unsubscribe) => unsubscribe());
     await this.transport?.disconnect().catch(() => undefined);
     await this.signaling?.disconnect().catch(() => undefined);
@@ -548,6 +648,10 @@ export class InviteService {
     this.requestId = undefined;
     this.pendingDecision = undefined;
   }
+}
+
+function isTerminalStatus(status: InviteStatus): boolean {
+  return ["accepted", "rejected", "expired", "cancelled", "error"].includes(status);
 }
 
 export class FriendInviteService extends InviteService {

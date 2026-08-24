@@ -260,16 +260,14 @@ async fn remove_friendship(
         return Err(ApiError::Bad("Amizade inválida".into()));
     }
     let mut transaction = state.db.begin().await.map_err(internal)?;
-    sqlx::query(
-        "DELETE FROM friendships WHERE (user_a=? AND user_b=?) OR (user_a=? AND user_b=?)",
-    )
-    .bind(user)
-    .bind(friend_id)
-    .bind(friend_id)
-    .bind(user)
-    .execute(&mut *transaction)
-    .await
-    .map_err(internal)?;
+    sqlx::query("DELETE FROM friendships WHERE (user_a=? AND user_b=?) OR (user_a=? AND user_b=?)")
+        .bind(user)
+        .bind(friend_id)
+        .bind(friend_id)
+        .bind(user)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
     sqlx::query(
         "DELETE FROM friend_requests WHERE (sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?)",
     )
@@ -355,15 +353,17 @@ async fn list_messages(
     Ok(Json(
         rows.into_iter()
             .rev()
-            .map(|(id, author, content, created_at, author_peer_id, signature)| P2pMessage {
-                id,
-                channel_id: channel_id.clone(),
-                author,
-                content,
-                created_at,
-                author_peer_id,
-                signature,
-            })
+            .map(
+                |(id, author, content, created_at, author_peer_id, signature)| P2pMessage {
+                    id,
+                    channel_id: channel_id.clone(),
+                    author,
+                    content,
+                    created_at,
+                    author_peer_id,
+                    signature,
+                },
+            )
             .collect(),
     ))
 }

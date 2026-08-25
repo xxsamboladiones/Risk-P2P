@@ -102,6 +102,7 @@ export interface TransportEvents {
   sendIce(peerId: string, candidate: IceCandidatePayload): void | Promise<void>;
   onRemoteStream(peerId: string, stream: MediaStream): void;
   onConnectionState(peerId: string, state: RTCPeerConnectionState): void;
+  onNegotiationError?(peerId: string, error: unknown): void;
   onDataMessage?(peerId: string, data: string): void;
   onDataState?(peerId: string, state: RTCDataChannelState): void;
   onTransferMessage?(peerId: string, data: ArrayBuffer): void;
@@ -151,6 +152,7 @@ const MAX_DATA_BUFFER_BYTES = 512 * 1024;
 const MAX_TRANSFER_FRAME_BYTES = 320 * 1024;
 const TRANSFER_HIGH_WATER_MARK_BYTES = 4 * 1024 * 1024;
 const TRANSFER_LOW_WATER_MARK_BYTES = 1 * 1024 * 1024;
+const TRANSFER_BUFFER_WAIT_TIMEOUT_MS = 15_000;
 
 export class MeshWebRTCTransport implements CallTransport {
   private readonly peers = new Map<string, PeerEntry>();
@@ -352,13 +354,19 @@ export class MeshWebRTCTransport implements CallTransport {
     if (channel.bufferedAmount <= threshold) return;
     channel.bufferedAmountLowThreshold = Math.max(0, threshold);
     await new Promise<void>((resolve, reject) => {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
       const cleanup = () => {
+        if (timeout) clearTimeout(timeout);
         channel.removeEventListener("bufferedamountlow", onLow);
         channel.removeEventListener("close", onClosed);
         channel.removeEventListener("error", onClosed);
       };
       const onLow = () => { cleanup(); resolve(); };
       const onClosed = () => { cleanup(); reject(new Error(`Canal ${TRANSFER_CHANNEL_LABEL} foi fechado durante a transferência.`)); };
+      timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error(`Canal ${TRANSFER_CHANNEL_LABEL} permaneceu congestionado por mais de ${TRANSFER_BUFFER_WAIT_TIMEOUT_MS / 1000}s.`));
+      }, TRANSFER_BUFFER_WAIT_TIMEOUT_MS);
       channel.addEventListener("bufferedamountlow", onLow, { once: true });
       channel.addEventListener("close", onClosed, { once: true });
       channel.addEventListener("error", onClosed, { once: true });
@@ -483,7 +491,10 @@ export class MeshWebRTCTransport implements CallTransport {
       }
       if (entry.makingOffer || entry.pc.signalingState !== "stable") return;
       entry.needsNegotiation = true;
-      void this.negotiateIfNeeded(peerId, entry);
+      void this.negotiateIfNeeded(peerId, entry).catch((error) => {
+        logger.warn("WebRTC negotiationneeded failed", { peerId, error: String(error) });
+        this.events.onNegotiationError?.(peerId, error);
+      });
     };
     pc.onconnectionstatechange = () => {
       this.events.onConnectionState(peerId, pc.connectionState);
@@ -616,6 +627,7 @@ export class MeshWebRTCTransport implements CallTransport {
     } catch (error) {
       if (!iceRestart) entry.needsNegotiation = true;
       logger.warn("WebRTC renegotiation failed", { peerId, error: String(error) });
+      throw error;
     } finally { entry.makingOffer = false; }
   }
 }

@@ -230,105 +230,127 @@ export class ChatController {
   ): Promise<void> {
     await this.disconnect();
     this.setStatus("connecting");
-
-    const inferred = options.identity ? null : await inferLocalGroupSecurity(channelId, displayName);
-    const identity = options.identity ?? inferred?.identity;
-    const trustedPeers = options.trustedPeers ?? inferred?.trustedPeers ?? [];
-    const revokedPeers = options.revokedPeers ?? inferred?.revokedPeers ?? [];
-    if (options.requireIdentityAuthentication && !identity) {
-      throw new Error("A identidade P2P é obrigatória para conectar ao chat deste grupo.");
-    }
-
-    this.channelId = channelId;
-    this.groupId = options.groupId ?? inferred?.groupId;
-    this.rendezvousId = options.rendezvousId ?? inferred?.rendezvousId ?? channelId;
-    this.signalingNamespace = options.namespace ?? "chat";
-    this.identity = identity;
-    this.peerId = identity?.peerId ?? crypto.randomUUID();
-    this.displayName = displayName.trim();
-    this.trustedPeers.clear();
-    this.revokedPeers.clear();
-    this.revocations = options.revocations ?? inferred?.revocations ?? [];
-    this.verifyKeys.clear();
-    for (const peer of trustedPeers) this.trustedPeers.set(peer.peerId, peer);
-    for (const peer of revokedPeers) this.revokedPeers.set(peer.peerId, peer);
-    if (identity) {
-      this.trustedPeers.set(identity.peerId, {
-        peerId: identity.peerId,
-        publicKey: identity.publicKey,
-        displayName: identity.displayName,
-        avatar: identity.avatar,
-      });
-    }
-    this.peerNames.clear();
-    this.trustedPeers.forEach((peer) => this.peerNames.set(peer.peerId, peer.displayName));
-
     const sessionToken = {};
     this.sessionToken = sessionToken;
-    const signaling = this.createSignaling();
-    this.signaling = signaling;
-    const transport = new MeshWebRTCTransport(this.peerId, iceServers, {
-      sendOffer: (targetPeerId, description) => signaling.sendOffer(targetPeerId, description),
-      sendAnswer: (targetPeerId, description) => signaling.sendAnswer(targetPeerId, description),
-      sendIce: (targetPeerId, candidate) => signaling.sendIceCandidate(targetPeerId, candidate),
-      onRemoteStream: () => undefined,
-      onConnectionState: (remotePeerId, state) => {
-        if (this.sessionToken !== sessionToken) return;
-        if (state === "failed" || state === "closed") this.forgetPeerConnection(remotePeerId);
-      },
-      onDataMessage: (remotePeerId, data) => {
-        if (this.sessionToken !== sessionToken) return;
-        void this.receiveData(remotePeerId, data);
-      },
-      onDataState: (remotePeerId, state) => {
-        if (this.sessionToken !== sessionToken) return;
-        if (state === "open") {
-          this.dataChannelPeers.add(remotePeerId);
-          this.identityHandshakeFailedPeers.delete(remotePeerId);
-          if (this.identity) void this.beginIdentityHandshake(remotePeerId);
-          else this.markPeerReady(remotePeerId);
-        } else {
-          this.forgetPeerConnection(remotePeerId);
-        }
-      },
-      onTransferMessage: (remotePeerId, data) => {
-        if (this.sessionToken !== sessionToken) return;
-        if (!this.openDataPeers.has(remotePeerId)) return;
-        void this.attachmentService?.handleTransferFrame(remotePeerId, data).catch((error) => console.warn("Frame de anexo rejeitado", error));
-      },
-      onTransferState: (remotePeerId, state) => {
-        if (this.sessionToken !== sessionToken) return;
-        if (state === "open" && this.openDataPeers.has(remotePeerId) && !this.revokedPeers.has(remotePeerId)) void this.attachmentService?.peerReady(remotePeerId).catch(() => undefined);
-      },
-    }, options.maxRemotePeers);
-    this.transport = transport;
-    this.installAttachmentService(new AttachmentService(
-      transport,
-      channelId,
-      this.peerId,
-      () => [...this.openDataPeers],
-      await createAttachmentStorage(),
-    ));
-    if (this.sessionToken !== sessionToken) {
-      await transport.disconnect().catch(() => undefined);
-      throw new DOMException("Conexão do chat substituída por outra sessão.", "AbortError");
-    }
-    this.bindSignaling(signaling, this.peerId);
-    if (this.groupId && typeof window !== "undefined") {
-      const refresh = () => { void this.refreshGroupMembership(true); };
-      window.addEventListener("risk:social-updated", refresh);
-      this.unsubscribers.push(() => window.removeEventListener("risk:social-updated", refresh));
-    }
+    let signaling: SignalingProvider | undefined;
+    let transport: MeshWebRTCTransport | undefined;
+
     try {
-      await signaling.connect(this.rendezvousId, this.peerId, this.signalingNamespace);
+      const inferred = options.identity ? null : await inferLocalGroupSecurity(channelId, displayName);
       if (this.sessionToken !== sessionToken) throw new DOMException("Conexão do chat substituída por outra sessão.", "AbortError");
+      const identity = options.identity ?? inferred?.identity;
+      const trustedPeers = options.trustedPeers ?? inferred?.trustedPeers ?? [];
+      const revokedPeers = options.revokedPeers ?? inferred?.revokedPeers ?? [];
+      if (options.requireIdentityAuthentication && !identity) {
+        throw new Error("A identidade P2P é obrigatória para conectar ao chat deste grupo.");
+      }
+
+      const localPeerId = identity?.peerId ?? crypto.randomUUID();
+      const rendezvousId = options.rendezvousId ?? inferred?.rendezvousId ?? channelId;
+      const namespace = options.namespace ?? "chat";
+      this.channelId = channelId;
+      this.groupId = options.groupId ?? inferred?.groupId;
+      this.rendezvousId = rendezvousId;
+      this.signalingNamespace = namespace;
+      this.identity = identity;
+      this.peerId = localPeerId;
+      this.displayName = displayName.trim();
+      this.trustedPeers.clear();
+      this.revokedPeers.clear();
+      this.revocations = options.revocations ?? inferred?.revocations ?? [];
+      this.verifyKeys.clear();
+      for (const peer of trustedPeers) this.trustedPeers.set(peer.peerId, peer);
+      for (const peer of revokedPeers) this.revokedPeers.set(peer.peerId, peer);
+      if (identity) {
+        this.trustedPeers.set(identity.peerId, {
+          peerId: identity.peerId,
+          publicKey: identity.publicKey,
+          displayName: identity.displayName,
+          avatar: identity.avatar,
+        });
+      }
+      this.peerNames.clear();
+      this.trustedPeers.forEach((peer) => this.peerNames.set(peer.peerId, peer.displayName));
+
+      signaling = this.createSignaling();
+      this.signaling = signaling;
+      transport = new MeshWebRTCTransport(localPeerId, iceServers, {
+        sendOffer: (targetPeerId, description) => signaling!.sendOffer(targetPeerId, description),
+        sendAnswer: (targetPeerId, description) => signaling!.sendAnswer(targetPeerId, description),
+        sendIce: (targetPeerId, candidate) => signaling!.sendIceCandidate(targetPeerId, candidate),
+        onRemoteStream: () => undefined,
+        onConnectionState: (remotePeerId, state) => {
+          if (this.sessionToken !== sessionToken) return;
+          if (state === "failed" || state === "closed") this.forgetPeerConnection(remotePeerId);
+        },
+        onNegotiationError: (remotePeerId, error) => {
+          if (this.sessionToken !== sessionToken) return;
+          console.warn("Falha de negociação WebRTC no chat", { remotePeerId, error });
+          if (this.openDataPeers.size === 0) this.setStatus("error");
+        },
+        onDataMessage: (remotePeerId, data) => {
+          if (this.sessionToken !== sessionToken) return;
+          void this.receiveData(remotePeerId, data);
+        },
+        onDataState: (remotePeerId, state) => {
+          if (this.sessionToken !== sessionToken) return;
+          if (state === "open") {
+            this.dataChannelPeers.add(remotePeerId);
+            this.identityHandshakeFailedPeers.delete(remotePeerId);
+            if (this.identity) void this.beginIdentityHandshake(remotePeerId);
+            else this.markPeerReady(remotePeerId);
+          } else {
+            this.forgetPeerConnection(remotePeerId);
+          }
+        },
+        onTransferMessage: (remotePeerId, data) => {
+          if (this.sessionToken !== sessionToken || !this.openDataPeers.has(remotePeerId)) return;
+          void this.attachmentService?.handleTransferFrame(remotePeerId, data).catch((error) => console.warn("Frame de anexo rejeitado", error));
+        },
+        onTransferState: (remotePeerId, state) => {
+          if (this.sessionToken !== sessionToken) return;
+          if (state === "open" && this.openDataPeers.has(remotePeerId) && !this.revokedPeers.has(remotePeerId)) {
+            void this.attachmentService?.peerReady(remotePeerId).catch((error) => console.warn("Falha ao preparar canal de anexos", { remotePeerId, error }));
+          }
+        },
+      }, options.maxRemotePeers);
+      this.transport = transport;
+
+      const attachmentStorage = await createAttachmentStorage();
+      if (this.sessionToken !== sessionToken || this.transport !== transport) {
+        await transport.disconnect().catch(() => undefined);
+        throw new DOMException("Conexão do chat substituída por outra sessão.", "AbortError");
+      }
+      this.installAttachmentService(new AttachmentService(
+        transport,
+        channelId,
+        localPeerId,
+        () => this.sessionToken === sessionToken ? [...this.openDataPeers] : [],
+        attachmentStorage,
+      ));
+      this.bindSignaling(signaling, localPeerId);
+      if (this.groupId && typeof window !== "undefined") {
+        const refresh = () => { if (this.sessionToken === sessionToken) void this.refreshGroupMembership(true); };
+        window.addEventListener("risk:social-updated", refresh);
+        this.unsubscribers.push(() => window.removeEventListener("risk:social-updated", refresh));
+      }
+
+      await signaling.connect(rendezvousId, localPeerId, namespace);
+      if (this.sessionToken !== sessionToken || this.transport !== transport) {
+        throw new DOMException("Conexão do chat substituída por outra sessão.", "AbortError");
+      }
       this.setStatus("connected");
       this.armReadyTimeout(sessionToken);
       if (this.groupId) await this.refreshGroupMembership(false);
       else await this.connectPresentTrustedPeers();
     } catch (error) {
-      if (this.sessionToken === sessionToken) await this.disconnect();
-      if (!(error instanceof DOMException && error.name === "AbortError")) this.setStatus("error");
+      if (this.sessionToken === sessionToken) {
+        await this.disconnect();
+        if (!(error instanceof DOMException && error.name === "AbortError")) this.setStatus("error");
+      } else {
+        await signaling?.disconnect().catch(() => undefined);
+        await transport?.disconnect().catch(() => undefined);
+      }
       throw error;
     }
   }
@@ -441,7 +463,8 @@ export class ChatController {
   async downloadAttachment(record: StoredAttachmentRecord): Promise<void> {
     if (!this.attachmentService) {
       const storage = await createAttachmentStorage();
-      if (record.state !== "completed" && record.direction !== "outgoing") throw new Error("Conecte ao peer para baixar este arquivo.");
+      const locallyAvailable = record.direction === "outgoing" ? record.sourcePersisted === true : record.state === "completed";
+      if (!locallyAvailable) throw new Error("Conecte ao peer para baixar este arquivo.");
       const blob = await storage.getBlob(record.attachmentId, record.manifest);
       triggerDownload(blob, record.manifest.filename);
       return;
@@ -646,32 +669,43 @@ export class ChatController {
   }
 
   private async respondIdentityChallenge(remotePeerId: string, challenge: IdentityChallengeWireMessage): Promise<void> {
-    if (!this.identity || !this.channelId || !this.transport || challenge.fromPeerId !== remotePeerId) return;
+    const sessionToken = this.sessionToken;
+    const identity = this.identity;
+    const channelId = this.channelId;
+    const transport = this.transport;
+    if (!sessionToken || !identity || !channelId || !transport || challenge.fromPeerId !== remotePeerId) return;
     const unsigned: Omit<IdentityProofWireMessage, "signature"> = {
       version: 2,
       type: "chat.identity.proof",
-      channelId: this.channelId,
-      fromPeerId: this.identity.peerId,
+      channelId,
+      fromPeerId: identity.peerId,
       toPeerId: remotePeerId,
       nonce: challenge.nonce,
       timestamp: Date.now(),
       capabilities: LOCAL_RISK_CAPABILITIES,
     };
-    const proof: IdentityProofWireMessage = {
-      ...unsigned,
-      signature: await this.signCanonical(canonicalIdentityProof(unsigned)),
-    };
-    this.transport.sendData(JSON.stringify(proof), remotePeerId);
+    const signature = await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" },
+      identity.privateKey,
+      new TextEncoder().encode(canonicalIdentityProof(unsigned)),
+    );
+    if (this.sessionToken !== sessionToken || this.transport !== transport || !this.dataChannelPeers.has(remotePeerId)) return;
+    const proof: IdentityProofWireMessage = { ...unsigned, signature: bytesToBase64Url(new Uint8Array(signature)) };
+    transport.sendData(JSON.stringify(proof), remotePeerId);
     if (!this.openDataPeers.has(remotePeerId) && !this.pendingIdentityChallenges.has(remotePeerId) && !this.identityHandshakeFailedPeers.has(remotePeerId)) {
       void this.beginIdentityHandshake(remotePeerId);
     }
   }
 
   private async acceptIdentityProof(remotePeerId: string, proof: IdentityProofWireMessage): Promise<void> {
-    if (!this.identity || proof.fromPeerId !== remotePeerId || proof.toPeerId !== this.identity.peerId) return;
+    const sessionToken = this.sessionToken;
+    const identity = this.identity;
+    if (!sessionToken || !identity || proof.fromPeerId !== remotePeerId || proof.toPeerId !== identity.peerId) return;
     const expectedNonce = this.pendingIdentityChallenges.get(remotePeerId);
     if (!expectedNonce || proof.nonce !== expectedNonce) return;
-    if (!(await this.verifyCanonical(remotePeerId, proof.signature, canonicalIdentityProof(proof)))) {
+    const valid = await this.verifyCanonical(remotePeerId, proof.signature, canonicalIdentityProof(proof));
+    if (this.sessionToken !== sessionToken || this.identity !== identity || this.pendingIdentityChallenges.get(remotePeerId) !== expectedNonce) return;
+    if (!valid) {
       console.warn("Prova de identidade P2P inválida", { remotePeerId });
       this.failIdentityHandshake(remotePeerId, "invalid-proof");
       return;
@@ -722,6 +756,9 @@ export class ChatController {
       this.markRevokedPeerReady(remotePeerId);
       return;
     }
+    const sessionToken = this.sessionToken;
+    if (!sessionToken) return;
+    const attachmentService = this.attachmentService;
     this.clearIdentityHandshake(remotePeerId);
     this.identityHandshakeFailedPeers.delete(remotePeerId);
     this.openDataPeers.add(remotePeerId);
@@ -729,14 +766,23 @@ export class ChatController {
     this.setStatus("ready");
     void (async () => {
       await this.sendProfileUpdate(remotePeerId);
+      if (!this.isSessionPeerActive(sessionToken, remotePeerId)) return;
       await this.sendGroupMembership(remotePeerId);
+      if (!this.isSessionPeerActive(sessionToken, remotePeerId)) return;
       await this.flushOutbox(remotePeerId);
+      if (!this.isSessionPeerActive(sessionToken, remotePeerId)) return;
       await this.requestHistory(remotePeerId);
-      await this.attachmentService?.peerReady(remotePeerId);
+      if (!this.isSessionPeerActive(sessionToken, remotePeerId)) return;
+      if (attachmentService === this.attachmentService) await attachmentService?.peerReady(remotePeerId);
     })().catch((error) => {
+      if (this.sessionToken !== sessionToken) return;
       console.warn("Falha ao preparar peer autenticado do chat", { remotePeerId, error });
       if (this.openDataPeers.size === 0) this.setStatus("error");
     });
+  }
+
+  private isSessionPeerActive(sessionToken: object, remotePeerId: string): boolean {
+    return this.sessionToken === sessionToken && Boolean(this.transport) && this.openDataPeers.has(remotePeerId);
   }
 
   private armReadyTimeout(sessionToken: object): void {
@@ -888,67 +934,90 @@ export class ChatController {
   }
 
   private async requestHistory(remotePeerId: string): Promise<void> {
-    if (!this.identity || !this.channelId || !this.transport || !this.openDataPeers.has(remotePeerId) || this.historyRequests.has(remotePeerId)) return;
-    const knownIds = (await loadLocalMessages(this.channelId)).slice(-MAX_HISTORY_IDS).map((message) => message.id);
+    const sessionToken = this.sessionToken;
+    const transport = this.transport;
+    const channelId = this.channelId;
+    if (!sessionToken || !this.identity || !channelId || !transport || !this.openDataPeers.has(remotePeerId) || this.historyRequests.has(remotePeerId)) return;
+    const knownIds = (await loadLocalMessages(channelId)).slice(-MAX_HISTORY_IDS).map((message) => message.id);
+    if (this.sessionToken !== sessionToken || this.transport !== transport || this.channelId !== channelId || !this.openDataPeers.has(remotePeerId)) return;
     const requestId = crypto.randomUUID();
     const request: HistoryRequestWireMessage = {
       version: 2,
       type: "chat.history.request",
-      channelId: this.channelId,
+      channelId,
       requestId,
       knownIds,
     };
     this.historyRequests.set(remotePeerId, requestId);
-    if (this.transport.sendData(JSON.stringify(request), remotePeerId) === 0) this.historyRequests.delete(remotePeerId);
+    if (transport.sendData(JSON.stringify(request), remotePeerId) === 0) this.historyRequests.delete(remotePeerId);
   }
 
   private async respondHistory(remotePeerId: string, request: HistoryRequestWireMessage): Promise<void> {
-    if (!this.channelId || !this.transport || !this.openDataPeers.has(remotePeerId)) return;
+    const sessionToken = this.sessionToken;
+    const transport = this.transport;
+    const channelId = this.channelId;
+    if (!sessionToken || !channelId || !transport || !this.openDataPeers.has(remotePeerId)) return;
     const known = new Set(request.knownIds);
-    const messages = (await loadLocalMessages(this.channelId))
+    const messages = (await loadLocalMessages(channelId))
       .map(localToSignedWire)
       .filter((message): message is SignedChatWireMessage => Boolean(message) && !known.has(message!.id))
       .slice(-MAX_HISTORY_IDS);
+    if (this.sessionToken !== sessionToken || this.transport !== transport || this.channelId !== channelId || !this.openDataPeers.has(remotePeerId)) return;
 
     for (let index = 0; index < messages.length; index += HISTORY_CHUNK_MESSAGES) {
+      if (!this.isSessionPeerActive(sessionToken, remotePeerId)) return;
       const chunk: HistoryChunkWireMessage = {
         version: 2,
         type: "chat.history.chunk",
-        channelId: this.channelId,
+        channelId,
         requestId: request.requestId,
         messages: messages.slice(index, index + HISTORY_CHUNK_MESSAGES),
       };
-      if (this.transport.sendData(JSON.stringify(chunk), remotePeerId) === 0) return;
+      if (transport.sendData(JSON.stringify(chunk), remotePeerId) === 0) return;
     }
+    if (!this.isSessionPeerActive(sessionToken, remotePeerId)) return;
     const complete: HistoryCompleteWireMessage = {
       version: 2,
       type: "chat.history.complete",
-      channelId: this.channelId,
+      channelId,
       requestId: request.requestId,
     };
-    this.transport.sendData(JSON.stringify(complete), remotePeerId);
+    transport.sendData(JSON.stringify(complete), remotePeerId);
   }
 
   private async refreshGroupMembership(broadcast: boolean): Promise<void> {
-    if (!this.groupId || !this.identity) return;
+    const sessionToken = this.sessionToken;
+    const groupId = this.groupId;
+    const identity = this.identity;
+    if (!sessionToken || !groupId || !identity) return;
     if (this.refreshingMembers) return this.refreshingMembers;
-    this.refreshingMembers = (async () => {
-      const group = (await loadLocalGroups()).find((item) => item.groupId === this.groupId);
-      if (!group) return;
-      const nextRendezvousId = this.channelId ? groupRendezvousId(group, "chat", this.channelId) : undefined;
+    let task: Promise<void>;
+    task = (async () => {
+      const group = (await loadLocalGroups()).find((item) => item.groupId === groupId);
+      if (!group || this.sessionToken !== sessionToken || this.groupId !== groupId || this.identity !== identity) return;
+      const channelId = this.channelId;
+      const nextRendezvousId = channelId ? groupRendezvousId(group, "chat", channelId) : undefined;
       const rendezvousChanged = Boolean(nextRendezvousId && this.rendezvousId && nextRendezvousId !== this.rendezvousId);
       this.installGroupPeers(group.members ?? [], group.removedMembers ?? [], group.revocations ?? []);
       await this.connectPresentTrustedPeers();
+      if (this.sessionToken !== sessionToken) return;
       if (broadcast) await Promise.all([...this.openDataPeers].map((peerId) => this.sendGroupMembership(peerId)));
-      if (rendezvousChanged && nextRendezvousId && this.signaling && this.peerId) {
+      if (this.sessionToken !== sessionToken) return;
+      const signaling = this.signaling;
+      const peerId = this.peerId;
+      if (rendezvousChanged && nextRendezvousId && signaling && peerId) {
         this.rendezvousId = nextRendezvousId;
         this.setStatus("connecting");
-        await this.signaling.connect(nextRendezvousId, this.peerId, this.signalingNamespace);
+        await signaling.connect(nextRendezvousId, peerId, this.signalingNamespace);
+        if (this.sessionToken !== sessionToken || this.signaling !== signaling) return;
         this.setStatus("connected");
         await this.connectPresentTrustedPeers();
       }
-    })().finally(() => { this.refreshingMembers = undefined; });
-    return this.refreshingMembers;
+    })().finally(() => {
+      if (this.refreshingMembers === task) this.refreshingMembers = undefined;
+    });
+    this.refreshingMembers = task;
+    return task;
   }
 
   private installGroupPeers(activePeers: PublicPeerIdentity[], revokedPeers: PublicPeerIdentity[], revocations: GroupRevocationCertificate[]): void {
@@ -984,19 +1053,23 @@ export class ChatController {
   }
 
   private async sendGroupMembership(remotePeerId: string): Promise<void> {
-    if (!this.groupId || !this.identity || !this.channelId || !this.transport || !this.openDataPeers.has(remotePeerId)) return;
-    const group = (await loadLocalGroups()).find((item) => item.groupId === this.groupId);
-    if (!group || (group.ownerPeerId !== this.identity.peerId && !(group.administratorPeerIds ?? []).includes(this.identity.peerId))) return;
-    // Avatares mudam com frequência e são sincronizados pelo evento de perfil
-    // assinado. O manifesto mantém apenas a identidade estável do membro.
+    const sessionToken = this.sessionToken;
+    const groupId = this.groupId;
+    const identity = this.identity;
+    const channelId = this.channelId;
+    const transport = this.transport;
+    if (!sessionToken || !groupId || !identity || !channelId || !transport || !this.openDataPeers.has(remotePeerId)) return;
+    const group = (await loadLocalGroups()).find((item) => item.groupId === groupId);
+    if (this.sessionToken !== sessionToken || this.transport !== transport || !this.openDataPeers.has(remotePeerId)) return;
+    if (!group || (group.ownerPeerId !== identity.peerId && !(group.administratorPeerIds ?? []).includes(identity.peerId))) return;
     const members = (group.members ?? []).slice(0, MAX_GROUP_SYNC_MEMBERS).map(({ avatar: _avatar, ...member }) => member);
     const removedMembers = (group.removedMembers ?? []).slice(0, MAX_GROUP_SYNC_MEMBERS).map(({ avatar: _avatar, ...member }) => member);
     const unsigned: Omit<GroupMembersWireMessage, "signature"> = {
       version: 2,
       type: "chat.members.snapshot",
-      channelId: this.channelId,
-      groupId: this.groupId,
-      senderPeerId: this.identity.peerId,
+      channelId,
+      groupId,
+      senderPeerId: identity.peerId,
       ownerPeerId: group.ownerPeerId,
       membershipVersion: group.membershipVersion,
       manifestVersion: group.manifestVersion,
@@ -1016,15 +1089,18 @@ export class ChatController {
       members,
       timestamp: Date.now(),
     };
-    const message: GroupMembersWireMessage = {
-      ...unsigned,
-      signature: await this.signCanonical(canonicalGroupMembership(unsigned)),
-    };
+    const signature = await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" },
+      identity.privateKey,
+      new TextEncoder().encode(canonicalGroupMembership(unsigned)),
+    );
+    if (this.sessionToken !== sessionToken || this.transport !== transport || !this.openDataPeers.has(remotePeerId)) return;
+    const message: GroupMembersWireMessage = { ...unsigned, signature: bytesToBase64Url(new Uint8Array(signature)) };
     const serialized = JSON.stringify(message);
     if (new TextEncoder().encode(serialized).byteLength > MAX_WIRE_BYTES) {
-      throw new Error("O manifesto do grupo excedeu o limite P2P seguro. Remova canais ou identidades antigas antes de sincronizar.");
+      throw new Error("O manifesto do grupo excedeu o limite P2P seguro. Reduza a imagem do grupo, canais ou histórico de membros antes de sincronizar.");
     }
-    this.transport.sendData(serialized, remotePeerId);
+    transport.sendData(serialized, remotePeerId);
   }
 
   private async sendRevocations(remotePeerId: string): Promise<void> {
@@ -1041,21 +1117,31 @@ export class ChatController {
   }
 
   private async sendProfileUpdate(remotePeerId: string): Promise<void> {
-    if (!this.identity || !this.channelId || !this.transport || !this.openDataPeers.has(remotePeerId)) return;
+    const sessionToken = this.sessionToken;
+    const identity = this.identity;
+    const channelId = this.channelId;
+    const transport = this.transport;
+    if (!sessionToken || !identity || !channelId || !transport || !this.openDataPeers.has(remotePeerId)) return;
     const unsigned: Omit<ProfileUpdateWireMessage, "signature"> = {
       version: 2,
       type: "chat.profile.update",
-      channelId: this.channelId,
+      channelId,
       identity: {
-        peerId: this.identity.peerId,
-        publicKey: this.identity.publicKey,
-        displayName: this.identity.displayName,
-        avatar: this.identity.avatar,
+        peerId: identity.peerId,
+        publicKey: identity.publicKey,
+        displayName: identity.displayName,
+        avatar: identity.avatar,
       },
       timestamp: Date.now(),
     };
-    const message: ProfileUpdateWireMessage = { ...unsigned, signature: await this.signCanonical(canonicalProfileUpdate(unsigned)) };
-    this.transport.sendData(JSON.stringify(message), remotePeerId);
+    const signature = await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" },
+      identity.privateKey,
+      new TextEncoder().encode(canonicalProfileUpdate(unsigned)),
+    );
+    if (this.sessionToken !== sessionToken || this.transport !== transport || !this.openDataPeers.has(remotePeerId)) return;
+    const message: ProfileUpdateWireMessage = { ...unsigned, signature: bytesToBase64Url(new Uint8Array(signature)) };
+    transport.sendData(JSON.stringify(message), remotePeerId);
   }
 
   private sendToAuthenticatedPeers(data: string): number {
@@ -1075,14 +1161,20 @@ export class ChatController {
   }
 
   private async flushOutbox(remotePeerId: string): Promise<void> {
-    if (!this.channelId || !this.transport || !this.openDataPeers.has(remotePeerId)) return;
-    for (const record of await loadOutbox(this.channelId)) {
-      const envelope = parseChatWireEnvelope(record.wire, this.channelId);
+    const sessionToken = this.sessionToken;
+    const channelId = this.channelId;
+    const transport = this.transport;
+    if (!sessionToken || !channelId || !transport || !this.openDataPeers.has(remotePeerId)) return;
+    const records = await loadOutbox(channelId);
+    if (this.sessionToken !== sessionToken || this.transport !== transport || this.channelId !== channelId) return;
+    for (const record of records) {
+      if (!this.isSessionPeerActive(sessionToken, remotePeerId)) return;
+      const envelope = parseChatWireEnvelope(record.wire, channelId);
       if (!envelope || envelope.type !== "chat.message" || envelope.version !== 2) {
-        await removeOutbox(this.channelId, record.messageId);
+        await removeOutbox(channelId, record.messageId);
         continue;
       }
-      if (this.transport.sendData(record.wire, remotePeerId) > 0) await markOutboxAttempt(record);
+      if (transport.sendData(record.wire, remotePeerId) > 0) await markOutboxAttempt(record);
     }
   }
 

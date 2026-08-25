@@ -30,7 +30,8 @@ export type AttachmentCardProps = {
 export function AttachmentCard(props: AttachmentCardProps) {
   const { record, progress, connected } = props;
   const { manifest } = record;
-  const canPreview = record.state === "completed" || record.direction === "outgoing";
+  const locallyAvailable = record.direction === "outgoing" ? record.sourcePersisted === true : record.state === "completed";
+  const canPreview = locallyAvailable;
   const [previewUrl, setPreviewUrl] = useState<string>();
   const [previewError, setPreviewError] = useState("");
 
@@ -59,7 +60,7 @@ export function AttachmentCard(props: AttachmentCardProps) {
   const speed = progress?.speedBytesPerSecond ?? 0;
   const eta = progress?.etaSeconds;
   const activeTransfer = ["accepted", "queued", "transferring", "verifying"].includes(record.state);
-  const downloadable = record.state === "completed" || record.direction === "outgoing";
+  const downloadable = locallyAvailable;
 
   return <article className={`attachment-card kind-${manifest.kind} state-${record.state}`}>
     {manifest.kind === "image" && previewUrl && <img className="attachment-image" src={previewUrl} alt={manifest.filename}/>} 

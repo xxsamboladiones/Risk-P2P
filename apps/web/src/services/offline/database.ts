@@ -48,7 +48,12 @@ export function openRiskDatabase(): Promise<IDBDatabase> {
         : database.createObjectStore(OFFLINE_STORES.outbox, { keyPath: "key" });
       if (!outbox.indexNames.contains("channelId")) outbox.createIndex("channelId", "channelId", { unique: false });
     };
-    request.onsuccess = () => resolve(request.result);
+    request.onsuccess = () => {
+      const database = request.result;
+      database.onversionchange = () => database.close();
+      resolve(database);
+    };
+    request.onblocked = () => reject(new Error("Atualização do armazenamento local bloqueada por outra janela do Risk."));
     request.onerror = () => reject(request.error ?? new Error("IndexedDB indisponível."));
   });
 }
@@ -77,6 +82,7 @@ export async function deleteAllByIndex(storeName: string, indexName: string, key
   const database = await openRiskDatabase();
   try {
     const transaction = database.transaction(storeName, "readwrite");
+    const done = transactionDone(transaction);
     const store = transaction.objectStore(storeName);
     const index = store.index(indexName);
     await new Promise<void>((resolve, reject) => {
@@ -89,7 +95,7 @@ export async function deleteAllByIndex(storeName: string, indexName: string, key
         cursor.continue();
       };
     });
-    await transactionDone(transaction);
+    await done;
   } finally { database.close(); }
 }
 
@@ -110,6 +116,12 @@ function transactionDone(transaction: IDBTransaction): Promise<void> {
 
 async function withStore<T>(storeName: string, mode: IDBTransactionMode, operation: (store: IDBObjectStore) => IDBRequest): Promise<T> {
   const database = await openRiskDatabase();
-  try { return await asyncRequest(operation(database.transaction(storeName, mode).objectStore(storeName))) as T; }
-  finally { database.close(); }
+  try {
+    const transaction = database.transaction(storeName, mode);
+    const done = transactionDone(transaction);
+    const result = await asyncRequest(operation(transaction.objectStore(storeName))) as T;
+    await done;
+    return result;
+  } finally { database.close(); }
+
 }

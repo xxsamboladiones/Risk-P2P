@@ -20,6 +20,7 @@ export type StoredAttachmentRecord = {
   channelId: string;
   peerId: string;
   direction: AttachmentDirection;
+  sourcePersisted?: boolean;
   manifest: AttachmentManifest;
   state: AttachmentTransferProgress["state"];
   bytesTransferred: number;
@@ -126,7 +127,9 @@ export class IndexedDbAttachmentStorage implements AttachmentChunkSink {
         payload,
       } satisfies StoredAttachmentChunk);
     }
-    return record;
+    const persisted = { ...record, sourcePersisted: true, updatedAt: new Date().toISOString() };
+    await this.saveRecord(persisted);
+    return persisted;
   }
 
   async registerOutgoing(
@@ -142,6 +145,7 @@ export class IndexedDbAttachmentStorage implements AttachmentChunkSink {
       channelId,
       peerId,
       direction: "outgoing",
+      sourcePersisted: false,
       manifest,
       state: "offered",
       bytesTransferred: 0,
@@ -208,8 +212,10 @@ export class IndexedDbAttachmentStorage implements AttachmentChunkSink {
   }
 
   async findCompletedByAttachmentId(attachmentId: string): Promise<StoredAttachmentRecord | undefined> {
-    return (await getAllByIndex<StoredAttachmentRecord>(OFFLINE_STORES.attachments, "attachmentId", attachmentId))
-      .find((record) => record.state === "completed" || record.direction === "outgoing");
+    const records = await getAllByIndex<StoredAttachmentRecord>(OFFLINE_STORES.attachments, "attachmentId", attachmentId);
+    return records.find((record) => record.direction === "incoming"
+      ? record.state === "completed"
+      : record.sourcePersisted === true);
   }
 
   async getBlob(attachmentId: string, manifest?: AttachmentManifest): Promise<Blob> {

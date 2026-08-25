@@ -1,10 +1,107 @@
-name: Audit fixes (retired)
+name: Apply private chat and preview stability fix
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - hotfix/group-invite-ack-stall
+
+permissions:
+  contents: write
 
 jobs:
-  retired:
+  apply:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Temporary audit workflow retired after validated fixes were applied."
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 10.15.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - name: Patch stable conversation ownership
+        shell: python
+        run: |
+          from pathlib import Path
+
+          main = Path("apps/web/src/main.tsx")
+          source = main.read_text(encoding="utf-8")
+
+          old = '''  useEffect(() => {
+            const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
+            if (!conversationId) { setMessages([]); setHasOlderMessages(false); setAttachments([]); setAttachmentProgress({}); return; }
+          '''
+          new = '''  const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
+
+          useEffect(() => {
+            if (!conversationId) { setMessages([]); setHasOlderMessages(false); setAttachments([]); setAttachmentProgress({}); return; }
+          '''
+          if old not in source:
+            raise SystemExit("conversation effect anchor not found")
+          source = source.replace(old, new, 1)
+
+          old = '''  }, [activeChannel, activeFriend, privateChannelId]);'''
+          new = '''  }, [conversationId]);'''
+          if old not in source:
+            raise SystemExit("conversation effect dependencies not found")
+          source = source.replace(old, new, 1)
+
+          old = '''  }, [activeFriend, currentUser]);'''
+          new = '''  }, [activeFriend?.id, activeFriend?.local, currentUser?.displayName]);'''
+          if old not in source:
+            raise SystemExit("private conversation dependencies not found")
+          source = source.replace(old, new, 1)
+
+          old = '''    const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
+            if (!conversationId || !currentUser) return;'''
+          new = '''    if (!conversationId || !currentUser) return;'''
+          if source.count(old) != 1:
+            raise SystemExit(f"submit conversation anchor count={source.count(old)}")
+          source = source.replace(old, new, 1)
+
+          old = '''    const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
+            const before = messages[0]?.createdAt;'''
+          new = '''    const before = messages[0]?.createdAt;'''
+          if source.count(old) != 1:
+            raise SystemExit(f"history conversation anchor count={source.count(old)}")
+          source = source.replace(old, new, 1)
+
+          old = '''  const existing = current[index]!;
+            const replacement = attachmentStateWeight(record.state) >= attachmentStateWeight(existing.state) ? record : existing;
+            const next = [...current];
+            next[index] = replacement;'''
+          new = '''  const existing = current[index]!;
+            const preferred = attachmentStateWeight(record.state) >= attachmentStateWeight(existing.state) ? record : existing;
+            const replacement: ChatAttachmentRecord = {
+              ...preferred,
+              sourcePersisted: preferred.sourcePersisted === true || existing.sourcePersisted === true || record.sourcePersisted === true,
+            };
+            const next = [...current];
+            next[index] = replacement;'''
+          if old not in source:
+            raise SystemExit("attachment dedupe anchor not found")
+          source = source.replace(old, new, 1)
+          main.write_text(source, encoding="utf-8")
+
+          protocol = Path("packages/protocol/src/attachments.ts")
+          source = protocol.read_text(encoding="utf-8")
+          old = '  return MIME_BY_EXTENSION[extension] ?? normalized || "application/octet-stream";'
+          new = '  return MIME_BY_EXTENSION[extension] ?? (normalized || "application/octet-stream");'
+          if old not in source:
+            raise SystemExit("MIME fallback anchor not found")
+          protocol.write_text(source.replace(old, new, 1), encoding="utf-8")
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build:web
+      - name: Commit validated fix
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add apps/web/src/main.tsx packages/protocol/src/attachments.ts
+          git commit -m "fix(chat): keep private P2P alive during calls"
+          git push

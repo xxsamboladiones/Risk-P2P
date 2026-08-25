@@ -1,0 +1,63 @@
+name: Apply audit fixes
+
+on:
+  push:
+    branches:
+      - hotfix/group-invite-ack-stall
+    paths:
+      - scripts/apply-audit-fixes.py
+      - .github/workflows/audit-fixes.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: hotfix/group-invite-ack-stall
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Apply audit fixes
+        run: python3 scripts/apply-audit-fixes.py
+      - name: Format Rust
+        run: cargo fmt --manifest-path desktop-backend/Cargo.toml
+      - name: Validate diff
+        run: git diff --check
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Test TypeScript
+        run: pnpm test
+      - name: Test Rust backend
+        run: cargo test --manifest-path desktop-backend/Cargo.toml
+      - name: Build web
+        env:
+          VITE_SUPABASE_URL: https://example.supabase.co
+          VITE_SUPABASE_ANON_KEY: test-anon-key-for-ci-only
+        run: pnpm build:web
+      - name: Compile Electron main/preload
+        run: pnpm --filter @risk/desktop exec tsc
+      - name: Commit validated fixes
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "No audit fixes to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: address audit findings 1-12 [skip ci]"
+          git push origin HEAD:hotfix/group-invite-ack-stall

@@ -51,6 +51,10 @@ export function P2PInvitePanel({ type, token, displayName, group, initialMode = 
     const key = `${state.type}:${state.code}`;
     if (completedInvite.current === key) return;
     completedInvite.current = key;
+    // O InviteService persiste o novo vínculo antes de publicar o estado
+    // `accepted`. Notificamos o restante da aplicação somente depois disso para
+    // que sidebar, chat e chamada recarreguem imediatamente a nova membership.
+    window.dispatchEvent(new Event("risk:social-updated"));
     onComplete?.();
   }, [state?.code, state?.status, state?.type, onComplete]);
 

@@ -19,7 +19,15 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: pnpm }
       - name: Apply long-call stability patches
-        run: python scripts/apply-long-call-stability-fix.py
+        run: |
+          python scripts/apply-long-call-stability-fix.py
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('apps/web/src/call.ts')
+          source = path.read_text(encoding='utf-8')
+          source = source.replace('Object.values(participant.streams).forEach', 'Object.values(participant.streams ?? {}).forEach')
+          path.write_text(source, encoding='utf-8')
+          PY
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test

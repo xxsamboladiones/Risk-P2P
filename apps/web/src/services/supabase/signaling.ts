@@ -27,6 +27,7 @@ type CallbackMap = {
 
 type CallbackSets = { [Key in keyof CallbackMap]: Set<CallbackMap[Key]> };
 type RateWindow = { startedAt: number; count: number };
+type ConnectionWaiter = { resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
 
 const DEBUG = import.meta.env.VITE_DEBUG_SIGNALING === "true";
 const CLIENT_VERSION = import.meta.env.VITE_RISK_APP_VERSION ?? "0.2.0";
@@ -34,6 +35,7 @@ const PRESENCE_LEAVE_GRACE_MS = 10_000;
 const SIGNALING_MAX_AGE_MS = 30_000;
 const SIGNALING_FUTURE_SKEW_MS = 10_000;
 const SESSION_TIMESTAMP_TOLERANCE_MS = 1_500;
+const SIGNALING_RECONNECT_SEND_TIMEOUT_MS = 20_000;
 
 export class SupabaseSignalingProvider implements SignalingProvider {
   private readonly callbacks: CallbackSets = {
@@ -57,6 +59,7 @@ export class SupabaseSignalingProvider implements SignalingProvider {
   private readonly missingPeers = new Set<string>();
   private readonly peerLeaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly peerDepartedAt = new Map<string, number>();
+  private readonly connectionWaiters = new Set<ConnectionWaiter>();
 
   async connect(roomId: string, peerId: string, namespace: SignalingNamespace = "room"): Promise<void> {
     if (this.channel) await this.disconnect();
@@ -113,6 +116,7 @@ export class SupabaseSignalingProvider implements SignalingProvider {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
     this.reconnectAttempts = 0;
+    this.rejectConnectionWaiters(new Error("Signaling Realtime foi desconectado."));
     this.peerLeaveTimers.forEach((timer) => clearTimeout(timer));
     this.peerLeaveTimers.clear();
     this.missingPeers.clear();
@@ -198,7 +202,10 @@ export class SupabaseSignalingProvider implements SignalingProvider {
           this.reconnectAttempts = 0;
           this.reconcilePresence();
           this.setStatus("connected");
-        } catch { this.scheduleReconnect(); }
+        } catch {
+          this.setStatus("reconnecting");
+          this.scheduleReconnect();
+        }
       } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
         this.setStatus("reconnecting");
         this.scheduleReconnect();
@@ -232,8 +239,6 @@ export class SupabaseSignalingProvider implements SignalingProvider {
         continue;
       }
 
-      // joinedAt identifica uma sessão lógica do peer. reconnects internos do
-      // Supabase preservam o valor; uma nova instância do Risk recebe outro.
       if (Math.abs(existing.joinedAt - peer.joinedAt) > SESSION_TIMESTAMP_TOLERANCE_MS) {
         this.peerDepartedAt.set(peerId, Math.max(Date.now(), peer.joinedAt));
         this.presencePeers.set(peerId, peer);
@@ -319,13 +324,67 @@ export class SupabaseSignalingProvider implements SignalingProvider {
   }
 
   private async broadcast<Type extends string, Payload>(type: Type, targetPeerId: string | undefined, payload: Payload): Promise<void> {
-    if (!this.channel || !this.roomId || !this.peerId || this.status !== "connected") throw new Error("Signaling Realtime não está conectado.");
-    const envelope: SignalingEnvelope<Type, Payload> = {
-      version: 1, roomId: this.roomId, fromPeerId: this.peerId, targetPeerId,
-      messageId: crypto.randomUUID(), timestamp: Date.now(), type, payload,
-    };
-    const result = await this.channel.send({ type: "broadcast", event: type, payload: envelope });
-    if (result !== "ok") throw new Error(`Falha ao enviar ${type} pelo Supabase Realtime.`);
+    if (!this.roomId || !this.peerId || this.disconnecting) throw new Error("Signaling Realtime não está conectado.");
+    if (!this.channel || this.status !== "connected") await this.waitForConnected();
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const channel = this.channel;
+      const roomId = this.roomId;
+      const peerId = this.peerId;
+      if (!channel || !roomId || !peerId || this.status !== "connected") {
+        await this.waitForConnected();
+        continue;
+      }
+      const envelope: SignalingEnvelope<Type, Payload> = {
+        version: 1, roomId, fromPeerId: peerId, targetPeerId,
+        messageId: crypto.randomUUID(), timestamp: Date.now(), type, payload,
+      };
+      try {
+        const result = await channel.send({ type: "broadcast", event: type, payload: envelope });
+        if (result === "ok") return;
+      } catch {
+        // Transient websocket failures are retried after reopening the channel.
+      }
+      if (attempt === 0 && !this.disconnecting) {
+        this.setStatus("reconnecting");
+        this.scheduleReconnect();
+        await this.waitForConnected();
+      }
+    }
+    throw new Error(`Falha ao enviar ${type} pelo Supabase Realtime após reconectar.`);
+  }
+
+  private waitForConnected(timeoutMs = SIGNALING_RECONNECT_SEND_TIMEOUT_MS): Promise<void> {
+    if (this.channel && this.status === "connected") return Promise.resolve();
+    if (this.disconnecting || !this.client || !this.channelName || !this.peerId || !this.roomId) {
+      return Promise.reject(new Error("Signaling Realtime não está conectado."));
+    }
+    this.scheduleReconnect();
+    return new Promise<void>((resolve, reject) => {
+      const waiter = {} as ConnectionWaiter;
+      waiter.resolve = () => {
+        clearTimeout(waiter.timer);
+        this.connectionWaiters.delete(waiter);
+        resolve();
+      };
+      waiter.reject = (error) => {
+        clearTimeout(waiter.timer);
+        this.connectionWaiters.delete(waiter);
+        reject(error);
+      };
+      waiter.timer = setTimeout(() => {
+        waiter.reject(new Error("Tempo esgotado ao reconectar ao Supabase Realtime."));
+      }, timeoutMs);
+      this.connectionWaiters.add(waiter);
+    });
+  }
+
+  private resolveConnectionWaiters(): void {
+    [...this.connectionWaiters].forEach((waiter) => waiter.resolve());
+  }
+
+  private rejectConnectionWaiters(error: Error): void {
+    [...this.connectionWaiters].forEach((waiter) => waiter.reject(error));
   }
 
   private addCallback<Key extends keyof CallbackMap>(key: Key, callback: CallbackMap[Key]): () => void {
@@ -336,7 +395,13 @@ export class SupabaseSignalingProvider implements SignalingProvider {
     const callbacks = this.callbacks[key] as Set<(item: Parameters<CallbackMap[Key]>[0]) => void>;
     callbacks.forEach((callback) => callback(value));
   }
-  private setStatus(status: SignalingStatus): void { if (this.status === status) return; this.status = status; this.log(status); this.emit("status", status); }
+  private setStatus(status: SignalingStatus): void {
+    if (this.status === status) return;
+    this.status = status;
+    if (status === "connected") this.resolveConnectionWaiters();
+    this.log(status);
+    this.emit("status", status);
+  }
   private log(event: string, peerId?: string): void { if (DEBUG) console.info(`[signaling] ${event}`, peerId ? { peerId } : undefined); }
 }
 

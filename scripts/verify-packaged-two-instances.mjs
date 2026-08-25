@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const executable = process.argv[2]?.trim();
 if (!executable) {
@@ -6,9 +7,9 @@ if (!executable) {
   process.exit(1);
 }
 
-const script = new URL("./verify-packaged-renderer-origin.mjs", import.meta.url);
+const script = fileURLToPath(new URL("./verify-packaged-renderer-origin.mjs", import.meta.url));
 const run = () => new Promise((resolve, reject) => {
-  const child = spawn(process.execPath, [script.pathname, executable], { stdio: "inherit", windowsHide: true });
+  const child = spawn(process.execPath, [script, executable], { stdio: "inherit", windowsHide: true });
   child.once("error", reject);
   child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`Instância empacotada encerrou com ${code}`)));
 });

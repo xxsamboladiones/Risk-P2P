@@ -11,6 +11,7 @@ import type {
   SignalingNamespace,
   SignalingStatus,
 } from "./types";
+import { RISK_APP_VERSION } from "../protocol-compatibility";
 
 type TestEnvelope = OfferMessage | AnswerMessage | IceCandidateMessage | PeerStateMessage;
 type Listener<T> = (value: T) => void;
@@ -64,7 +65,10 @@ export class InMemorySignalingProvider implements SignalingProvider {
   private readonly peerStates = new Set<Listener<PeerStateMessage>>();
   private readonly statuses = new Set<Listener<SignalingStatus>>();
 
-  constructor(private readonly hub: InMemorySignalingHub) {}
+  constructor(
+    private readonly hub: InMemorySignalingHub,
+    private readonly clientVersion = RISK_APP_VERSION,
+  ) {}
 
   get currentPeerId(): string { return this.peerId ?? ""; }
 
@@ -144,7 +148,7 @@ export class InMemorySignalingProvider implements SignalingProvider {
     }
   }
 
-  private asPeer(): SignalingPeer { return { peerId: this.peerId!, joinedAt: Date.now(), clientVersion: "test" }; }
+  private asPeer(): SignalingPeer { return { peerId: this.peerId!, joinedAt: Date.now(), clientVersion: this.clientVersion }; }
 
   private async send<Type extends TestEnvelope["type"], Payload>(type: Type, targetPeerId: string | undefined, payload: Payload): Promise<void> {
     if (!this.roomId || !this.peerId || this.status !== "connected") throw new Error("Provider em memória desconectado.");

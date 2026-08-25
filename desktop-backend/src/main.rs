@@ -912,12 +912,7 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::query("CREATE TABLE users(id BLOB PRIMARY KEY)")
-            .execute(&db)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO users(id) VALUES(?)")
-            .bind(vec![7_u8; 16])
+        sqlx::raw_sql(include_str!("../migrations/0001_initial.sql"))
             .execute(&db)
             .await
             .unwrap();
@@ -925,19 +920,21 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0003_p2p_messages.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/0004_p2p_message_signatures.sql"
+        ))
+        .execute(&db)
+        .await
+        .unwrap();
         sqlx::raw_sql(include_str!("../migrations/0005_p2p_group_ownership.sql"))
             .execute(&db)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO p2p_groups(owner_user_id,group_id,name,channels_json,members_json,joined_at,owner_peer_id,membership_version) VALUES(?,?,?,?,?,?,?,?)")
-            .bind(vec![7_u8; 16])
-            .bind("legacy-group")
-            .bind("Grupo legado")
-            .bind("[]")
-            .bind("[]")
-            .bind(1_i64)
-            .bind("legacy-owner")
-            .bind(3_i64)
+        sqlx::raw_sql(include_str!("../tests/fixtures/risk_v0_1_seed.sql"))
             .execute(&db)
             .await
             .unwrap();
@@ -958,15 +955,33 @@ mod tests {
         let row = sqlx::query_as::<_, (String, i64, String, String, String, String)>(
             "SELECT name,manifest_version,administrator_peer_ids_json,removed_peer_ids_json,removed_members_json,consistency_json FROM p2p_groups WHERE group_id=?",
         )
-        .bind("legacy-group")
+        .bind("group_legacy_0001")
         .fetch_one(&db)
         .await
         .unwrap();
-        assert_eq!(row.0, "Grupo legado");
+        assert_eq!(row.0, "Grupo P2P legado");
         assert_eq!(row.1, 1);
         assert_eq!(row.2, "[]");
         assert_eq!(row.3, "[]");
         assert_eq!(row.4, "[]");
         assert_eq!(row.5, "{}");
+
+        let preserved = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            "SELECT (SELECT COUNT(*) FROM friendships),(SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM p2p_friends),(SELECT COUNT(*) FROM p2p_messages)",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(preserved, (1, 1, 1, 1));
+        let group_payload = sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT channels_json,members_json,membership_version FROM p2p_groups WHERE group_id=?",
+        )
+        .bind("group_legacy_0001")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(group_payload.0.contains("channel_legacy_voice"));
+        assert!(group_payload.1.contains("peer_friend_legacy"));
+        assert_eq!(group_payload.2, 3);
     }
 }

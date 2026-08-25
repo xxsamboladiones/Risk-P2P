@@ -15,6 +15,10 @@ let configPromise: Promise<DesktopBackendConfig | null> | undefined;
 const migratedChannels = new Set<string>();
 const DEV_BACKEND_PROXY = "/__risk-api";
 
+export function resetChatStorageRuntime(): void {
+  configPromise = undefined;
+}
+
 export type MessagePageOptions = { before?: string; limit?: number };
 
 export async function loadLocalMessages(channelId: string, options: MessagePageOptions = {}): Promise<LocalChatMessage[]> {

@@ -52,7 +52,7 @@ export function GroupInvitePanel({
             const community = communities.find((group) => group.id === preferredGroupId);
             if (!community) throw new Error("Grupo selecionado não foi encontrado.");
             const identity = await getOrCreateLocalIdentity(displayName);
-            metadata = { groupId: preferredGroupId, name: preferredGroupName ?? community.name, channels: preferredGroupChannels ?? await api.channels(token, preferredGroupId).catch(() => []), ownerPeerId: identity.peerId, membershipVersion: 1, manifestVersion: 1, manifestActorPeerId: identity.peerId, manifestOperationId: crypto.randomUUID(), administratorEpoch: 1, administratorPeerIds: [], removedPeerIds: [], removedMembers: [], revocations: [] };
+            metadata = { groupId: preferredGroupId, name: preferredGroupName ?? community.name, channels: preferredGroupChannels ?? await api.channels(token, preferredGroupId).catch(() => []), ownerPeerId: identity.peerId, membershipVersion: 1, manifestVersion: 1, manifestActorPeerId: identity.peerId, manifestOperationId: crypto.randomUUID(), administratorEpoch: 1, administratorPeerIds: [], administratorGrants: [], removedPeerIds: [], removedMembers: [], revocations: [], rendezvousVersion: 1, rendezvousSecret: crypto.randomUUID() };
           }
 
           try {
@@ -72,6 +72,9 @@ export function GroupInvitePanel({
               metadata.manifestOperationId,
               metadata.administratorEpoch,
               metadata.revocations,
+              metadata.administratorGrants,
+              metadata.rendezvousVersion,
+              metadata.rendezvousSecret,
             );
             localGroups = await loadLocalGroups();
             window.dispatchEvent(new Event("risk:social-updated"));
@@ -82,7 +85,11 @@ export function GroupInvitePanel({
       }
 
       if (!alive) return;
-      const ownedGroups = initialMode === "create" ? localGroups.filter((group) => group.ownerPeerId === currentIdentity.peerId || (group.administratorPeerIds ?? []).includes(currentIdentity.peerId)) : localGroups;
+      const ownedGroups = initialMode === "create" ? localGroups.filter((group) => group.ownerPeerId === currentIdentity.peerId || (
+        (group.administratorPeerIds ?? []).includes(currentIdentity.peerId)
+        && (group.administratorGrants ?? []).some((grant) => grant.administratorPeerId === currentIdentity.peerId
+          && grant.administratorEpoch === (group.administratorEpoch ?? 1))
+      )) : localGroups;
       const available = preferredGroupId
         ? ownedGroups.filter((group) => group.groupId === preferredGroupId)
         : ownedGroups;
@@ -119,9 +126,12 @@ export function GroupInvitePanel({
         manifestOperationId: selected.manifestOperationId,
         administratorEpoch: selected.administratorEpoch,
         administratorPeerIds: selected.administratorPeerIds ?? [],
+        administratorGrants: selected.administratorGrants ?? [],
         removedPeerIds: selected.removedPeerIds ?? [],
         removedMembers: (selected.removedMembers ?? []).map(({ avatar: _avatar, ...member }) => member),
         revocations: selected.revocations ?? [],
+        rendezvousVersion: selected.rendezvousVersion ?? 1,
+        rendezvousSecret: selected.rendezvousSecret ?? selected.groupId,
         ownerIdentity: selected.members.find((member) => member.peerId === selected.ownerPeerId),
       }
     : preferredMetadata && selectedId === preferredMetadata.groupId

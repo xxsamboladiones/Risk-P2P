@@ -5,6 +5,17 @@ export type PublicPeerIdentity = { peerId: string; publicKey: JsonWebKey; displa
 export type LocalIdentity = PublicPeerIdentity & { id: "self"; privateKey: CryptoKey };
 export type LocalFriend = PublicPeerIdentity & { addedAt: number };
 export type LocalGroupChannel = { id: string; name: string; kind: "text" | "voice"; voiceRoomId?: string | null };
+export type GroupAdministratorGrant = {
+  version: 1;
+  groupId: string;
+  administratorPeerId: string;
+  administratorPublicKey: JsonWebKey;
+  ownerPeerId: string;
+  administratorEpoch: number;
+  messageId: string;
+  timestamp: number;
+  signature: string;
+};
 export type GroupRevocationCertificate = {
   version: 1;
   groupId: string;
@@ -15,6 +26,9 @@ export type GroupRevocationCertificate = {
   administratorEpoch: number;
   messageId: string;
   timestamp: number;
+  administratorGrant?: GroupAdministratorGrant;
+  rendezvousVersion?: number;
+  rendezvousSecret?: string;
   signature: string;
 };
 export type PublicGroupMetadata = {
@@ -31,7 +45,10 @@ export type PublicGroupMetadata = {
   manifestActorPeerId?: string;
   manifestOperationId?: string;
   administratorEpoch?: number;
+  administratorGrants?: GroupAdministratorGrant[];
   revocations?: GroupRevocationCertificate[];
+  rendezvousVersion?: number;
+  rendezvousSecret?: string;
   /** Incluída em convites criados por administradores para ancorar a chave do proprietário. */
   ownerIdentity?: PublicPeerIdentity;
 };
@@ -46,7 +63,7 @@ export function nextGroupManifestRevision(group: PublicGroupMetadata, actorPeerI
 }
 
 export function canonicalGroupRevocation(certificate: Omit<GroupRevocationCertificate, "signature"> | GroupRevocationCertificate): string {
-  return JSON.stringify({
+  const legacyFields = {
     version: 1,
     groupId: certificate.groupId,
     targetPeerId: certificate.targetPeerId,
@@ -56,12 +73,45 @@ export function canonicalGroupRevocation(certificate: Omit<GroupRevocationCertif
     administratorEpoch: certificate.administratorEpoch,
     messageId: certificate.messageId,
     timestamp: certificate.timestamp,
+  };
+  // Certificados 0.2.0 anteriores a esta cadeia não possuíam os campos abaixo.
+  // O formato condicional mantém a assinatura antiga verificável após upgrade.
+  return JSON.stringify(certificate.administratorGrant || certificate.rendezvousVersion || certificate.rendezvousSecret
+    ? {
+      ...legacyFields,
+      administratorGrant: certificate.administratorGrant ? canonicalAdministratorGrantValue(certificate.administratorGrant) : null,
+      rendezvousVersion: certificate.rendezvousVersion ?? null,
+      rendezvousSecret: certificate.rendezvousSecret ?? null,
+    }
+    : legacyFields);
+}
+
+export function canonicalGroupAdministratorGrant(grant: Omit<GroupAdministratorGrant, "signature"> | GroupAdministratorGrant): string {
+  return JSON.stringify({
+    version: 1,
+    groupId: grant.groupId,
+    administratorPeerId: grant.administratorPeerId,
+    administratorPublicKey: canonicalPublicKey(grant.administratorPublicKey),
+    ownerPeerId: grant.ownerPeerId,
+    administratorEpoch: grant.administratorEpoch,
+    messageId: grant.messageId,
+    timestamp: grant.timestamp,
   });
+}
+
+export function groupRendezvousId(group: PublicGroupMetadata, purpose: "chat" | "voice" | "activity", resourceId: string): string {
+  const secret = validOpaqueId(group.rendezvousSecret) ? group.rendezvousSecret : group.groupId;
+  return `risk-rendezvous-v1:${secret}:${purpose}:${resourceId}`;
 }
 
 type DesktopBackendConfig = { baseUrl: string; token?: string };
 let desktopConfigPromise: Promise<DesktopBackendConfig | null> | undefined;
 let migrationPromise: Promise<void> | undefined;
+
+export function resetSocialStorageRuntime(): void {
+  desktopConfigPromise = undefined;
+  migrationPromise = undefined;
+}
 
 const DEV_BACKEND_PROXY = "/__risk-api";
 const MAX_GROUP_MEMBERS = 48;
@@ -170,7 +220,7 @@ export async function createLocalGroup(name: string, owner: PublicPeerIdentity):
   if (trimmedName.length < 2 || trimmedName.length > 80) throw new Error("O nome do grupo deve ter entre 2 e 80 caracteres.");
   const groupId = crypto.randomUUID();
   const group: LocalGroup = {
-    groupId, name: trimmedName, members: [owner], joinedAt: Date.now(), ownerPeerId: owner.peerId, membershipVersion: 1, manifestVersion: 1, manifestActorPeerId: owner.peerId, manifestOperationId: crypto.randomUUID(), administratorEpoch: 1, administratorPeerIds: [], removedPeerIds: [], removedMembers: [], revocations: [],
+    groupId, name: trimmedName, members: [owner], joinedAt: Date.now(), ownerPeerId: owner.peerId, membershipVersion: 1, manifestVersion: 1, manifestActorPeerId: owner.peerId, manifestOperationId: crypto.randomUUID(), administratorEpoch: 1, administratorPeerIds: [], administratorGrants: [], removedPeerIds: [], removedMembers: [], revocations: [], rendezvousVersion: 1, rendezvousSecret: crypto.randomUUID(),
     channels: [
       { id: crypto.randomUUID(), name: "geral", kind: "text" },
       { id: crypto.randomUUID(), name: "Geral", kind: "voice", voiceRoomId: crypto.randomUUID() },
@@ -195,10 +245,10 @@ export async function addLocalGroupChannel(groupId: string, channel: LocalGroupC
   await saveLocalGroup(group);
 }
 
-export async function ensureLocalGroup(groupId: string, name: string, owner: PublicPeerIdentity, channels: LocalGroupChannel[] = [], ownerPeerId = owner.peerId, membershipVersion = 1, manifestVersion = 1, removedPeerIds: string[] = [], administratorPeerIds: string[] = [], removedMembers: PublicPeerIdentity[] = [], manifestActorPeerId: string = ownerPeerId, manifestOperationId: string = crypto.randomUUID(), administratorEpoch = 1, revocations: GroupRevocationCertificate[] = []): Promise<LocalGroup> {
+export async function ensureLocalGroup(groupId: string, name: string, owner: PublicPeerIdentity, channels: LocalGroupChannel[] = [], ownerPeerId = owner.peerId, membershipVersion = 1, manifestVersion = 1, removedPeerIds: string[] = [], administratorPeerIds: string[] = [], removedMembers: PublicPeerIdentity[] = [], manifestActorPeerId: string = ownerPeerId, manifestOperationId: string = crypto.randomUUID(), administratorEpoch = 1, revocations: GroupRevocationCertificate[] = [], administratorGrants: GroupAdministratorGrant[] = [], rendezvousVersion = 1, rendezvousSecret = groupId): Promise<LocalGroup> {
   const existing = (await loadLocalGroups()).find((item) => item.groupId === groupId);
   if (existing) return existing;
-  const local: LocalGroup = { groupId, name, members: [owner], joinedAt: Date.now(), channels, ownerPeerId, membershipVersion, manifestVersion, manifestActorPeerId, manifestOperationId, administratorEpoch, administratorPeerIds, removedPeerIds, removedMembers, revocations };
+  const local: LocalGroup = { groupId, name, members: [owner], joinedAt: Date.now(), channels, ownerPeerId, membershipVersion, manifestVersion, manifestActorPeerId, manifestOperationId, administratorEpoch, administratorPeerIds, administratorGrants, removedPeerIds, removedMembers, revocations, rendezvousVersion, rendezvousSecret };
   await saveLocalGroup(local);
   return local;
 }
@@ -254,7 +304,15 @@ export async function setLocalGroupAdministrator(groupId: string, targetPeerId: 
   if (!group.members.some((member) => member.peerId === targetPeerId)) throw new Error("Membro não encontrado.");
   const administrators = new Set(group.administratorPeerIds ?? []);
   if (administrator) administrators.add(targetPeerId); else administrators.delete(targetPeerId);
-  const updated = { ...group, administratorPeerIds: [...administrators], administratorEpoch: (group.administratorEpoch ?? 1) + 1, ...nextGroupManifestRevision(group, identity.peerId) };
+  const administratorEpoch = (group.administratorEpoch ?? 1) + 1;
+  // Todo avanço de epoch invalida as delegações anteriores. O proprietário
+  // renova a cadeia de todos os administradores restantes de uma vez.
+  const administratorGrants = await Promise.all([...administrators].map(async (peerId) => {
+    const target = group.members.find((member) => member.peerId === peerId);
+    if (!target) throw new Error("A lista de administradores contém uma identidade desconhecida.");
+    return createGroupAdministratorGrant(group, target, identity, administratorEpoch);
+  }));
+  const updated = { ...group, administratorPeerIds: [...administrators], administratorGrants, administratorEpoch, ...nextGroupManifestRevision(group, identity.peerId) };
   await saveLocalGroup(updated);
   if (typeof window !== "undefined") window.dispatchEvent(new Event("risk:social-updated"));
   return updated;
@@ -277,21 +335,34 @@ export async function removeLocalGroupMember(groupId: string, targetPeerId: stri
   const membershipVersion = group.membershipVersion + 1;
   const targetWasAdministrator = (group.administratorPeerIds ?? []).includes(targetPeerId);
   const administratorEpoch = (group.administratorEpoch ?? 1) + (targetWasAdministrator ? 1 : 0);
+  const rendezvousVersion = (group.rendezvousVersion ?? 1) + 1;
+  const rendezvousSecret = crypto.randomUUID();
   const certificate = await createGroupRevocationCertificate(
-    { ...group, administratorEpoch },
+    { ...group, administratorEpoch, rendezvousVersion, rendezvousSecret },
     target,
     identity,
     membershipVersion,
   );
+  const remainingAdministratorIds = (group.administratorPeerIds ?? []).filter((peerId) => peerId !== targetPeerId);
+  const administratorGrants = targetWasAdministrator
+    ? await Promise.all(remainingAdministratorIds.map(async (peerId) => {
+      const administrator = group.members.find((member) => member.peerId === peerId);
+      if (!administrator) throw new Error("A lista de administradores contém uma identidade desconhecida.");
+      return createGroupAdministratorGrant(group, administrator, identity, administratorEpoch);
+    }))
+    : (group.administratorGrants ?? []).filter((grant) => grant.administratorPeerId !== targetPeerId);
   const updated: LocalGroup = {
     ...group,
     members: group.members.filter((member) => !samePeerIdentity(member, target)),
-    administratorPeerIds: (group.administratorPeerIds ?? []).filter((peerId) => peerId !== targetPeerId),
+    administratorPeerIds: remainingAdministratorIds,
     removedPeerIds: [...new Set([...(group.removedPeerIds ?? []), targetPeerId])],
     removedMembers,
     revocations: mergeGroupRevocations(group.revocations ?? [], [certificate]),
     membershipVersion,
     administratorEpoch,
+    administratorGrants,
+    rendezvousVersion,
+    rendezvousSecret,
     ...nextGroupManifestRevision(group, identity.peerId),
   };
   await saveLocalGroup(updated);
@@ -381,6 +452,16 @@ export function resolveLocalGroupManifest(group: LocalGroup, incomingValue: Loca
       : winner.administratorPeerIds)
     .filter((peerId) => members.some((member) => member.peerId === peerId) && peerId !== incoming.ownerPeerId)
     .sort();
+  const administratorGrants = mergeAdministratorGrants(
+    group.administratorGrants ?? [],
+    incoming.administratorGrants ?? [],
+  ).filter((grant) => administratorPeerIds.includes(grant.administratorPeerId)
+    && grant.administratorEpoch === administratorEpoch);
+  const rendezvousWinner = (incoming.rendezvousVersion ?? 1) > (group.rendezvousVersion ?? 1)
+    ? incoming
+    : (incoming.rendezvousVersion ?? 1) < (group.rendezvousVersion ?? 1)
+      ? group
+      : winner;
   const merged: LocalGroup = {
     ...group,
     name: winner.name,
@@ -394,9 +475,14 @@ export function resolveLocalGroupManifest(group: LocalGroup, incomingValue: Loca
     manifestOperationId: winner.manifestOperationId ?? `legacy-${winner.manifestVersion}`,
     administratorEpoch,
     administratorPeerIds,
+    administratorGrants,
     removedPeerIds: [...removed].sort(),
     removedMembers: dedupePeerIdentities([...(group.removedMembers ?? []), ...(incoming.removedMembers ?? [])]).filter((member) => removed.has(member.peerId)).sort((left, right) => left.peerId.localeCompare(right.peerId)),
     revocations,
+    rendezvousVersion: Math.max(group.rendezvousVersion ?? 1, incoming.rendezvousVersion ?? 1),
+    rendezvousSecret: validOpaqueId(rendezvousWinner.rendezvousSecret)
+      ? rendezvousWinner.rendezvousSecret
+      : group.groupId,
   };
   return merged;
 }
@@ -450,6 +536,56 @@ export function publicIdentity(identity: LocalIdentity): PublicPeerIdentity {
   return { peerId: identity.peerId, publicKey: identity.publicKey, displayName: identity.displayName, avatar: identity.avatar };
 }
 
+export async function createGroupAdministratorGrant(
+  group: PublicGroupMetadata,
+  administrator: PublicPeerIdentity,
+  owner: LocalIdentity,
+  administratorEpoch: number,
+): Promise<GroupAdministratorGrant> {
+  if (owner.peerId !== group.ownerPeerId) throw new Error("Somente o proprietário pode delegar o cargo de administrador.");
+  const unsigned: Omit<GroupAdministratorGrant, "signature"> = {
+    version: 1,
+    groupId: group.groupId,
+    administratorPeerId: administrator.peerId,
+    administratorPublicKey: administrator.publicKey,
+    ownerPeerId: owner.peerId,
+    administratorEpoch,
+    messageId: crypto.randomUUID(),
+    timestamp: Date.now(),
+  };
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    owner.privateKey,
+    new TextEncoder().encode(canonicalGroupAdministratorGrant(unsigned)),
+  );
+  return { ...unsigned, signature: bytesToBase64Url(new Uint8Array(signature)) };
+}
+
+export async function verifyGroupAdministratorGrant(
+  grant: GroupAdministratorGrant,
+  group: PublicGroupMetadata & { members: PublicPeerIdentity[] },
+): Promise<boolean> {
+  if (!validGroupAdministratorGrant(grant)
+    || grant.groupId !== group.groupId
+    || grant.ownerPeerId !== group.ownerPeerId) return false;
+  const owner = [...group.members, ...(group.removedMembers ?? [])].find((member) => member.peerId === group.ownerPeerId)
+    ?? group.ownerIdentity;
+  if (!owner) return false;
+  const administrator = [...group.members, ...(group.removedMembers ?? [])].find((member) => member.peerId === grant.administratorPeerId);
+  if (administrator && !samePublicKey(administrator.publicKey, grant.administratorPublicKey)) return false;
+  try {
+    const key = await crypto.subtle.importKey("jwk", owner.publicKey, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+    return crypto.subtle.verify(
+      { name: "ECDSA", hash: "SHA-256" },
+      key,
+      base64UrlToArrayBuffer(grant.signature),
+      new TextEncoder().encode(canonicalGroupAdministratorGrant(grant)),
+    );
+  } catch {
+    return false;
+  }
+}
+
 export async function createGroupRevocationCertificate(
   group: PublicGroupMetadata,
   target: PublicPeerIdentity,
@@ -457,6 +593,13 @@ export async function createGroupRevocationCertificate(
   membershipVersion: number,
 ): Promise<GroupRevocationCertificate> {
   if (!canManageLocalGroup(group, issuer.peerId)) throw new Error("A identidade local não pode revogar membros deste grupo.");
+  let administratorGrant: GroupAdministratorGrant | undefined;
+  if (issuer.peerId !== group.ownerPeerId) {
+    administratorGrant = (group.administratorGrants ?? []).find((grant) =>
+      grant.administratorPeerId === issuer.peerId
+      && grant.administratorEpoch === (group.administratorEpoch ?? 1));
+    if (!administratorGrant) throw new Error("A delegação assinada deste administrador não está disponível. O proprietário precisa renovar o cargo.");
+  }
   const unsigned: Omit<GroupRevocationCertificate, "signature"> = {
     version: 1,
     groupId: group.groupId,
@@ -467,6 +610,9 @@ export async function createGroupRevocationCertificate(
     administratorEpoch: group.administratorEpoch ?? 1,
     messageId: crypto.randomUUID(),
     timestamp: Date.now(),
+    administratorGrant,
+    rendezvousVersion: group.rendezvousVersion,
+    rendezvousSecret: group.rendezvousSecret,
   };
   const signature = await crypto.subtle.sign(
     { name: "ECDSA", hash: "SHA-256" },
@@ -482,15 +628,25 @@ export async function verifyGroupRevocationCertificate(
 ): Promise<boolean> {
   if (!validGroupRevocationCertificate(certificate) || certificate.groupId !== group.groupId) return false;
   const issuer = [...group.members, ...(group.removedMembers ?? [])].find((member) => member.peerId === certificate.issuerPeerId);
-  if (!issuer) return false;
-  const issuerAuthorized = issuer.peerId === group.ownerPeerId
-    || ((group.administratorPeerIds ?? []).includes(issuer.peerId)
-      && certificate.administratorEpoch === (group.administratorEpoch ?? 1));
-  if (!issuerAuthorized) return false;
+  let issuerKey: JsonWebKey | undefined;
+  if (certificate.issuerPeerId === group.ownerPeerId) {
+    issuerKey = issuer?.publicKey ?? group.ownerIdentity?.publicKey;
+  } else {
+    const grant = certificate.administratorGrant;
+    if (!grant
+      || grant.administratorPeerId !== certificate.issuerPeerId
+      || grant.administratorEpoch !== certificate.administratorEpoch
+      || (group.administratorEpoch ?? 1) > certificate.administratorEpoch
+      || ((group.administratorEpoch ?? 1) === certificate.administratorEpoch
+        && !(group.administratorPeerIds ?? []).includes(certificate.issuerPeerId))
+      || !(await verifyGroupAdministratorGrant(grant, group))) return false;
+    issuerKey = grant.administratorPublicKey;
+  }
+  if (!issuerKey) return false;
   const target = [...group.members, ...(group.removedMembers ?? [])].find((member) => member.peerId === certificate.targetPeerId);
   if (!target || !samePublicKey(target.publicKey, certificate.targetPublicKey)) return false;
   try {
-    const key = await crypto.subtle.importKey("jwk", issuer.publicKey, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+    const key = await crypto.subtle.importKey("jwk", issuerKey, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
     return crypto.subtle.verify(
       { name: "ECDSA", hash: "SHA-256" },
       key,
@@ -505,6 +661,8 @@ export async function verifyGroupRevocationCertificate(
 export async function applyGroupRevocationCertificate(certificate: GroupRevocationCertificate): Promise<boolean> {
   const group = (await loadLocalGroups()).find((item) => item.groupId === certificate.groupId);
   if (!group || !(await verifyGroupRevocationCertificate(certificate, group))) return false;
+  const learnsNewAdministratorEpoch = Boolean(certificate.administratorGrant)
+    && certificate.administratorEpoch > (group.administratorEpoch ?? 1);
   const target = group.members.find((member) => member.peerId === certificate.targetPeerId);
   const removedMembers = target
     ? dedupePeerIdentities([...(group.removedMembers ?? []), target])
@@ -512,7 +670,14 @@ export async function applyGroupRevocationCertificate(certificate: GroupRevocati
   const updated: LocalGroup = {
     ...group,
     members: group.members.filter((member) => member.peerId !== certificate.targetPeerId),
-    administratorPeerIds: (group.administratorPeerIds ?? []).filter((peerId) => peerId !== certificate.targetPeerId),
+    administratorPeerIds: [...new Set([
+      ...(group.administratorPeerIds ?? []),
+      ...(learnsNewAdministratorEpoch ? [certificate.issuerPeerId] : []),
+    ])].filter((peerId) => peerId !== certificate.targetPeerId),
+    administratorGrants: mergeAdministratorGrants(
+      group.administratorGrants ?? [],
+      certificate.administratorGrant ? [certificate.administratorGrant] : [],
+    ).filter((grant) => grant.administratorPeerId !== certificate.targetPeerId),
     removedPeerIds: [...new Set([...(group.removedPeerIds ?? []), certificate.targetPeerId])],
     removedMembers,
     revocations: mergeGroupRevocations(group.revocations ?? [], [certificate]),
@@ -521,6 +686,12 @@ export async function applyGroupRevocationCertificate(certificate: GroupRevocati
     manifestActorPeerId: certificate.issuerPeerId,
     manifestOperationId: certificate.messageId,
     administratorEpoch: Math.max(group.administratorEpoch ?? 1, certificate.administratorEpoch),
+    rendezvousVersion: certificate.rendezvousVersion && certificate.rendezvousVersion > (group.rendezvousVersion ?? 1)
+      ? certificate.rendezvousVersion
+      : group.rendezvousVersion ?? 1,
+    rendezvousSecret: certificate.rendezvousVersion && certificate.rendezvousVersion > (group.rendezvousVersion ?? 1)
+      ? certificate.rendezvousSecret ?? group.rendezvousSecret ?? group.groupId
+      : group.rendezvousSecret ?? group.groupId,
   };
   const identity = await loadLocalIdentity();
   if (identity?.peerId === certificate.targetPeerId
@@ -549,7 +720,24 @@ export function validGroupRevocationCertificate(value: unknown): value is GroupR
     && Number.isSafeInteger(certificate.administratorEpoch) && Number(certificate.administratorEpoch) >= 1
     && typeof certificate.messageId === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(certificate.messageId)
     && typeof certificate.timestamp === "number" && Number.isFinite(certificate.timestamp) && certificate.timestamp > 0
+    && (certificate.administratorGrant === undefined || validGroupAdministratorGrant(certificate.administratorGrant))
+    && (certificate.rendezvousVersion === undefined || (Number.isSafeInteger(certificate.rendezvousVersion) && Number(certificate.rendezvousVersion) >= 1))
+    && (certificate.rendezvousSecret === undefined || validOpaqueId(certificate.rendezvousSecret))
     && typeof certificate.signature === "string" && /^[A-Za-z0-9_-]{16,256}$/.test(certificate.signature);
+}
+
+export function validGroupAdministratorGrant(value: unknown): value is GroupAdministratorGrant {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const grant = value as Partial<GroupAdministratorGrant>;
+  return grant.version === 1
+    && validOpaqueId(grant.groupId)
+    && validOpaqueId(grant.administratorPeerId)
+    && validOpaqueId(grant.ownerPeerId)
+    && validP256PublicKey(grant.administratorPublicKey)
+    && Number.isSafeInteger(grant.administratorEpoch) && Number(grant.administratorEpoch) >= 1
+    && validOpaqueId(grant.messageId)
+    && typeof grant.timestamp === "number" && Number.isFinite(grant.timestamp) && grant.timestamp > 0
+    && typeof grant.signature === "string" && /^[A-Za-z0-9_-]{16,256}$/.test(grant.signature);
 }
 
 async function refreshIdentityMembership(): Promise<void> {
@@ -572,7 +760,10 @@ export async function reconcileIdentityMembership(
     const manifestActorPeerId = typeof group.manifestActorPeerId === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(group.manifestActorPeerId) ? group.manifestActorPeerId : ownerPeerId;
     const manifestOperationId = typeof group.manifestOperationId === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(group.manifestOperationId) ? group.manifestOperationId : `legacy-${manifestVersion}`;
     const administratorEpoch = Number.isSafeInteger(group.administratorEpoch) && Number(group.administratorEpoch) >= 1 ? Number(group.administratorEpoch) : 1;
+    const administratorGrants = Array.isArray(group.administratorGrants) ? mergeAdministratorGrants([], group.administratorGrants) : [];
     const revocations = Array.isArray(group.revocations) ? mergeGroupRevocations([], group.revocations) : [];
+    const rendezvousVersion = Number.isSafeInteger(group.rendezvousVersion) && Number(group.rendezvousVersion) >= 1 ? Number(group.rendezvousVersion) : 1;
+    const rendezvousSecret = validOpaqueId(group.rendezvousSecret) ? group.rendezvousSecret : group.groupId;
     // O proprietário é irremovível. Registros antigos ou interrompidos não
     // podem manter um tombstone que apague a autoridade raiz do grupo.
     const removedPeerIds = [...new Set([
@@ -583,7 +774,8 @@ export async function reconcileIdentityMembership(
     const members = dedupePeerIdentities(rawMembers, self ?? undefined).filter((member) => !removedPeerIds.includes(member.peerId));
     let administratorPeerIds = Array.isArray(group.administratorPeerIds) ? [...new Set(group.administratorPeerIds.filter((peerId) => typeof peerId === "string" && peerId.length <= 128 && peerId !== ownerPeerId))] : [];
     administratorPeerIds = administratorPeerIds.filter((peerId) => members.some((member) => member.peerId === peerId));
-    let changed = members.length !== rawMembers.length || group.ownerPeerId !== ownerPeerId || group.membershipVersion !== membershipVersion || group.manifestVersion !== manifestVersion || group.manifestActorPeerId !== manifestActorPeerId || group.manifestOperationId !== manifestOperationId || group.administratorEpoch !== administratorEpoch || JSON.stringify(group.removedPeerIds ?? []) !== JSON.stringify(removedPeerIds) || JSON.stringify(group.administratorPeerIds ?? []) !== JSON.stringify(administratorPeerIds) || JSON.stringify(group.removedMembers ?? []) !== JSON.stringify(removedMembers) || JSON.stringify(group.revocations ?? []) !== JSON.stringify(revocations);
+    const activeAdministratorGrants = administratorGrants.filter((grant) => administratorPeerIds.includes(grant.administratorPeerId) && grant.administratorEpoch === administratorEpoch);
+    let changed = members.length !== rawMembers.length || group.ownerPeerId !== ownerPeerId || group.membershipVersion !== membershipVersion || group.manifestVersion !== manifestVersion || group.manifestActorPeerId !== manifestActorPeerId || group.manifestOperationId !== manifestOperationId || group.administratorEpoch !== administratorEpoch || group.rendezvousVersion !== rendezvousVersion || group.rendezvousSecret !== rendezvousSecret || JSON.stringify(group.removedPeerIds ?? []) !== JSON.stringify(removedPeerIds) || JSON.stringify(group.administratorPeerIds ?? []) !== JSON.stringify(administratorPeerIds) || JSON.stringify(group.administratorGrants ?? []) !== JSON.stringify(activeAdministratorGrants) || JSON.stringify(group.removedMembers ?? []) !== JSON.stringify(removedMembers) || JSON.stringify(group.revocations ?? []) !== JSON.stringify(revocations);
     const index = self ? members.findIndex((member) => samePeerIdentity(member, self)) : -1;
     if (self && index < 0 && (self.peerId === ownerPeerId || !removedPeerIds.includes(self.peerId))) {
       members.push(self);
@@ -602,7 +794,7 @@ export async function reconcileIdentityMembership(
       reconciled.push(group);
       continue;
     }
-    const updated = { ...group, ownerPeerId, membershipVersion, manifestVersion, manifestActorPeerId, manifestOperationId, administratorEpoch, administratorPeerIds, removedPeerIds, removedMembers, revocations, members };
+    const updated = { ...group, ownerPeerId, membershipVersion, manifestVersion, manifestActorPeerId, manifestOperationId, administratorEpoch, administratorPeerIds, administratorGrants: activeAdministratorGrants, removedPeerIds, removedMembers, revocations, rendezvousVersion, rendezvousSecret, members };
     await persist(updated);
     reconciled.push(updated);
   }
@@ -636,7 +828,15 @@ function validPublicPeerIdentity(identity: PublicPeerIdentity): boolean {
   return /^[A-Za-z0-9_-]{8,128}$/.test(identity.peerId)
     && identity.displayName.trim().length >= 2
     && identity.displayName.length <= 80
-    && Boolean(identity.publicKey && typeof identity.publicKey === "object");
+    && validP256PublicKey(identity.publicKey);
+}
+
+function validP256PublicKey(value: unknown): value is JsonWebKey {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const key = value as JsonWebKey;
+  return key.kty === "EC" && key.crv === "P-256"
+    && typeof key.x === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(key.x)
+    && typeof key.y === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(key.y);
 }
 
 function samePublicKey(left: JsonWebKey, right: JsonWebKey): boolean {
@@ -645,6 +845,24 @@ function samePublicKey(left: JsonWebKey, right: JsonWebKey): boolean {
 
 function canonicalPublicKey(key: JsonWebKey): object {
   return { kty: key.kty ?? null, crv: key.crv ?? null, x: key.x ?? null, y: key.y ?? null };
+}
+
+function canonicalAdministratorGrantValue(grant: GroupAdministratorGrant): object {
+  return {
+    version: grant.version,
+    groupId: grant.groupId,
+    administratorPeerId: grant.administratorPeerId,
+    administratorPublicKey: canonicalPublicKey(grant.administratorPublicKey),
+    ownerPeerId: grant.ownerPeerId,
+    administratorEpoch: grant.administratorEpoch,
+    messageId: grant.messageId,
+    timestamp: grant.timestamp,
+    signature: grant.signature,
+  };
+}
+
+function validOpaqueId(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(value);
 }
 
 export function compareGroupManifestRevisions(left: PublicGroupMetadata, right: PublicGroupMetadata): number {
@@ -669,6 +887,20 @@ export function mergeGroupRevocations(left: GroupRevocationCertificate[], right:
     }
   }
   return [...byTarget.values()].sort((a, b) => a.targetPeerId.localeCompare(b.targetPeerId)).slice(0, MAX_GROUP_REVOCATIONS);
+}
+
+export function mergeAdministratorGrants(left: GroupAdministratorGrant[], right: GroupAdministratorGrant[]): GroupAdministratorGrant[] {
+  const byAdministrator = new Map<string, GroupAdministratorGrant>();
+  for (const grant of [...left, ...right]) {
+    if (!validGroupAdministratorGrant(grant)) continue;
+    const current = byAdministrator.get(grant.administratorPeerId);
+    if (!current
+      || grant.administratorEpoch > current.administratorEpoch
+      || (grant.administratorEpoch === current.administratorEpoch && grant.messageId > current.messageId)) {
+      byAdministrator.set(grant.administratorPeerId, grant);
+    }
+  }
+  return [...byAdministrator.values()].sort((a, b) => a.administratorPeerId.localeCompare(b.administratorPeerId)).slice(0, MAX_GROUP_MEMBERS);
 }
 
 function bytesToBase64Url(bytes: Uint8Array): string {

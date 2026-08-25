@@ -7,6 +7,7 @@ import react from "@vitejs/plugin-react";
 const envDir = fileURLToPath(new URL("../../", import.meta.url));
 const devBackendBridgeFile = fileURLToPath(new URL("../../.risk/dev-backend.json", import.meta.url));
 const DEV_API_PREFIX = "/__risk-api";
+const webVersion = process.env.npm_package_version?.trim() || "0.2.0";
 
 type DevBackendBridge = {
   baseUrl: string;
@@ -131,9 +132,10 @@ export default defineConfig(({ command, mode }) => {
     // Durante `vite serve`, o navegador usa o proxy local por padrão mesmo que um
     // .env antigo ainda contenha VITE_API_URL=http://localhost:8080. Para testar
     // deliberadamente outra API em desenvolvimento, use RISK_DEV_API_URL.
-    define: command === "serve"
-      ? { "import.meta.env.VITE_API_URL": JSON.stringify(devApiUrl) }
-      : undefined,
+    define: {
+      "import.meta.env.VITE_RISK_APP_VERSION": JSON.stringify(webVersion),
+      ...(command === "serve" ? { "import.meta.env.VITE_API_URL": JSON.stringify(devApiUrl) } : {}),
+    },
     server: { port: 5173 },
     build: {
       rollupOptions: {

@@ -44,7 +44,13 @@ struct P2pGroup {
     #[serde(default = "default_group_epoch")]
     administrator_epoch: i64,
     #[serde(default = "empty_json_array")]
+    administrator_grants: Value,
+    #[serde(default = "empty_json_array")]
     revocations: Value,
+    #[serde(default = "default_group_epoch")]
+    rendezvous_version: i64,
+    #[serde(default)]
+    rendezvous_secret: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -57,7 +63,13 @@ struct P2pGroupConsistency {
     #[serde(default = "default_group_epoch")]
     administrator_epoch: i64,
     #[serde(default = "empty_json_array")]
+    administrator_grants: Value,
+    #[serde(default = "empty_json_array")]
     revocations: Value,
+    #[serde(default = "default_group_epoch")]
+    rendezvous_version: i64,
+    #[serde(default)]
+    rendezvous_secret: String,
 }
 
 fn default_group_epoch() -> i64 {
@@ -231,7 +243,10 @@ async fn list_groups(
             manifest_actor_peer_id: consistency.manifest_actor_peer_id,
             manifest_operation_id: consistency.manifest_operation_id,
             administrator_epoch: consistency.administrator_epoch,
+            administrator_grants: consistency.administrator_grants,
             revocations: consistency.revocations,
+            rendezvous_version: consistency.rendezvous_version,
+            rendezvous_secret: consistency.rendezvous_secret,
         });
     }
     Ok(Json(result))
@@ -265,11 +280,18 @@ async fn save_group(
         || !group.removed_peer_ids.is_array()
         || !group.removed_members.is_array()
         || group.administrator_epoch < 1
+        || !group.administrator_grants.is_array()
+        || group
+            .administrator_grants
+            .as_array()
+            .is_some_and(|items| items.len() > 48)
         || !group.revocations.is_array()
         || group
             .revocations
             .as_array()
             .is_some_and(|items| items.len() > 48)
+        || group.rendezvous_version < 1
+        || (!group.rendezvous_secret.is_empty() && !valid_id(&group.rendezvous_secret))
         || (!group.manifest_actor_peer_id.is_empty() && !valid_id(&group.manifest_actor_peer_id))
         || (!group.manifest_operation_id.is_empty() && !valid_id(&group.manifest_operation_id))
     {
@@ -291,7 +313,10 @@ async fn save_group(
         manifest_actor_peer_id: group.manifest_actor_peer_id.clone(),
         manifest_operation_id: group.manifest_operation_id.clone(),
         administrator_epoch: group.administrator_epoch,
+        administrator_grants: group.administrator_grants.clone(),
         revocations: group.revocations.clone(),
+        rendezvous_version: group.rendezvous_version,
+        rendezvous_secret: group.rendezvous_secret.clone(),
     })
     .map_err(|error| ApiError::Internal(error.into()))?;
     sqlx::query(

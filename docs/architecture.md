@@ -93,7 +93,9 @@ O chat negocia um DataChannel ordenado usando o mesmo modelo de signaling. Mensa
 
 Mensagens versão 2 são assinadas pela identidade ECDSA permanente. Antes de aceitar conteúdo ou histórico, os peers concluem um desafio bilateral e conferem a chave pública com a lista local de membros/amigos. Até oito canais locais podem manter sessões leves em segundo plano para não lidas e notificações.
 
-O proprietário e administradores autorizados podem assinar snapshots de membership. Revisões usam versão, autor e ID de operação para desempatar edições concorrentes; mudanças de cargo incrementam um `administratorEpoch` controlado pelo proprietário. Remoções são *remove-wins* e produzem um certificado assinado que membros comuns podem retransmitir sem possuir a chave da autoridade. Uma identidade revogada abre apenas o caminho restrito necessário para receber esse certificado: histórico, outbox, anexos e mídia permanecem bloqueados.
+O proprietário e administradores autorizados podem assinar snapshots de membership. Cada administrador possui uma delegação ECDSA assinada pelo proprietário para um `administratorEpoch`; ao mudar cargos, o proprietário avança o epoch e renova todas as delegações restantes. O certificado de remoção inclui essa cadeia, portanto um peer atrasado consegue verificar a autoridade sem confiar cegamente no snapshot atual. Revisões usam versão, autor e ID de operação para desempatar edições concorrentes. Remoções são *remove-wins*, rotacionam o segredo efêmero de rendezvous do grupo e produzem um certificado retransmissível. Uma identidade revogada abre apenas o caminho restrito necessário para receber esse certificado: histórico, outbox, anexos e mídia permanecem bloqueados.
+
+Antes de autorizar DataChannel ou mídia, os peers anunciam versão do aplicativo e versões dos protocolos de chamada, chat e manifesto. Versões incompatíveis são recusadas com diagnóstico explícito, em vez de falharem silenciosamente durante SDP/ICE.
 
 Nesta fase Alpha, cada grupo aceita no máximo 48 membros ativos e conserva até 48 certificados de revogação. Uma chave revogada não pode ser readmitida no mesmo grupo: o retorno exige uma nova identidade P2P. O monitor de atividade acompanha até 32 grupos e o cliente mantém até oito chats autenticados em segundo plano.
 
@@ -121,6 +123,8 @@ Para redes em que conexão direta/STUN falha, o Risk deve usar:
 
 Esse serviço não precisa armazenar amigos, mensagens ou grupos.
 
+Sem uma URL `turn:`/`turns:` válida, o produto se declara `Somente STUN`; ele não promete conectividade universal e orienta o usuário quando ICE falha por NAT/CGNAT/firewall.
+
 ## Electron
 
 O processo desktop usa:
@@ -135,6 +139,8 @@ O processo desktop usa:
 - IPC validado por origem;
 - single-instance lock;
 - sidecar iniciado antes da UI ficar disponível.
+
+Se o sidecar encerrar depois do readiness, o processo principal faz uma única tentativa controlada de reinício, renova o endpoint/token de loopback e notifica o renderer. Se o renderer falhar, a janela tenta uma recarga; erros React restantes caem em uma tela de recuperação com relatório sanitizado.
 
 ## Empacotamento
 

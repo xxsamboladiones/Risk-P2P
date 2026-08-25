@@ -17,6 +17,11 @@ let runtimeConfig: Promise<ApiRuntimeConfig | null> | undefined;
 
 type ApiRuntimeConfig = { baseUrl: string; desktopToken?: string };
 
+export function resetApiRuntimeConfig(): void {
+  runtimeConfig = undefined;
+  refreshInFlight = undefined;
+}
+
 export class ApiRequestError extends Error {
   constructor(message: string, public readonly status: number) { super(message); }
 }

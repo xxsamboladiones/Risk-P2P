@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { LocalIdentity } from "../offline/social-storage";
+import { createGroupAdministratorGrant, type LocalIdentity } from "../offline/social-storage";
 import { createSignedInviteMessage, parseAndVerifyInviteMessage } from "./protocol";
 
 async function identity(name: string): Promise<LocalIdentity> {
@@ -37,11 +37,20 @@ describe("protocolo assinado de convites", () => {
     const adminGroup = {
       ...group,
       administratorPeerIds: [administrator.peerId],
+      administratorEpoch: 2,
       ownerIdentity: { peerId: owner.peerId, displayName: owner.displayName, publicKey: owner.publicKey },
     };
-    const adminInvite = await createSignedInviteMessage(administrator, { type: "group.join.accept", requestId: crypto.randomUUID(), timestamp: now, group: adminGroup });
+    const grant = await createGroupAdministratorGrant(adminGroup, {
+      peerId: administrator.peerId,
+      displayName: administrator.displayName,
+      publicKey: administrator.publicKey,
+    }, owner, 2);
+    const authorizedAdminGroup = { ...adminGroup, administratorGrants: [grant] };
+    const adminInvite = await createSignedInviteMessage(administrator, { type: "group.join.accept", requestId: crypto.randomUUID(), timestamp: now, group: authorizedAdminGroup });
     expect(await parseAndVerifyInviteMessage(JSON.stringify(adminInvite), now)).not.toBeNull();
-    const unauthorized = await createSignedInviteMessage(administrator, { type: "group.join.accept", requestId: crypto.randomUUID(), timestamp: now, group: { ...adminGroup, administratorPeerIds: [] } });
+    const unauthorized = await createSignedInviteMessage(administrator, { type: "group.join.accept", requestId: crypto.randomUUID(), timestamp: now, group: { ...authorizedAdminGroup, administratorPeerIds: [] } });
     expect(await parseAndVerifyInviteMessage(JSON.stringify(unauthorized), now)).toBeNull();
+    const forged = await createSignedInviteMessage(administrator, { type: "group.join.accept", requestId: crypto.randomUUID(), timestamp: now, group: { ...authorizedAdminGroup, administratorGrants: [{ ...grant, administratorEpoch: 3 }] } });
+    expect(await parseAndVerifyInviteMessage(JSON.stringify(forged), now)).toBeNull();
   });
 });

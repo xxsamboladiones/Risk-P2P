@@ -28,6 +28,7 @@ import type {
   ChatController,
 } from "../chat";
 import { loadLocalGroups } from "../services/offline/social-storage";
+import { incompatiblePeerMessage } from "../services/protocol-compatibility";
 import { useCallStore, type Participant } from "../store";
 import { ConversationTimeline } from "./ConversationTimeline";
 import { InCallAudioSettings } from "./InCallAudioSettings";
@@ -399,7 +400,11 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
         ? current
         : [...current, message].sort((left, right) => left.createdAt.localeCompare(right.createdAt)));
     });
-    const offStatus = chat.onStatus((status) => { if (alive) setChatStatus(status); });
+    const offStatus = chat.onStatus((status) => {
+      if (!alive) return;
+      setChatStatus(status);
+      if (status === "incompatible") setError(incompatiblePeerMessage());
+    });
     const offAttachment = chat.onAttachment((record) => {
       if (alive && record.channelId === channelId) setAttachments((current) => upsertAttachment(current, record));
     });
@@ -613,7 +618,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
     <section className={`call-chat-view ${view === "chat" ? "" : "is-hidden"}`}>
       <header className="call-chat-header">
         <div><Hash/><span><strong>#{context?.textChannelName ?? "chat"}</strong><small>{context?.groupName ?? "Grupo atual"}</small></span></div>
-        <div className={`call-chat-status ${chatStatus}`}><i/>{chatStatus === "ready" ? "P2P conectado" : chatStatus === "connected" ? "Aguardando peers" : chatStatus === "connecting" ? "Conectando" : "Offline"}</div>
+        <div className={`call-chat-status ${chatStatus}`}><i/>{chatStatus === "ready" ? "P2P conectado" : chatStatus === "connected" ? "Aguardando peers" : chatStatus === "connecting" ? "Conectando" : chatStatus === "incompatible" ? "Versão incompatível" : "Offline"}</div>
         <button onClick={() => setView("call")}><Video size={16}/> Voltar para chamada</button>
       </header>
       <div className="messages call-chat-messages">
@@ -654,6 +659,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
       <p>Signaling: <b>{diagnostics?.signaling?.status ?? "indisponível"}</b></p>
       <p>Canal Supabase: <b>{diagnostics?.signaling?.channelStatus ?? "indisponível"}</b></p>
       <p>Peers presentes: <b>{diagnostics?.signaling?.presencePeers.length ?? 0}</b></p>
+      <p>Conectividade: <b>{diagnostics?.connectivity.label ?? "verificando"}</b></p>
       {(diagnostics?.peerConnections ?? []).map((peer) => <article key={peer.peerId}><strong>{peer.peerId.slice(0, 8)}</strong><span>WebRTC {peer.connectionState} · ICE {peer.iceConnectionState}</span><small>RTT {peer.roundTripTimeMs ?? 0} ms · jitter {peer.jitterMs ?? 0} ms · perdas {peer.packetsLost ?? 0}</small></article>)}
       <button onClick={() => void navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2))}><Copy/> Copiar relatório sanitizado</button>
     </section>}

@@ -186,6 +186,31 @@ describe("ciclo de conexão do ChatController", () => {
     await Promise.all([first.disconnect(), second.disconnect()]);
   });
 
+  it("recusa um peer de versão antiga antes de autenticar o DataChannel", async () => {
+    const hub = new InMemorySignalingHub();
+    const currentIdentity = await identity("Atual");
+    const oldIdentity = await identity("Antigo");
+    const current = new ChatController(() => new InMemorySignalingProvider(hub));
+    const old = new ChatController(() => new InMemorySignalingProvider(hub, "0.1.0"));
+    const statuses: ChatConnectionStatus[] = [];
+    current.onStatus((status) => statuses.push(status));
+
+    await current.connect("canal-versao", currentIdentity.displayName, [], {
+      identity: currentIdentity,
+      trustedPeers: [publicIdentity(oldIdentity)],
+      namespace: "friend",
+    });
+    await old.connect("canal-versao", oldIdentity.displayName, [], {
+      identity: oldIdentity,
+      trustedPeers: [publicIdentity(currentIdentity)],
+      namespace: "friend",
+    });
+
+    await vi.waitFor(() => expect(statuses.at(-1)).toBe("incompatible"));
+    expect(runtime.messages).toEqual([]);
+    await Promise.all([current.disconnect(), old.disconnect()]);
+  });
+
   it("entrega a revogação ao removido sem liberar mensagens, histórico ou anexos", async () => {
     const hub = new InMemorySignalingHub();
     const member = await identity("Membro ativo");

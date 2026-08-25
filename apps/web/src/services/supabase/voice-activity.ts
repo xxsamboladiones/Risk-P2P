@@ -1,5 +1,5 @@
 import type { RealtimeChannel, SupabaseClient } from "@supabase/supabase-js";
-import type { LocalGroup } from "../offline/social-storage";
+import { groupRendezvousId, type LocalGroup } from "../offline/social-storage";
 import { getSupabaseRealtimeClient } from "./client";
 
 type VoicePresence = { peerId: string; roomId: string; channelId: string; joinedAt: number };
@@ -13,7 +13,7 @@ export type VoiceActivity = {
   participantCount: number;
 };
 
-type GroupSubscription = { group: LocalGroup; channel: RealtimeChannel; subscribed: Promise<void> };
+type GroupSubscription = { group: LocalGroup; rendezvousId: string; channel: RealtimeChannel; subscribed: Promise<void> };
 const MAX_GROUP_SUBSCRIPTIONS = 32;
 
 /** Diretório efêmero baseado exclusivamente em Supabase Realtime Presence. */
@@ -43,8 +43,15 @@ export class VoiceActivityDirectory {
     }
     for (const group of allowed) {
       const existing = this.subscriptions.get(group.groupId);
-      if (existing) existing.group = group;
-      else await this.addGroup(group);
+      const rendezvousId = groupRendezvousId(group, "activity", group.groupId);
+      if (existing?.rendezvousId === rendezvousId) existing.group = group;
+      else {
+        if (existing) {
+          await this.client.removeChannel(existing.channel).catch(() => undefined);
+          this.subscriptions.delete(group.groupId);
+        }
+        await this.addGroup(group);
+      }
     }
     this.emit();
   }
@@ -90,14 +97,15 @@ export class VoiceActivityDirectory {
   private async addGroup(group: LocalGroup): Promise<void> {
     const client = this.client;
     if (!client || this.subscriptions.has(group.groupId)) return;
-    const channelName = `risk:activity:${(await hashId(group.groupId)).slice(0, 32)}`;
+    const rendezvousId = groupRendezvousId(group, "activity", group.groupId);
+    const channelName = `risk:activity:${(await hashId(rendezvousId)).slice(0, 32)}`;
     const channel = client.channel(channelName, { config: { presence: { key: this.localPeerId ?? crypto.randomUUID() } } });
     let settle = false;
     let resolveSubscribed!: () => void;
     let rejectSubscribed!: (error: Error) => void;
     const subscribed = new Promise<void>((resolve, reject) => { resolveSubscribed = resolve; rejectSubscribed = reject; });
     void subscribed.catch(() => undefined);
-    const subscription: GroupSubscription = { group, channel, subscribed };
+    const subscription: GroupSubscription = { group, rendezvousId, channel, subscribed };
     this.subscriptions.set(group.groupId, subscription);
     channel.on("presence", { event: "sync" }, () => this.emit()).subscribe((status) => {
       if (status === "SUBSCRIBED") {

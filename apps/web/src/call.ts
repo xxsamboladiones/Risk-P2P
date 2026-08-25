@@ -9,6 +9,7 @@ import { validAvatarDataUrl } from "./services/offline/profile";
 import {
   applyGroupRevocationCertificate,
   getOrCreateLocalIdentity,
+  groupRendezvousId,
   loadLocalGroups,
   publicIdentity,
   validGroupRevocationCertificate,
@@ -18,10 +19,19 @@ import {
 } from "./services/offline/social-storage";
 import { SupabaseSignalingProvider } from "./services/supabase/signaling";
 import type { SignalingDiagnostics, SignalingProvider } from "./services/signaling/types";
+import {
+  compatibleAppVersion,
+  compatibleCallPeer,
+  incompatiblePeerMessage,
+  LOCAL_RISK_CAPABILITIES,
+  validRiskPeerCapabilities,
+  type RiskPeerCapabilities,
+} from "./services/protocol-compatibility";
 
 export type CallDiagnostics = {
   signaling: SignalingDiagnostics | null;
   peerConnections: PeerConnectionDiagnostics[];
+  connectivity: { mode: "turn" | "stun-only"; label: string };
 };
 
 type DisplayAudioSettings = MediaTrackSettings & { restrictOwnAudio?: boolean };
@@ -58,8 +68,8 @@ function base64UrlToArrayBuffer(value: string): ArrayBuffer {
 }
 
 type CallAuthMessage =
-  | { version: 1; type: "call.auth.challenge"; identityPeerId: string; nonce: string; timestamp: number }
-  | { version: 1; type: "call.auth.proof"; identity: PublicPeerIdentity; nonce: string; timestamp: number; signature: string };
+  | { version: 1; type: "call.auth.challenge"; identityPeerId: string; nonce: string; timestamp: number; capabilities: RiskPeerCapabilities }
+  | { version: 1; type: "call.auth.proof"; identity: PublicPeerIdentity; nonce: string; timestamp: number; capabilities: RiskPeerCapabilities; signature: string };
 type CallGroupRevocationMessage = { version: 1; type: "call.group.revocation"; certificate: GroupRevocationCertificate };
 
 export type CallJoinOptions = {
@@ -70,6 +80,7 @@ export type CallJoinOptions = {
   groupId?: string;
   /** Chamadas pertencentes a grupos nunca podem cair no modo anônimo. */
   requireIdentityAuthentication?: boolean;
+  rendezvousId?: string;
 };
 
 export function parseCallProfileMessage(value: string): CallProfileMessage | null {
@@ -282,6 +293,7 @@ export class CallController {
   private cameraTrack?: MediaStreamTrack;
   private screenStream?: MediaStream;
   private roomId?: string;
+  private rendezvousId?: string;
   private peerId?: string;
   private displayName = "Participante";
   private avatar?: string;
@@ -301,6 +313,7 @@ export class CallController {
   private readonly pendingPeerStates = new Map<string, PeerState>();
   private readonly remoteIdentityPeerIds = new Map<string, string>();
   private readonly revocationOnlyPeers = new Set<string>();
+  private readonly pendingRevokedPeers = new Set<string>();
   private mediaAuthenticationRequired = false;
 
   constructor(private readonly createSignaling: () => SignalingProvider = () => new SupabaseSignalingProvider()) {}
@@ -310,7 +323,10 @@ export class CallController {
     const lifecycle = ++this.lifecycleId;
     const voiceSettings = loadVoiceVideoSettings();
     this.roomId = roomId;
-    this.peerId = crypto.randomUUID();
+    this.peerId = options.requireIdentityAuthentication && options.identity
+      ? options.identity.peerId
+      : crypto.randomUUID();
+    this.rendezvousId = options.rendezvousId ?? roomId;
     this.local = new MediaStream();
     this.microphoneInputStream = undefined;
     this.microphoneTrack = undefined;
@@ -331,6 +347,7 @@ export class CallController {
     this.pendingPeerStates.clear();
     this.remoteIdentityPeerIds.clear();
     this.revocationOnlyPeers.clear();
+    this.pendingRevokedPeers.clear();
     this.mediaAuthenticationRequired = false;
     this.identity = options.identity;
     this.trustedPeers.clear();
@@ -423,7 +440,7 @@ export class CallController {
       if (!this.isActive(lifecycle)) throw new DOMException("Entrada na chamada cancelada.", "AbortError");
       this.state.cameraStreamId = this.local.id;
       this.updateLocalPreview();
-      await signaling.connect(roomId, this.peerId);
+      await signaling.connect(this.rendezvousId, this.peerId);
       if (!this.isActive(lifecycle)) throw new DOMException("Entrada na chamada cancelada.", "AbortError");
       await signaling.sendPeerState(this.state);
       return this.local;
@@ -686,10 +703,11 @@ export class CallController {
     this.authTimers.set(remotePeerId, setTimeout(() => {
       this.authTimers.delete(remotePeerId);
       if (!this.authChallenges.delete(remotePeerId)) return;
+      this.pendingRevokedPeers.delete(remotePeerId);
       useCallStore.getState().remove(remotePeerId);
       void this.transport?.disconnect(remotePeerId);
     }, 12_000));
-    const message: CallAuthMessage = { version: 1, type: "call.auth.challenge", identityPeerId: this.identity.peerId, nonce, timestamp: Date.now() };
+    const message: CallAuthMessage = { version: 1, type: "call.auth.challenge", identityPeerId: this.identity.peerId, nonce, timestamp: Date.now(), capabilities: LOCAL_RISK_CAPABILITIES };
     this.transport.sendData(JSON.stringify(message), remotePeerId);
   }
 
@@ -699,6 +717,10 @@ export class CallController {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;
     const message = value as Partial<CallAuthMessage>;
     if (message.version !== 1 || typeof message.type !== "string" || !message.type.startsWith("call.auth.")) return false;
+    if (!validRiskPeerCapabilities(message.capabilities) || !compatibleCallPeer(message.capabilities)) {
+      this.rejectIncompatibleCallPeer(remotePeerId, validRiskPeerCapabilities(message.capabilities) ? message.capabilities.appVersion : undefined);
+      return true;
+    }
     if (Math.abs(Date.now() - Number(message.timestamp)) > 30_000) return true;
     if (message.type === "call.auth.challenge") void this.respondAuthChallenge(remotePeerId, message);
     if (message.type === "call.auth.proof") void this.acceptAuthProof(remotePeerId, message);
@@ -709,20 +731,20 @@ export class CallController {
     if (!this.identity || !this.transport || typeof message.nonce !== "string" || !this.peerId || !this.roomId) return;
     const publicProfile = publicIdentity(this.identity);
     const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, this.identity.privateKey, new TextEncoder().encode(this.authCanonical(remotePeerId, message.nonce, publicProfile)));
-    const proof: CallAuthMessage = { version: 1, type: "call.auth.proof", identity: publicProfile, nonce: message.nonce, timestamp: Date.now(), signature: bytesToBase64Url(new Uint8Array(signature)) };
+    const proof: CallAuthMessage = { version: 1, type: "call.auth.proof", identity: publicProfile, nonce: message.nonce, timestamp: Date.now(), capabilities: LOCAL_RISK_CAPABILITIES, signature: bytesToBase64Url(new Uint8Array(signature)) };
     this.transport.sendData(JSON.stringify(proof), remotePeerId);
   }
 
   private async acceptAuthProof(remotePeerId: string, message: Partial<Extract<CallAuthMessage, { type: "call.auth.proof" }>>): Promise<void> {
     const expectedNonce = this.authChallenges.get(remotePeerId);
     const identity = message.identity;
-    if (!expectedNonce || message.nonce !== expectedNonce || !identity || typeof message.signature !== "string") return;
-    if (!/^[A-Za-z0-9_-]{8,128}$/.test(identity.peerId) || identity.displayName.trim().length < 2 || identity.displayName.length > 80 || (identity.avatar !== undefined && !validAvatarDataUrl(identity.avatar))) return;
+    if (!expectedNonce || message.nonce !== expectedNonce || !identity || typeof message.signature !== "string" || !validRiskPeerCapabilities(message.capabilities) || !compatibleCallPeer(message.capabilities)) return;
+    if (identity.peerId !== remotePeerId || !/^[A-Za-z0-9_-]{8,128}$/.test(identity.peerId) || identity.displayName.trim().length < 2 || identity.displayName.length > 80 || (identity.avatar !== undefined && !validAvatarDataUrl(identity.avatar))) return;
     const trusted = this.trustedPeers.get(identity.peerId) ?? this.revokedPeers.get(identity.peerId);
     if (!trusted || JSON.stringify(trusted.publicKey) !== JSON.stringify(identity.publicKey)) return;
     try {
       const key = await crypto.subtle.importKey("jwk", trusted.publicKey, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
-      const valid = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, base64UrlToArrayBuffer(message.signature), new TextEncoder().encode(this.authCanonical(remotePeerId, expectedNonce, identity)));
+      const valid = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, base64UrlToArrayBuffer(message.signature), new TextEncoder().encode(this.authCanonical(remotePeerId, expectedNonce, identity, message.capabilities)));
       if (!valid) return;
       this.authChallenges.delete(remotePeerId);
       const timer = this.authTimers.get(remotePeerId); if (timer) clearTimeout(timer);
@@ -730,6 +752,7 @@ export class CallController {
       this.remoteIdentityPeerIds.set(remotePeerId, identity.peerId);
       this.authenticatedPeers.add(remotePeerId);
       if (this.revokedPeers.has(identity.peerId)) {
+        this.pendingRevokedPeers.delete(remotePeerId);
         this.revocationOnlyPeers.add(remotePeerId);
         this.transport?.revokePeerMedia(remotePeerId);
         useCallStore.getState().remove(remotePeerId);
@@ -778,8 +801,8 @@ export class CallController {
     if (!group) return;
     this.trustedPeers.clear();
     this.revokedPeers.clear();
-    group.members.forEach((peer) => this.trustedPeers.set(peer.peerId, peer));
-    group.removedMembers.forEach((peer) => this.revokedPeers.set(peer.peerId, peer));
+    (group.members ?? []).forEach((peer) => this.trustedPeers.set(peer.peerId, peer));
+    (group.removedMembers ?? []).forEach((peer) => this.revokedPeers.set(peer.peerId, peer));
     this.revocations = (group.revocations ?? []).filter(validGroupRevocationCertificate);
 
     for (const [remotePeerId, identityPeerId] of this.remoteIdentityPeerIds) {
@@ -797,17 +820,32 @@ export class CallController {
         await this.transport?.disconnect(remotePeerId);
       }
     }
+    const nextRendezvousId = this.roomId ? groupRendezvousId(group, "voice", this.roomId) : undefined;
+    if (nextRendezvousId && this.rendezvousId && nextRendezvousId !== this.rendezvousId && this.signaling && this.peerId) {
+      this.rendezvousId = nextRendezvousId;
+      await this.signaling.connect(nextRendezvousId, this.peerId);
+    }
   }
 
-  private authCanonical(remotePeerId: string, nonce: string, identity: PublicPeerIdentity): string {
+  private rejectIncompatibleCallPeer(remotePeerId: string, remoteVersion?: string): void {
+    const message = incompatiblePeerMessage(remoteVersion);
+    console.warn(message, { remotePeerId });
+    useCallStore.getState().setError(message);
+    this.pendingRevokedPeers.delete(remotePeerId);
+    useCallStore.getState().remove(remotePeerId);
+    void this.transport?.disconnect(remotePeerId);
+  }
+
+  private authCanonical(remotePeerId: string, nonce: string, identity: PublicPeerIdentity, capabilities: RiskPeerCapabilities = LOCAL_RISK_CAPABILITIES): string {
     const peers = [this.peerId ?? "", remotePeerId].sort().join(":");
-    return JSON.stringify({ protocol: "risk-call-auth-v1", roomId: this.roomId ?? "", peers, nonce, identity });
+    return JSON.stringify({ protocol: "risk-call-auth-v2", roomId: this.roomId ?? "", peers, nonce, identity, capabilities });
   }
 
   getDiagnostics(): CallDiagnostics {
     return {
       signaling: this.signaling?.getDiagnostics() ?? null,
       peerConnections: this.transport?.getDiagnostics() ?? [],
+      connectivity: this.connectivityDiagnostics(),
     };
   }
 
@@ -886,6 +924,11 @@ export class CallController {
   private bindSignaling(signaling: SignalingProvider, roomId: string, peerId: string): void {
     this.signalingUnsubscribers.push(
       signaling.onPeerJoined((peer) => {
+        if (this.mediaAuthenticationRequired && peer.clientVersion && !compatibleAppVersion(peer.clientVersion)) {
+          this.rejectIncompatibleCallPeer(peer.peerId, peer.clientVersion);
+          return;
+        }
+        if (this.mediaAuthenticationRequired && !this.isAdmittedCallPeer(peer.peerId)) return;
         const store = useCallStore.getState();
         const participant = store.participants[peer.peerId] ?? placeholderParticipant(peer.peerId);
         store.upsert({ ...participant, connection: participant.connection ?? "new" });
@@ -898,21 +941,26 @@ export class CallController {
         this.pendingPeerStates.delete(remotePeerId);
         this.remoteIdentityPeerIds.delete(remotePeerId);
         this.revocationOnlyPeers.delete(remotePeerId);
+        this.pendingRevokedPeers.delete(remotePeerId);
         this.authChallenges.delete(remotePeerId);
         const timer = this.authTimers.get(remotePeerId); if (timer) clearTimeout(timer);
         this.authTimers.delete(remotePeerId);
         void this.transport?.disconnect(remotePeerId);
       }),
       signaling.onOffer((message) => {
+        if (this.mediaAuthenticationRequired && !this.isAdmittedCallPeer(message.fromPeerId)) return;
         void this.transport?.acceptOffer(message.fromPeerId, message.payload.sdp).catch((error) => useCallStore.getState().setError(String(error)));
       }),
       signaling.onAnswer((message) => {
+        if (this.mediaAuthenticationRequired && !this.isAdmittedCallPeer(message.fromPeerId)) return;
         void this.transport?.acceptAnswer(message.fromPeerId, message.payload.sdp).catch((error) => useCallStore.getState().setError(String(error)));
       }),
       signaling.onIceCandidate((message) => {
+        if (this.mediaAuthenticationRequired && !this.isAdmittedCallPeer(message.fromPeerId)) return;
         void this.transport?.addIceCandidate(message.fromPeerId, message.payload.candidate).catch((error) => useCallStore.getState().setError(String(error)));
       }),
       signaling.onPeerState((message) => {
+        if (this.mediaAuthenticationRequired && !this.isAdmittedCallPeer(message.fromPeerId)) return;
         if (this.revocationOnlyPeers.has(message.fromPeerId)) return;
         if (this.mediaAuthenticationRequired && !this.authenticatedPeers.has(message.fromPeerId)) {
           this.pendingPeerStates.set(message.fromPeerId, message.payload.state);
@@ -980,6 +1028,7 @@ export class CallController {
     this.cameraTrack = undefined;
     this.screenStream = undefined;
     this.roomId = undefined;
+    this.rendezvousId = undefined;
     this.peerId = undefined;
     this.displayName = "Participante";
     this.avatar = undefined;
@@ -997,6 +1046,7 @@ export class CallController {
     this.pendingPeerStates.clear();
     this.remoteIdentityPeerIds.clear();
     this.revocationOnlyPeers.clear();
+    this.pendingRevokedPeers.clear();
     this.mediaAuthenticationRequired = false;
     this.state = { microphone: true, camera: false, screenShare: false };
 
@@ -1022,7 +1072,14 @@ export class CallController {
     return {
       signaling: this.signaling?.getDiagnostics() ?? null,
       peerConnections: await this.transport?.collectDiagnostics() ?? [],
+      connectivity: this.connectivityDiagnostics(),
     };
+  }
+
+  private connectivityDiagnostics(): CallDiagnostics["connectivity"] {
+    return this.turnAvailable
+      ? { mode: "turn", label: "TURN disponível para fallback" }
+      : { mode: "stun-only", label: "Somente STUN: redes restritivas podem bloquear a chamada" };
   }
 
   private sendProfile(targetPeerId?: string): void {
@@ -1039,5 +1096,14 @@ export class CallController {
     const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
     const state = reconcileRemoteMediaState(participant.streams, remoteState);
     store.upsert({ ...participant, state });
+  }
+
+  private isAdmittedCallPeer(remotePeerId: string): boolean {
+    if (this.trustedPeers.has(remotePeerId)) return true;
+    if (!this.revokedPeers.has(remotePeerId)) return false;
+    if (this.pendingRevokedPeers.has(remotePeerId) || this.revocationOnlyPeers.has(remotePeerId)) return true;
+    if (this.pendingRevokedPeers.size + this.revocationOnlyPeers.size >= 1) return false;
+    this.pendingRevokedPeers.add(remotePeerId);
+    return true;
   }
 }

@@ -22,7 +22,7 @@ import {
   VideoOff,
   PhoneOff,
 } from "lucide-react";
-import { api, type Channel, type ChatMessage, type Community, type CurrentUser, type Friend, type PendingFriend } from "./api";
+import { api, resetApiRuntimeConfig, type Channel, type ChatMessage, type Community, type CurrentUser, type Friend, type PendingFriend } from "./api";
 import { CallController } from "./call";
 import {
   ChatController,
@@ -32,6 +32,7 @@ import {
   type ChatConnectionStatus,
 } from "./chat";
 import { CallWorkspace } from "./components/CallWorkspace";
+import { AppErrorBoundary } from "./components/AppErrorBoundary";
 import { ConversationTimeline } from "./components/ConversationTimeline";
 import { GroupInvitePanel } from "./components/GroupInvitePanel";
 import { GroupEditor } from "./components/GroupEditor";
@@ -43,6 +44,8 @@ import { ProfileAvatar } from "./components/ProfileAvatar";
 import { ProfileEditor } from "./components/ProfileEditor";
 import { VoiceVideoSettingsPanel } from "./components/VoiceVideoSettingsPanel";
 import type { LocalProfile } from "./services/offline/profile";
+import { incompatiblePeerMessage } from "./services/protocol-compatibility";
+import { resetChatStorageRuntime } from "./services/offline/chat-storage";
 import { dedupeMembersForDisplay } from "./services/offline/member-display";
 import { deleteLocalGroupChannel, renameLocalGroupChannel } from "./services/offline/channel-storage";
 import {
@@ -51,10 +54,12 @@ import {
   deleteLocalFriend,
   deleteLocalGroup,
   getOrCreateLocalIdentity,
+  groupRendezvousId,
   loadLocalFriends,
   loadLocalGroups,
   publicIdentity,
   removeLocalGroupMember,
+  resetSocialStorageRuntime,
   setLocalGroupAdministrator,
   type LocalGroup,
   type PublicPeerIdentity,
@@ -319,7 +324,11 @@ function SocialHome() {
         return [...current, message].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
       });
     });
-    const offStatus = chat.onStatus((status) => { if (alive) setChatStatus(status); });
+    const offStatus = chat.onStatus((status) => {
+      if (!alive) return;
+      setChatStatus(status);
+      if (status === "incompatible") setError(incompatiblePeerMessage());
+    });
     const offAttachment = chat.onAttachment((record) => {
       if (!alive || record.channelId !== conversationId) return;
       setAttachments((current) => upsertAttachment(current, record));
@@ -371,9 +380,10 @@ function SocialHome() {
         ? {
             identity,
             trustedPeers: localGroup.members,
-            revokedPeers: localGroup.removedMembers,
+            revokedPeers: localGroup.removedMembers ?? [],
             revocations: localGroup.revocations,
             groupId: localGroup.groupId,
+            rendezvousId: groupRendezvousId(localGroup, "voice", channel.voiceRoomId),
             requireIdentityAuthentication: true,
           }
         : {});
@@ -426,9 +436,10 @@ function SocialHome() {
       await chat.connect(activeChannel.id, currentUser.displayName, iceServers, group ? {
         identity,
         trustedPeers: group.members,
-        revokedPeers: group.removedMembers,
+        revokedPeers: group.removedMembers ?? [],
         revocations: group.revocations,
         groupId: group.groupId,
+        rendezvousId: groupRendezvousId(group, "chat", activeChannel.id),
         requireIdentityAuthentication: true,
       } : {});
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Falha ao conectar o chat"); }
@@ -443,7 +454,7 @@ function SocialHome() {
     const content = input.value.trim();
     if (!content) return;
     try {
-      if (chatStatus === "disconnected" || chatStatus === "error") await chat.queue(conversationId, content, currentUser.displayName);
+      if (chatStatus === "disconnected" || chatStatus === "error" || chatStatus === "incompatible") await chat.queue(conversationId, content, currentUser.displayName);
       else await chat.send(content);
       input.value = "";
     }
@@ -703,7 +714,7 @@ function SocialHome() {
       <section className="content-panel">
         {error && <div className="global-error" onClick={() => setError("")}>{error}</div>}
         {activeFriend ? <>
-          <header className="content-header"><MessageCircle/><strong>{activeFriend.displayName}</strong><span>Mensagem direta P2P</span><input className="message-search" value={messageSearch} onChange={(event) => setMessageSearch(event.target.value)} placeholder="Buscar"/><button className={`chat-connect ${chatStatus}`} disabled={!privateChannelId || chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat privado conectado" : chatStatus === "connected" ? "Aguardando amigo…" : chatStatus === "connecting" ? "Conectando…" : "Conectar P2P"}</button></header>
+          <header className="content-header"><MessageCircle/><strong>{activeFriend.displayName}</strong><span>Mensagem direta P2P</span><input className="message-search" value={messageSearch} onChange={(event) => setMessageSearch(event.target.value)} placeholder="Buscar"/><button className={`chat-connect ${chatStatus}`} disabled={!privateChannelId || chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat privado conectado" : chatStatus === "connected" ? "Aguardando amigo…" : chatStatus === "connecting" ? "Conectando…" : chatStatus === "incompatible" ? "Versão incompatível" : "Conectar P2P"}</button></header>
           <div className="messages">
             {hasOlderMessages && <button className="load-older-messages" disabled={loadingOlderMessages} onClick={() => void loadOlderMessages()}>{loadingOlderMessages ? "Carregando…" : "Carregar mensagens anteriores"}</button>}
             {timeline}
@@ -736,7 +747,7 @@ function SocialHome() {
             {communities.length > 32 && <small>A atividade acompanha os primeiros 32 grupos neste dispositivo.</small>}
           </aside></div>
         </> : activeChannel?.kind === "text" ? <>
-          <header className="content-header"><Hash/><strong>{activeChannel.name}</strong><span>{selectedCommunity.name}</span><input className="message-search" value={messageSearch} onChange={(event) => setMessageSearch(event.target.value)} placeholder="Buscar"/><button className={`chat-connect ${chatStatus}`} disabled={chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat P2P conectado" : chatStatus === "connected" ? "Aguardando peer…" : chatStatus === "connecting" ? "Conectando…" : "Conectar chat"}</button></header>
+          <header className="content-header"><Hash/><strong>{activeChannel.name}</strong><span>{selectedCommunity.name}</span><input className="message-search" value={messageSearch} onChange={(event) => setMessageSearch(event.target.value)} placeholder="Buscar"/><button className={`chat-connect ${chatStatus}`} disabled={chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat P2P conectado" : chatStatus === "connected" ? "Aguardando peer…" : chatStatus === "connecting" ? "Conectando…" : chatStatus === "incompatible" ? "Versão incompatível" : "Conectar chat"}</button></header>
           <div className="messages">
             {hasOlderMessages && <button className="load-older-messages" disabled={loadingOlderMessages} onClick={() => void loadOlderMessages()}>{loadingOlderMessages ? "Carregando…" : "Carregar mensagens anteriores"}</button>}
             {timeline}
@@ -849,4 +860,23 @@ function App() {
   </div>;
 }
 
-createRoot(document.getElementById("root")!).render(<React.StrictMode><App/></React.StrictMode>);
+function DesktopRecoveryNotice() {
+  const [status, setStatus] = useState<RiskDesktopBackendStatus>();
+  useEffect(() => window.desktop?.onBackendStatus?.((next) => {
+    resetApiRuntimeConfig();
+    resetChatStorageRuntime();
+    resetSocialStorageRuntime();
+    setStatus(next);
+  }), []);
+  if (!status) return null;
+  return <button
+    className={`desktop-recovery-notice ${status.state}`}
+    onClick={() => setStatus(undefined)}
+    title="Clique para fechar"
+  >{status.message}</button>;
+}
+
+createRoot(document.getElementById("root")!).render(<React.StrictMode>
+  <AppErrorBoundary><App/></AppErrorBoundary>
+  <DesktopRecoveryNotice/>
+</React.StrictMode>);

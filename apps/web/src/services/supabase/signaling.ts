@@ -29,7 +29,7 @@ type CallbackSets = { [Key in keyof CallbackMap]: Set<CallbackMap[Key]> };
 type RateWindow = { startedAt: number; count: number };
 
 const DEBUG = import.meta.env.VITE_DEBUG_SIGNALING === "true";
-const CLIENT_VERSION = "risk-web-1";
+const CLIENT_VERSION = import.meta.env.VITE_RISK_APP_VERSION ?? "0.2.0";
 
 export class SupabaseSignalingProvider implements SignalingProvider {
   private readonly callbacks: CallbackSets = {

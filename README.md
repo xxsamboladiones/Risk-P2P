@@ -169,6 +169,8 @@ VITE_ICE_SERVERS_JSON=[{"urls":["stun:stun.example.com:3478"]}]
 
 Nunca coloque `service_role`, senha de banco, `JWT_SECRET` ou `TURN_SECRET` no frontend.
 
+Se a lista ICE contiver apenas `stun:`, o Risk opera em **STUN direto**. Isso funciona em muitas redes domésticas, mas não garante conexão entre CGNAT, NAT simétrico ou firewalls restritivos. A tela de diagnóstico identifica explicitamente `Somente STUN`; TURN só aparece como disponível quando uma URL `turn:`/`turns:` foi realmente entregue ao app.
+
 ## Desenvolvimento
 
 Pré-requisitos:
@@ -257,10 +259,10 @@ pnpm typecheck
 pnpm test
 ```
 
-A CI valida TypeScript, testes Web/P2P, build Web, duas instâncias empacotadas do Electron e o sidecar Rust.
+A CI valida TypeScript, testes Web/P2P, build Web, migração de um banco 0.1 preenchido e duas instâncias empacotadas do Electron. Cada instância precisa renderizar React, iniciar o sidecar Rust saudável e conseguir gravar `localStorage` e IndexedDB na origem persistente.
 O backend desktop também é verificado no Windows para cobrir os caminhos específicos de captura de áudio desse sistema.
 
-Tags `v*` executam o workflow de release para gerar NSIS, AppImage, DEB e `SHA256SUMS.txt`. Para assinar o Windows, configure `CSC_LINK` e `CSC_KEY_PASSWORD` como secrets do repositório. O servidor PostgreSQL antigo só é ativado explicitamente com `VITE_ENABLE_LEGACY_SERVER=true` e o profile Docker `legacy-server`.
+Tags `v*` executam o workflow de release para gerar NSIS, AppImage, DEB, atestados de proveniência e `SHA256SUMS.txt`. Releases Windows exigem `CSC_LINK` e `CSC_KEY_PASSWORD`: o pipeline interrompe o build se faltarem e valida a assinatura Authenticode dos executáveis antes da publicação. Builds locais continuam podendo ser não assinados. O servidor PostgreSQL antigo só é ativado explicitamente com `VITE_ENABLE_LEGACY_SERVER=true` e o profile Docker `legacy-server`.
 
 ## Destaques da versão Alpha atual
 
@@ -278,6 +280,10 @@ Esta versão adiciona e melhora principalmente:
 - nova identidade visual do aplicativo;
 - manifesto de grupo v2 assinado, com canais, membros e remoções consistentes;
 - resolução determinística de edições concorrentes e epoch de administradores controlado pelo proprietário;
+- delegações de administrador assinadas pelo proprietário e verificáveis mesmo por peers atrasados;
+- rendezvous de grupo rotacionado após remoções, evitando que ex-membros continuem descobrindo a sala;
+- negociação explícita de versão/capacidades antes de liberar chat ou mídia;
+- recuperação visual de falhas do renderer e uma tentativa controlada de reinício do sidecar;
 - revogação P2P retransmissível também ao reconectar diretamente em uma chamada;
 - reparo manual e seguro de aliases antigos da identidade local;
 - mensagens offline na caixa de saída até outro peer confirmar o recebimento;

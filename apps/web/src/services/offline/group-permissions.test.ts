@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   canManageLocalGroup,
   compareGroupManifestRevisions,
+  createGroupAdministratorGrant,
   createGroupRevocationCertificate,
+  groupRendezvousId,
   reconcileIdentityMembership,
   resolveLocalGroupManifest,
   verifyGroupRevocationCertificate,
@@ -161,6 +163,35 @@ describe("permissões de grupo local", () => {
     expect(merged.administratorPeerIds).toEqual([]);
   });
 
+  it("converge para o rendezvous rotacionado do proprietário", () => {
+    const owner = peer("owner_12345678", "Proprietário", "owner");
+    const current: LocalGroup = {
+      ...group,
+      members: [owner],
+      ownerPeerId: owner.peerId,
+      joinedAt: 1,
+      manifestActorPeerId: owner.peerId,
+      manifestOperationId: "operation_old_12345678",
+      administratorEpoch: 1,
+      revocations: [],
+      rendezvousVersion: 1,
+      rendezvousSecret: "secret_old_12345678",
+    };
+    const rotated: LocalGroup = {
+      ...current,
+      membershipVersion: 2,
+      manifestVersion: 2,
+      manifestOperationId: "operation_new_12345678",
+      rendezvousVersion: 2,
+      rendezvousSecret: "secret_new_12345678",
+    };
+    const merged = resolveLocalGroupManifest(current, rotated, owner.peerId);
+    expect(merged.rendezvousVersion).toBe(2);
+    expect(merged.rendezvousSecret).toBe("secret_new_12345678");
+    expect(groupRendezvousId(merged, "chat", "channel_12345678"))
+      .not.toBe(groupRendezvousId(current, "chat", "channel_12345678"));
+  });
+
   it("cria uma revogação assinada que pode ser retransmitida sem a chave privada do emissor", async () => {
     const owner = await createIdentity("owner_12345678", "Proprietário");
     const member = await createIdentity("member_12345678", "Membro");
@@ -194,13 +225,27 @@ describe("permissões de grupo local", () => {
       administratorEpoch: 1,
       revocations: [],
     };
+    const administratorGrant = await createGroupAdministratorGrant(authorized, administrator, owner, 2);
+    authorized.administratorEpoch = 2;
+    authorized.administratorGrants = [administratorGrant];
     const certificate = await createGroupRevocationCertificate(authorized, member, administrator, 2);
     expect(await verifyGroupRevocationCertificate(certificate, authorized)).toBe(true);
     expect(await verifyGroupRevocationCertificate(certificate, {
       ...authorized,
       administratorPeerIds: [],
-      administratorEpoch: 2,
+      administratorGrants: [],
+      administratorEpoch: 1,
+    })).toBe(true);
+    expect(await verifyGroupRevocationCertificate(certificate, {
+      ...authorized,
+      administratorPeerIds: [],
+      administratorGrants: [],
+      administratorEpoch: 3,
     })).toBe(false);
+    expect(await verifyGroupRevocationCertificate({
+      ...certificate,
+      administratorGrant: { ...administratorGrant, administratorPublicKey: member.publicKey },
+    }, authorized)).toBe(false);
   });
 });
 

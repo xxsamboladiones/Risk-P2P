@@ -115,6 +115,10 @@ let pendingDisplaySelection: PendingDisplaySelection | undefined;
 const knownDisplaySources = new Map<string, PendingDisplaySelection>();
 let backendProcess: ChildProcess | undefined;
 let backendConfig: { baseUrl: string; token: string } | undefined;
+let backendWebOrigin = PACKAGED_ORIGIN;
+let backendRestartAttempts = 0;
+let backendRestarting = false;
+let isQuitting = false;
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) app.quit();
@@ -213,12 +217,14 @@ async function startBackend(webOrigin: string): Promise<{ baseUrl: string; token
     child.once("error", (error) => {
       if (settled) return;
       settled = true;
+      if (backendProcess === child) backendProcess = undefined;
       cleanup();
       reject(error);
     });
     child.once("exit", (code, signal) => {
       if (settled) return;
       settled = true;
+      if (backendProcess === child) backendProcess = undefined;
       cleanup();
       reject(new Error(`Backend local encerrou antes do readiness (code=${code ?? "?"}, signal=${signal ?? "?"}).`));
     });
@@ -257,7 +263,43 @@ async function startBackend(webOrigin: string): Promise<{ baseUrl: string; token
 
   const response = await fetch(`${baseUrl}/health`, { signal: AbortSignal.timeout(5_000) });
   if (!response.ok) throw new Error(`Healthcheck do backend falhou com HTTP ${response.status}.`);
+  child.once("exit", (code, signal) => {
+    if (backendProcess !== child) return;
+    backendProcess = undefined;
+    backendConfig = undefined;
+    if (!isQuitting) void recoverBackendAfterCrash(code, signal);
+  });
   return { baseUrl, token };
+}
+
+function broadcastBackendStatus(payload: { state: "restarting" | "recovered" | "failed"; message: string }): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send("backend:status", payload);
+  }
+}
+
+async function recoverBackendAfterCrash(code: number | null, signal: NodeJS.Signals | null): Promise<void> {
+  if (backendRestarting || backendRestartAttempts >= 1 || isQuitting) {
+    const message = `O backend local encerrou inesperadamente (code=${code ?? "?"}, signal=${signal ?? "?"}) e não pôde ser reiniciado.`;
+    console.error(message);
+    broadcastBackendStatus({ state: "failed", message });
+    return;
+  }
+  backendRestarting = true;
+  backendRestartAttempts += 1;
+  broadcastBackendStatus({ state: "restarting", message: "O backend local parou. Tentando recuperar a sessão…" });
+  await new Promise((resolve) => setTimeout(resolve, 750));
+  try {
+    backendConfig = await startBackend(backendWebOrigin);
+    await publishDevBackendBridge(backendConfig);
+    broadcastBackendStatus({ state: "recovered", message: "Backend local recuperado. Você já pode continuar." });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("Falha ao reiniciar o backend local", error);
+    broadcastBackendStatus({ state: "failed", message: `Não foi possível recuperar o backend local: ${message}` });
+  } finally {
+    backendRestarting = false;
+  }
 }
 
 function stopBackend(): void {
@@ -401,6 +443,7 @@ ipcMain.handle("screen:select", async (event, sourceId: unknown) => {
 
 function createWindow(): void {
   const reportingPackagedOrigin = app.isPackaged && Boolean(PACKAGED_ORIGIN_REPORT_FILE);
+  let rendererRecoveryAttempted = false;
   const window = new BrowserWindow({
     width: 1280,
     height: 800,
@@ -421,6 +464,18 @@ function createWindow(): void {
   window.webContents.on("will-navigate", (event, targetUrl) => {
     if (!isTrustedRendererUrl(targetUrl)) event.preventDefault();
   });
+  window.webContents.on("render-process-gone", (_event, details) => {
+    console.error("Renderer do Risk encerrou inesperadamente", details);
+    if (rendererRecoveryAttempted || window.isDestroyed() || isQuitting) return;
+    rendererRecoveryAttempted = true;
+    setTimeout(() => { if (!window.isDestroyed()) void window.loadURL(pageUrl); }, 500);
+  });
+  window.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedUrl, isMainFrame) => {
+    if (!isMainFrame || errorCode === -3 || rendererRecoveryAttempted || window.isDestroyed() || isQuitting) return;
+    console.error("Falha ao carregar renderer do Risk", { errorCode, errorDescription, validatedUrl });
+    rendererRecoveryAttempted = true;
+    setTimeout(() => { if (!window.isDestroyed()) void window.loadURL(pageUrl); }, 500);
+  });
   window.webContents.once("did-finish-load", () => {
     if (!reportingPackagedOrigin || !PACKAGED_ORIGIN_REPORT_FILE) return;
     void (async () => {
@@ -431,21 +486,69 @@ function createWindow(): void {
             await new Promise((resolve) => setTimeout(resolve, 50));
           }
           const root = document.getElementById("root");
+          let backendHealth = false;
+          let backendLoopback = false;
+          let storageWritable = false;
+          let indexedDbWritable = false;
+          try {
+            const config = await window.desktop.getBackendConfig();
+            const backendUrl = new URL(config.baseUrl);
+            backendLoopback = backendUrl.protocol === "http:" && backendUrl.hostname === "127.0.0.1" && config.token.length >= 32;
+            const normalizedBaseUrl = config.baseUrl.endsWith("/") ? config.baseUrl.slice(0, -1) : config.baseUrl;
+            const response = await fetch(normalizedBaseUrl + "/health");
+            backendHealth = response.ok;
+          } catch {}
+          try {
+            const marker = "risk-packaged-smoke";
+            localStorage.setItem(marker, "ok");
+            storageWritable = localStorage.getItem(marker) === "ok";
+            localStorage.removeItem(marker);
+          } catch {}
+          try {
+            indexedDbWritable = await new Promise((resolve) => {
+              const request = indexedDB.open("risk-packaged-smoke", 1);
+              request.onupgradeneeded = () => request.result.createObjectStore("health");
+              request.onerror = () => resolve(false);
+              request.onsuccess = () => {
+                request.result.close();
+                const deletion = indexedDB.deleteDatabase("risk-packaged-smoke");
+                deletion.onerror = () => resolve(false);
+                deletion.onsuccess = () => resolve(true);
+              };
+            });
+          } catch {}
           return {
             origin: window.location.origin,
             href: window.location.href,
             rootChildren: root?.childElementCount ?? 0,
             rootTextLength: root?.textContent?.trim().length ?? 0,
+            backendHealth,
+            backendLoopback,
+            storageWritable,
+            indexedDbWritable,
           };
         })()`,
         true,
-      ) as { origin?: unknown; href?: unknown; rootChildren?: unknown; rootTextLength?: unknown };
+      ) as {
+        origin?: unknown;
+        href?: unknown;
+        rootChildren?: unknown;
+        rootTextLength?: unknown;
+        backendHealth?: unknown;
+        backendLoopback?: unknown;
+        storageWritable?: unknown;
+        indexedDbWritable?: unknown;
+      };
       await writeFile(PACKAGED_ORIGIN_REPORT_FILE, JSON.stringify({
         packaged: app.isPackaged,
         origin: location.origin,
         href: location.href,
         rootChildren: location.rootChildren,
         rootTextLength: location.rootTextLength,
+        backendHealth: location.backendHealth,
+        backendLoopback: location.backendLoopback,
+        storageWritable: location.storageWritable,
+        indexedDbWritable: location.indexedDbWritable,
       }), "utf8");
       app.quit();
     })().catch((error) => {
@@ -480,6 +583,7 @@ if (hasSingleInstanceLock) {
       pageUrl = "http://localhost:5173";
     }
     const webOrigin = app.isPackaged ? PACKAGED_ORIGIN : pageUrl;
+    backendWebOrigin = webOrigin;
     backendConfig = await startBackend(webOrigin);
     await publishDevBackendBridge(backendConfig);
     session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
@@ -537,6 +641,7 @@ if (hasSingleInstanceLock) {
 }
 
 app.on("before-quit", () => {
+  isQuitting = true;
   pendingDisplaySelection = undefined;
   knownDisplaySources.clear();
   void clearDevBackendBridge();

@@ -264,8 +264,7 @@ async fn wait_for_mix_nodes(
         }
 
         let graph = read_graph().await?;
-        (last_sink, last_source, last_sink_ports, last_source_ports) =
-            mix_graph_readiness(&graph);
+        (last_sink, last_source, last_sink_ports, last_source_ports) = mix_graph_readiness(&graph);
         if last_sink && last_source && last_sink_ports > 0 && last_source_ports > 0 {
             return Ok(());
         }
@@ -288,7 +287,10 @@ async fn wait_for_mix_nodes(
 
 #[cfg(target_os = "linux")]
 fn mix_graph_readiness(graph: &[PwObject]) -> (bool, bool, usize, usize) {
-    let sink_id = graph.iter().find(|object| is_mix_sink(object)).and_then(|object| object.id);
+    let sink_id = graph
+        .iter()
+        .find(|object| is_mix_sink(object))
+        .and_then(|object| object.id);
     let source_id = graph
         .iter()
         .find(|object| is_mix_source(object))
@@ -311,7 +313,12 @@ fn mix_graph_readiness(graph: &[PwObject]) -> (bool, bool, usize, usize) {
             .count()
     });
 
-    (sink_id.is_some(), source_id.is_some(), sink_ports, source_ports)
+    (
+        sink_id.is_some(),
+        source_id.is_some(),
+        sink_ports,
+        source_ports,
+    )
 }
 
 #[cfg(target_os = "linux")]

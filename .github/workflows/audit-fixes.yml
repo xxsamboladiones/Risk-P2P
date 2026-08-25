@@ -1,10 +1,101 @@
-name: Audit fixes (retired)
+name: Apply concurrent chat ownership fix
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - hotfix/group-invite-ack-stall
+    paths:
+      - .github/workflows/audit-fixes.yml
+
+permissions:
+  contents: write
 
 jobs:
-  retired:
+  apply:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Temporary audit workflow retired after validated fixes were applied."
+      - uses: actions/checkout@v4
+        with:
+          ref: hotfix/group-invite-ack-stall
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Patch chat ownership
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("apps/web/src/main.tsx")
+          text = path.read_text(encoding="utf-8")
+
+          old = '''  useEffect(() => {
+            if (!currentUser) return;
+            let alive = true;
+            void Promise.all([loadLocalGroups(), api.turnCredentials(token)])
+              .then(([groups, { iceServers }]) => { if (alive) return backgroundChats.sync(groups, currentUser.displayName, iceServers, activeChannel?.id); })
+              .catch(() => undefined);
+            return () => { alive = false; };
+          }, [activeChannel?.id, currentUser, communities, token]);'''
+          new = '''  useEffect(() => {
+            if (!currentUser) return;
+            let alive = true;
+            const reservedChannelIds = roomId && callContext?.textChannelId ? [callContext.textChannelId] : [];
+            void Promise.all([loadLocalGroups(), api.turnCredentials(token)])
+              .then(([groups, { iceServers }]) => { if (alive) return backgroundChats.sync(groups, currentUser.displayName, iceServers, activeChannel?.id, reservedChannelIds); })
+              .catch(() => undefined);
+            return () => { alive = false; };
+          }, [activeChannel?.id, callContext?.textChannelId, currentUser, communities, roomId, token]);'''
+          if old not in text:
+              raise SystemExit("background chat sync block not found")
+          text = text.replace(old, new, 1)
+
+          old = '''      const textChannel = availableChannels.find((item) => item.kind === "text") ?? null;
+          setCallContext({'''
+          new = '''      const textChannel = availableChannels.find((item) => item.kind === "text") ?? null;
+          if (textChannel) {
+            await backgroundChats.release(textChannel.id);
+            if (!activeFriend && activeChannel?.id === textChannel.id) {
+              await chat.disconnect().catch(() => undefined);
+              setChatStatus("disconnected");
+            }
+          }
+          setCallContext({'''
+          if old not in text:
+              raise SystemExit("enterVoice text channel block not found")
+          text = text.replace(old, new, 1)
+
+          old = '''      if (!activeChannel || activeChannel.kind !== "text") return;
+          const [identity, groups] = await Promise.all(['''
+          new = '''      if (!activeChannel || activeChannel.kind !== "text") return;
+          if (roomId && callContext?.textChannelId === activeChannel.id) {
+            throw new Error("Este canal já pertence ao chat automático da chamada enquanto você estiver na sala de voz.");
+          }
+          const [identity, groups] = await Promise.all(['''
+          if old not in text:
+              raise SystemExit("group connect block not found")
+          text = text.replace(old, new, 1)
+
+          old = '''      await Promise.all([chat.disconnect(), callChat.disconnect()]);'''
+          new = '''      await Promise.all([chat.disconnect(), callChat.disconnect(), backgroundChats.disconnect()]);'''
+          if old not in text:
+              raise SystemExit("logout disconnect block not found")
+          text = text.replace(old, new, 1)
+
+          path.write_text(text, encoding="utf-8")
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build:web
+      - name: Commit validated fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add apps/web/src/main.tsx
+          git diff --cached --check
+          git commit -m "fix(chat): isolate call chat from foreground sessions"
+          git push origin HEAD:hotfix/group-invite-ack-stall

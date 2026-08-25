@@ -42,6 +42,12 @@ export function P2PInvitePanel({ type, token, displayName, group, initialMode = 
       window.clearInterval(timer);
       const current = service.current;
       service.current = undefined;
+      // Depois de accepted/rejected o InviteService ainda mantém o DataChannel
+      // vivo por alguns instantes para garantir a entrega do invite.ack. Entrar
+      // no grupo desmonta este painel imediatamente; não podemos cancelar essa
+      // finalização ou o criador interpreta o fechamento como desconexão.
+      const finalStatus = current?.state?.status;
+      if (finalStatus === "accepted" || finalStatus === "rejected") return;
       void current?.cancel(false);
     };
   }, []);

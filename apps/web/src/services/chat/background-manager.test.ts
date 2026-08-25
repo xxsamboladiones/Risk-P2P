@@ -45,6 +45,7 @@ function groupWithTextChannels(...ids: string[]): LocalGroup {
     rendezvousSecret: "A".repeat(43),
     members: [],
     channels: ids.map((id) => ({ id, name: id, kind: "text" as const, voiceRoomId: null })),
+    joinedAt: 0,
     createdAt: new Date(0).toISOString(),
     updatedAt: new Date(0).toISOString(),
   } as LocalGroup;

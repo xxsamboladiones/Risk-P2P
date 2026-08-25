@@ -23,6 +23,8 @@
 - aplicativo Electron para Windows e Linux.
 - manifesto versionado de grupos com remoções propagadas entre os membros;
 - cargos locais de proprietário/administrador, gerenciamento de membros e revogação assinada via WebRTC;
+- certificados de remoção retransmissíveis, sem liberar chat, histórico, anexos ou mídia ao peer removido;
+- autorização bilateral antes de renderizar ou reproduzir qualquer mídia remota de grupo;
 - entrega de mensagens P2P com caixa de saída local, confirmação e reenvio;
 - perfil assinado e sincronizado sem acoplar a foto ao manifesto do grupo;
 - busca local, diagnóstico de conexão e estimativa de armazenamento;
@@ -273,8 +275,10 @@ Esta versão adiciona e melhora principalmente:
 - gerenciamento de grupos e canais;
 - melhorias de estabilidade e conexão P2P;
 - suporte experimental a áudio de screen share via PipeWire no Linux;
-- nova identidade visual do aplicativo.
+- nova identidade visual do aplicativo;
 - manifesto de grupo v2 assinado, com canais, membros e remoções consistentes;
+- resolução determinística de edições concorrentes e epoch de administradores controlado pelo proprietário;
+- revogação P2P retransmissível também ao reconectar diretamente em uma chamada;
 - reparo manual e seguro de aliases antigos da identidade local;
 - mensagens offline na caixa de saída até outro peer confirmar o recebimento;
 - diagnóstico de Presence, WebRTC, ICE, RTT, jitter e perda sem expor SDP ou candidatos;
@@ -282,6 +286,11 @@ Esta versão adiciona e melhora principalmente:
 - busca no histórico local e visão de uso do armazenamento;
 - paginação do histórico SQLite/IndexedDB para conversas longas;
 - controle de ensurdecer e sincronização assinada de perfil.
+
+Limites defensivos desta fase Alpha: até 48 membros ativos e 48 certificados de
+revogação por grupo, oito chats em segundo plano e 32 grupos monitorados na área
+de atividade. Uma identidade revogada não volta ao mesmo grupo; um novo convite
+exige uma nova identidade P2P.
 
 ## Documentação
 

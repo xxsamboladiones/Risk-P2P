@@ -158,6 +158,26 @@ describe("MeshWebRTCTransport", () => {
     expect(FakePeerConnection.addedTracks).toEqual([track]);
   });
 
+  it("mantém mídia remota fora da UI até a autorização criptográfica", async () => {
+    const peerId = "00000000-0000-4000-8000-000000000002";
+    const callbacks = events();
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
+    transport.requireMediaAuthorization();
+    await transport.connect(peerId, false);
+    const track = { id: "remote-camera", kind: "video", enabled: true } as MediaStreamTrack;
+    const stream = { id: "remote-stream", getTracks: () => [track] } as unknown as MediaStream;
+
+    FakePeerConnection.instances[0]!.ontrack?.({ streams: [stream] } as unknown as RTCTrackEvent);
+
+    expect(track.enabled).toBe(false);
+    expect(callbacks.onRemoteStream).not.toHaveBeenCalled();
+    await transport.authorizePeerMedia(peerId);
+    expect(track.enabled).toBe(true);
+    expect(callbacks.onRemoteStream).toHaveBeenCalledWith(peerId, stream);
+    transport.revokePeerMedia(peerId);
+    expect(track.enabled).toBe(false);
+  });
+
   it("preserva renegociação pendente se a câmera/tela ligar enquanto uma offer está em voo", async () => {
     const callbacks = events();
     const peerId = "00000000-0000-4000-8000-000000000002";

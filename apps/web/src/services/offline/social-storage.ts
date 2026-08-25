@@ -5,6 +5,18 @@ export type PublicPeerIdentity = { peerId: string; publicKey: JsonWebKey; displa
 export type LocalIdentity = PublicPeerIdentity & { id: "self"; privateKey: CryptoKey };
 export type LocalFriend = PublicPeerIdentity & { addedAt: number };
 export type LocalGroupChannel = { id: string; name: string; kind: "text" | "voice"; voiceRoomId?: string | null };
+export type GroupRevocationCertificate = {
+  version: 1;
+  groupId: string;
+  targetPeerId: string;
+  targetPublicKey: JsonWebKey;
+  issuerPeerId: string;
+  membershipVersion: number;
+  administratorEpoch: number;
+  messageId: string;
+  timestamp: number;
+  signature: string;
+};
 export type PublicGroupMetadata = {
   groupId: string;
   name: string;
@@ -16,16 +28,44 @@ export type PublicGroupMetadata = {
   administratorPeerIds: string[];
   removedPeerIds: string[];
   removedMembers: PublicPeerIdentity[];
+  manifestActorPeerId?: string;
+  manifestOperationId?: string;
+  administratorEpoch?: number;
+  revocations?: GroupRevocationCertificate[];
   /** Incluída em convites criados por administradores para ancorar a chave do proprietário. */
   ownerIdentity?: PublicPeerIdentity;
 };
 export type LocalGroup = PublicGroupMetadata & { members: PublicPeerIdentity[]; joinedAt: number };
+
+export function nextGroupManifestRevision(group: PublicGroupMetadata, actorPeerId: string): Pick<PublicGroupMetadata, "manifestVersion" | "manifestActorPeerId" | "manifestOperationId"> {
+  return {
+    manifestVersion: Math.max(1, group.manifestVersion) + 1,
+    manifestActorPeerId: actorPeerId,
+    manifestOperationId: crypto.randomUUID(),
+  };
+}
+
+export function canonicalGroupRevocation(certificate: Omit<GroupRevocationCertificate, "signature"> | GroupRevocationCertificate): string {
+  return JSON.stringify({
+    version: 1,
+    groupId: certificate.groupId,
+    targetPeerId: certificate.targetPeerId,
+    targetPublicKey: canonicalPublicKey(certificate.targetPublicKey),
+    issuerPeerId: certificate.issuerPeerId,
+    membershipVersion: certificate.membershipVersion,
+    administratorEpoch: certificate.administratorEpoch,
+    messageId: certificate.messageId,
+    timestamp: certificate.timestamp,
+  });
+}
 
 type DesktopBackendConfig = { baseUrl: string; token?: string };
 let desktopConfigPromise: Promise<DesktopBackendConfig | null> | undefined;
 let migrationPromise: Promise<void> | undefined;
 
 const DEV_BACKEND_PROXY = "/__risk-api";
+const MAX_GROUP_MEMBERS = 48;
+const MAX_GROUP_REVOCATIONS = 48;
 
 export async function loadLocalIdentity(): Promise<LocalIdentity | null> {
   const database = await openRiskDatabase();
@@ -130,7 +170,7 @@ export async function createLocalGroup(name: string, owner: PublicPeerIdentity):
   if (trimmedName.length < 2 || trimmedName.length > 80) throw new Error("O nome do grupo deve ter entre 2 e 80 caracteres.");
   const groupId = crypto.randomUUID();
   const group: LocalGroup = {
-    groupId, name: trimmedName, members: [owner], joinedAt: Date.now(), ownerPeerId: owner.peerId, membershipVersion: 1, manifestVersion: 1, administratorPeerIds: [], removedPeerIds: [], removedMembers: [],
+    groupId, name: trimmedName, members: [owner], joinedAt: Date.now(), ownerPeerId: owner.peerId, membershipVersion: 1, manifestVersion: 1, manifestActorPeerId: owner.peerId, manifestOperationId: crypto.randomUUID(), administratorEpoch: 1, administratorPeerIds: [], removedPeerIds: [], removedMembers: [], revocations: [],
     channels: [
       { id: crypto.randomUUID(), name: "geral", kind: "text" },
       { id: crypto.randomUUID(), name: "Geral", kind: "voice", voiceRoomId: crypto.randomUUID() },
@@ -150,15 +190,15 @@ export async function addLocalGroupChannel(groupId: string, channel: LocalGroupC
   const normalized = { ...channel, name };
   if (!group.channels.some((item) => item.id === normalized.id)) {
     group.channels.push(normalized);
-    group.manifestVersion += 1;
+    Object.assign(group, nextGroupManifestRevision(group, identity.peerId));
   }
   await saveLocalGroup(group);
 }
 
-export async function ensureLocalGroup(groupId: string, name: string, owner: PublicPeerIdentity, channels: LocalGroupChannel[] = [], ownerPeerId = owner.peerId, membershipVersion = 1, manifestVersion = 1, removedPeerIds: string[] = [], administratorPeerIds: string[] = [], removedMembers: PublicPeerIdentity[] = []): Promise<LocalGroup> {
+export async function ensureLocalGroup(groupId: string, name: string, owner: PublicPeerIdentity, channels: LocalGroupChannel[] = [], ownerPeerId = owner.peerId, membershipVersion = 1, manifestVersion = 1, removedPeerIds: string[] = [], administratorPeerIds: string[] = [], removedMembers: PublicPeerIdentity[] = [], manifestActorPeerId: string = ownerPeerId, manifestOperationId: string = crypto.randomUUID(), administratorEpoch = 1, revocations: GroupRevocationCertificate[] = []): Promise<LocalGroup> {
   const existing = (await loadLocalGroups()).find((item) => item.groupId === groupId);
   if (existing) return existing;
-  const local: LocalGroup = { groupId, name, members: [owner], joinedAt: Date.now(), channels, ownerPeerId, membershipVersion, manifestVersion, administratorPeerIds, removedPeerIds, removedMembers };
+  const local: LocalGroup = { groupId, name, members: [owner], joinedAt: Date.now(), channels, ownerPeerId, membershipVersion, manifestVersion, manifestActorPeerId, manifestOperationId, administratorEpoch, administratorPeerIds, removedPeerIds, removedMembers, revocations };
   await saveLocalGroup(local);
   return local;
 }
@@ -166,11 +206,22 @@ export async function ensureLocalGroup(groupId: string, name: string, owner: Pub
 export async function addLocalGroupMember(group: PublicGroupMetadata, member: PublicPeerIdentity, owner: PublicPeerIdentity): Promise<void> {
   if (!canManageLocalGroup(group, owner.peerId)) throw new Error("Somente administradores do grupo podem aprovar novos membros.");
   const current = (await loadLocalGroups()).find((item) => item.groupId === group.groupId);
-  const members = [...(current?.members ?? [owner])];
+  const base = current ?? { ...group, members: [owner], joinedAt: Date.now() };
+  if ((base.removedPeerIds ?? []).includes(member.peerId)
+    || (base.removedMembers ?? []).some((candidate) => samePeerIdentity(candidate, member))) {
+    throw new Error("Esta identidade foi revogada neste grupo e não pode ser reutilizada. Crie uma nova identidade P2P para um novo ingresso.");
+  }
+  const members = [...base.members];
+  if (!members.some((item) => samePeerIdentity(item, member)) && members.length >= MAX_GROUP_MEMBERS) {
+    throw new Error(`Este grupo atingiu o limite local de ${MAX_GROUP_MEMBERS} membros da versão Alpha.`);
+  }
   if (!members.some((item) => samePeerIdentity(item, member))) members.push(member);
-  const removedPeerIds = (group.removedPeerIds ?? []).filter((peerId) => peerId !== member.peerId);
-  const removedMembers = (group.removedMembers ?? []).filter((candidate) => !samePeerIdentity(candidate, member));
-  await saveLocalGroup({ ...group, members, removedPeerIds, removedMembers, membershipVersion: Math.max(group.membershipVersion, current?.membershipVersion ?? 0) + 1, manifestVersion: Math.max(group.manifestVersion, current?.manifestVersion ?? 0) + 1, joinedAt: current?.joinedAt ?? Date.now() });
+  await saveLocalGroup({
+    ...base,
+    members,
+    membershipVersion: Math.max(group.membershipVersion, base.membershipVersion) + 1,
+    ...nextGroupManifestRevision({ ...base, manifestVersion: Math.max(group.manifestVersion, base.manifestVersion) }, owner.peerId),
+  });
 }
 
 export async function updateLocalGroupProfile(groupId: string, name: string, avatar?: string): Promise<LocalGroup> {
@@ -184,7 +235,7 @@ export async function updateLocalGroupProfile(groupId: string, name: string, ava
     throw new Error("A imagem do grupo é inválida ou muito grande.");
   }
   if (group.name === normalizedName && group.avatar === avatar) return group;
-  const updated: LocalGroup = { ...group, name: normalizedName, avatar, manifestVersion: group.manifestVersion + 1 };
+  const updated: LocalGroup = { ...group, name: normalizedName, avatar, ...nextGroupManifestRevision(group, identity.peerId) };
   await saveLocalGroup(updated);
   if (typeof window !== "undefined") window.dispatchEvent(new Event("risk:social-updated"));
   return updated;
@@ -203,7 +254,7 @@ export async function setLocalGroupAdministrator(groupId: string, targetPeerId: 
   if (!group.members.some((member) => member.peerId === targetPeerId)) throw new Error("Membro não encontrado.");
   const administrators = new Set(group.administratorPeerIds ?? []);
   if (administrator) administrators.add(targetPeerId); else administrators.delete(targetPeerId);
-  const updated = { ...group, administratorPeerIds: [...administrators], manifestVersion: group.manifestVersion + 1 };
+  const updated = { ...group, administratorPeerIds: [...administrators], administratorEpoch: (group.administratorEpoch ?? 1) + 1, ...nextGroupManifestRevision(group, identity.peerId) };
   await saveLocalGroup(updated);
   if (typeof window !== "undefined") window.dispatchEvent(new Event("risk:social-updated"));
   return updated;
@@ -218,15 +269,30 @@ export async function removeLocalGroupMember(groupId: string, targetPeerId: stri
   if ((group.administratorPeerIds ?? []).includes(targetPeerId) && identity.peerId !== group.ownerPeerId) throw new Error("Somente o proprietário pode remover um administrador.");
   const target = group.members.find((member) => member.peerId === targetPeerId);
   if (!target) throw new Error("Membro não encontrado.");
+  if (!(group.revocations ?? []).some((certificate) => certificate.targetPeerId === targetPeerId)
+    && (group.revocations ?? []).length >= MAX_GROUP_REVOCATIONS) {
+    throw new Error(`Este grupo atingiu o limite local de ${MAX_GROUP_REVOCATIONS} revogações da versão Alpha.`);
+  }
   const removedMembers = dedupePeerIdentities([...(group.removedMembers ?? []), target]);
+  const membershipVersion = group.membershipVersion + 1;
+  const targetWasAdministrator = (group.administratorPeerIds ?? []).includes(targetPeerId);
+  const administratorEpoch = (group.administratorEpoch ?? 1) + (targetWasAdministrator ? 1 : 0);
+  const certificate = await createGroupRevocationCertificate(
+    { ...group, administratorEpoch },
+    target,
+    identity,
+    membershipVersion,
+  );
   const updated: LocalGroup = {
     ...group,
     members: group.members.filter((member) => !samePeerIdentity(member, target)),
     administratorPeerIds: (group.administratorPeerIds ?? []).filter((peerId) => peerId !== targetPeerId),
     removedPeerIds: [...new Set([...(group.removedPeerIds ?? []), targetPeerId])],
     removedMembers,
-    membershipVersion: group.membershipVersion + 1,
-    manifestVersion: group.manifestVersion + 1,
+    revocations: mergeGroupRevocations(group.revocations ?? [], [certificate]),
+    membershipVersion,
+    administratorEpoch,
+    ...nextGroupManifestRevision(group, identity.peerId),
   };
   await saveLocalGroup(updated);
   if (typeof window !== "undefined") window.dispatchEvent(new Event("risk:social-updated"));
@@ -252,40 +318,86 @@ export async function mergeLocalGroupMembers(groupId: string, incoming: PublicPe
   return merged;
 }
 
-export async function mergeLocalGroupManifest(incoming: LocalGroup): Promise<LocalGroup> {
+export async function mergeLocalGroupManifest(incoming: LocalGroup, senderPeerId = incoming.manifestActorPeerId ?? incoming.ownerPeerId): Promise<LocalGroup> {
   const group = (await loadLocalGroups()).find((item) => item.groupId === incoming.groupId);
   if (!group) throw new Error("Grupo local não encontrado para sincronizar o manifesto.");
-  if (incoming.ownerPeerId !== group.ownerPeerId || incoming.manifestVersion <= group.manifestVersion) return group;
-  const knownOwner = group.members.find((member) => member.peerId === group.ownerPeerId);
-  const incomingOwner = incoming.members.find((member) => member.peerId === incoming.ownerPeerId);
-  if (!knownOwner || !incomingOwner || !samePublicKey(knownOwner.publicKey, incomingOwner.publicKey)) return group;
-  const removed = new Set(incoming.removedPeerIds);
-  const members = dedupePeerIdentities(incoming.members).filter((member) => !removed.has(member.peerId)).map((member) => {
-    const cached = group.members.find((candidate) => samePeerIdentity(candidate, member));
-    return member.avatar === undefined && cached?.avatar ? { ...member, avatar: cached.avatar } : member;
-  });
-  const merged: LocalGroup = {
-    ...group,
-    name: incoming.name,
-    avatar: incoming.avatar,
-    channels: incoming.channels,
-    members,
-    ownerPeerId: incoming.ownerPeerId,
-    membershipVersion: incoming.membershipVersion,
-    manifestVersion: incoming.manifestVersion,
-    administratorPeerIds: incoming.administratorPeerIds.filter((peerId) => members.some((member) => member.peerId === peerId) && peerId !== incoming.ownerPeerId),
-    removedPeerIds: [...removed],
-    removedMembers: dedupePeerIdentities(incoming.removedMembers).filter((member) => removed.has(member.peerId)),
-  };
+  const merged = resolveLocalGroupManifest(group, incoming, senderPeerId);
   const identity = await loadLocalIdentity();
-  if (identity && !members.some((member) => samePeerIdentity(member, identity))) {
+  if (identity && !merged.members.some((member) => samePeerIdentity(member, identity))) {
     await deleteLocalGroup(group.groupId);
-    if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("risk:group-removed", { detail: { groupId: group.groupId, groupName: group.name } }));
-    window.dispatchEvent(new Event("risk:social-updated"));
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("risk:group-removed", { detail: { groupId: group.groupId, groupName: group.name } }));
+      window.dispatchEvent(new Event("risk:social-updated"));
+    }
     return merged;
   }
   await saveLocalGroup(merged);
   if (typeof window !== "undefined") window.dispatchEvent(new Event("risk:social-updated"));
+  return merged;
+}
+
+export function resolveLocalGroupManifest(group: LocalGroup, incomingValue: LocalGroup, senderPeerId = incomingValue.manifestActorPeerId ?? incomingValue.ownerPeerId): LocalGroup {
+  let incoming = incomingValue;
+  if (incoming.ownerPeerId !== group.ownerPeerId) return group;
+  const knownOwner = group.members.find((member) => member.peerId === group.ownerPeerId);
+  const incomingOwner = incoming.members.find((member) => member.peerId === incoming.ownerPeerId);
+  if (!knownOwner || !incomingOwner || !samePublicKey(knownOwner.publicKey, incomingOwner.publicKey)) return group;
+
+  const localAdministratorEpoch = group.administratorEpoch ?? 1;
+  const incomingAdministratorEpoch = incoming.administratorEpoch ?? 1;
+  if (incomingAdministratorEpoch > localAdministratorEpoch && senderPeerId !== group.ownerPeerId) return group;
+  if (incomingAdministratorEpoch < localAdministratorEpoch && senderPeerId !== group.ownerPeerId) {
+    // Um administrador rebaixado pode reaparecer depois de ficar offline. Seu
+    // manifesto antigo não deve alterar metadados, mas certificados válidos já
+    // conhecidos continuam sendo reconciliados abaixo.
+    incoming = { ...incoming, name: group.name, avatar: group.avatar, channels: group.channels, administratorPeerIds: group.administratorPeerIds };
+  }
+
+  const incomingWins = compareGroupManifestRevisions(incoming, group) > 0
+    || incomingAdministratorEpoch > localAdministratorEpoch;
+  const revocations = mergeGroupRevocations(group.revocations ?? [], incoming.revocations ?? []);
+  const removed = new Set([
+    ...(group.removedPeerIds ?? []),
+    ...(incoming.removedPeerIds ?? []),
+    ...revocations.map((certificate) => certificate.targetPeerId),
+  ]);
+  const orderedMembers = incomingAdministratorEpoch > localAdministratorEpoch
+    ? incoming.members
+    : incomingAdministratorEpoch < localAdministratorEpoch
+      ? group.members
+      : incomingWins
+        ? [...group.members, ...incoming.members]
+        : [...incoming.members, ...group.members];
+  const members = dedupePeerIdentities(orderedMembers).filter((member) => !removed.has(member.peerId)).map((member) => {
+    const cached = group.members.find((candidate) => samePeerIdentity(candidate, member));
+    return member.avatar === undefined && cached?.avatar ? { ...member, avatar: cached.avatar } : member;
+  }).sort((left, right) => left.peerId.localeCompare(right.peerId));
+  const winner = incomingWins ? incoming : group;
+  const administratorEpoch = Math.max(localAdministratorEpoch, incomingAdministratorEpoch);
+  const administratorPeerIds = (incomingAdministratorEpoch > localAdministratorEpoch
+    ? incoming.administratorPeerIds
+    : incomingAdministratorEpoch < localAdministratorEpoch
+      ? group.administratorPeerIds
+      : winner.administratorPeerIds)
+    .filter((peerId) => members.some((member) => member.peerId === peerId) && peerId !== incoming.ownerPeerId)
+    .sort();
+  const merged: LocalGroup = {
+    ...group,
+    name: winner.name,
+    avatar: winner.avatar,
+    channels: winner.channels,
+    members,
+    ownerPeerId: incoming.ownerPeerId,
+    membershipVersion: Math.max(group.membershipVersion, incoming.membershipVersion),
+    manifestVersion: winner.manifestVersion,
+    manifestActorPeerId: winner.manifestActorPeerId ?? winner.ownerPeerId,
+    manifestOperationId: winner.manifestOperationId ?? `legacy-${winner.manifestVersion}`,
+    administratorEpoch,
+    administratorPeerIds,
+    removedPeerIds: [...removed].sort(),
+    removedMembers: dedupePeerIdentities([...(group.removedMembers ?? []), ...(incoming.removedMembers ?? [])]).filter((member) => removed.has(member.peerId)).sort((left, right) => left.peerId.localeCompare(right.peerId)),
+    revocations,
+  };
   return merged;
 }
 
@@ -324,7 +436,9 @@ export async function repairLocalIdentityAliases(): Promise<number> {
     group.removedPeerIds = [...new Set([...(group.removedPeerIds ?? []), ...aliasIds])];
     group.removedMembers = dedupePeerIdentities([...(group.removedMembers ?? []), ...aliases]);
     group.membershipVersion += 1;
-    group.manifestVersion += 1;
+    const certificates = await Promise.all(aliases.map((alias) => createGroupRevocationCertificate(group, alias, identity, group.membershipVersion)));
+    group.revocations = mergeGroupRevocations(group.revocations ?? [], certificates);
+    Object.assign(group, nextGroupManifestRevision(group, identity.peerId));
     await saveLocalGroup(group);
     removedCount += aliases.length;
   }
@@ -334,6 +448,108 @@ export async function repairLocalIdentityAliases(): Promise<number> {
 
 export function publicIdentity(identity: LocalIdentity): PublicPeerIdentity {
   return { peerId: identity.peerId, publicKey: identity.publicKey, displayName: identity.displayName, avatar: identity.avatar };
+}
+
+export async function createGroupRevocationCertificate(
+  group: PublicGroupMetadata,
+  target: PublicPeerIdentity,
+  issuer: LocalIdentity,
+  membershipVersion: number,
+): Promise<GroupRevocationCertificate> {
+  if (!canManageLocalGroup(group, issuer.peerId)) throw new Error("A identidade local não pode revogar membros deste grupo.");
+  const unsigned: Omit<GroupRevocationCertificate, "signature"> = {
+    version: 1,
+    groupId: group.groupId,
+    targetPeerId: target.peerId,
+    targetPublicKey: target.publicKey,
+    issuerPeerId: issuer.peerId,
+    membershipVersion,
+    administratorEpoch: group.administratorEpoch ?? 1,
+    messageId: crypto.randomUUID(),
+    timestamp: Date.now(),
+  };
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    issuer.privateKey,
+    new TextEncoder().encode(canonicalGroupRevocation(unsigned)),
+  );
+  return { ...unsigned, signature: bytesToBase64Url(new Uint8Array(signature)) };
+}
+
+export async function verifyGroupRevocationCertificate(
+  certificate: GroupRevocationCertificate,
+  group: PublicGroupMetadata & { members: PublicPeerIdentity[] },
+): Promise<boolean> {
+  if (!validGroupRevocationCertificate(certificate) || certificate.groupId !== group.groupId) return false;
+  const issuer = [...group.members, ...(group.removedMembers ?? [])].find((member) => member.peerId === certificate.issuerPeerId);
+  if (!issuer) return false;
+  const issuerAuthorized = issuer.peerId === group.ownerPeerId
+    || ((group.administratorPeerIds ?? []).includes(issuer.peerId)
+      && certificate.administratorEpoch === (group.administratorEpoch ?? 1));
+  if (!issuerAuthorized) return false;
+  const target = [...group.members, ...(group.removedMembers ?? [])].find((member) => member.peerId === certificate.targetPeerId);
+  if (!target || !samePublicKey(target.publicKey, certificate.targetPublicKey)) return false;
+  try {
+    const key = await crypto.subtle.importKey("jwk", issuer.publicKey, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+    return crypto.subtle.verify(
+      { name: "ECDSA", hash: "SHA-256" },
+      key,
+      base64UrlToArrayBuffer(certificate.signature),
+      new TextEncoder().encode(canonicalGroupRevocation(certificate)),
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function applyGroupRevocationCertificate(certificate: GroupRevocationCertificate): Promise<boolean> {
+  const group = (await loadLocalGroups()).find((item) => item.groupId === certificate.groupId);
+  if (!group || !(await verifyGroupRevocationCertificate(certificate, group))) return false;
+  const target = group.members.find((member) => member.peerId === certificate.targetPeerId);
+  const removedMembers = target
+    ? dedupePeerIdentities([...(group.removedMembers ?? []), target])
+    : group.removedMembers ?? [];
+  const updated: LocalGroup = {
+    ...group,
+    members: group.members.filter((member) => member.peerId !== certificate.targetPeerId),
+    administratorPeerIds: (group.administratorPeerIds ?? []).filter((peerId) => peerId !== certificate.targetPeerId),
+    removedPeerIds: [...new Set([...(group.removedPeerIds ?? []), certificate.targetPeerId])],
+    removedMembers,
+    revocations: mergeGroupRevocations(group.revocations ?? [], [certificate]),
+    membershipVersion: Math.max(group.membershipVersion, certificate.membershipVersion),
+    manifestVersion: Math.max(group.manifestVersion, certificate.membershipVersion),
+    manifestActorPeerId: certificate.issuerPeerId,
+    manifestOperationId: certificate.messageId,
+    administratorEpoch: Math.max(group.administratorEpoch ?? 1, certificate.administratorEpoch),
+  };
+  const identity = await loadLocalIdentity();
+  if (identity?.peerId === certificate.targetPeerId
+    && samePublicKey(identity.publicKey, certificate.targetPublicKey)) {
+    await deleteLocalGroup(group.groupId);
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("risk:group-removed", { detail: { groupId: group.groupId, groupName: group.name } }));
+      window.dispatchEvent(new Event("risk:social-updated"));
+    }
+    return true;
+  }
+  await saveLocalGroup(updated);
+  if (typeof window !== "undefined") window.dispatchEvent(new Event("risk:social-updated"));
+  return true;
+}
+
+export function validGroupRevocationCertificate(value: unknown): value is GroupRevocationCertificate {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const certificate = value as Partial<GroupRevocationCertificate>;
+  return certificate.version === 1
+    && typeof certificate.groupId === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(certificate.groupId)
+    && typeof certificate.targetPeerId === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(certificate.targetPeerId)
+    && typeof certificate.issuerPeerId === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(certificate.issuerPeerId)
+    && Boolean(certificate.targetPublicKey && typeof certificate.targetPublicKey === "object")
+    && Number.isSafeInteger(certificate.membershipVersion) && Number(certificate.membershipVersion) >= 1
+    && Number.isSafeInteger(certificate.administratorEpoch) && Number(certificate.administratorEpoch) >= 1
+    && typeof certificate.messageId === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(certificate.messageId)
+    && typeof certificate.timestamp === "number" && Number.isFinite(certificate.timestamp) && certificate.timestamp > 0
+    && typeof certificate.signature === "string" && /^[A-Za-z0-9_-]{16,256}$/.test(certificate.signature);
 }
 
 async function refreshIdentityMembership(): Promise<void> {
@@ -353,14 +569,21 @@ export async function reconcileIdentityMembership(
     const ownerPeerId = group.ownerPeerId || rawMembers[0]?.peerId || self?.peerId || group.groupId;
     const membershipVersion = Number.isSafeInteger(group.membershipVersion) && group.membershipVersion > 0 ? group.membershipVersion : 1;
     const manifestVersion = Number.isSafeInteger(group.manifestVersion) && group.manifestVersion > 0 ? group.manifestVersion : membershipVersion;
+    const manifestActorPeerId = typeof group.manifestActorPeerId === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(group.manifestActorPeerId) ? group.manifestActorPeerId : ownerPeerId;
+    const manifestOperationId = typeof group.manifestOperationId === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(group.manifestOperationId) ? group.manifestOperationId : `legacy-${manifestVersion}`;
+    const administratorEpoch = Number.isSafeInteger(group.administratorEpoch) && Number(group.administratorEpoch) >= 1 ? Number(group.administratorEpoch) : 1;
+    const revocations = Array.isArray(group.revocations) ? mergeGroupRevocations([], group.revocations) : [];
     // O proprietário é irremovível. Registros antigos ou interrompidos não
     // podem manter um tombstone que apague a autoridade raiz do grupo.
-    const removedPeerIds = Array.isArray(group.removedPeerIds) ? [...new Set(group.removedPeerIds.filter((peerId) => typeof peerId === "string" && peerId.length <= 128 && peerId !== ownerPeerId))] : [];
+    const removedPeerIds = [...new Set([
+      ...(Array.isArray(group.removedPeerIds) ? group.removedPeerIds : []),
+      ...revocations.map((certificate) => certificate.targetPeerId),
+    ].filter((peerId) => typeof peerId === "string" && peerId.length <= 128 && peerId !== ownerPeerId))];
     const removedMembers = Array.isArray(group.removedMembers) ? dedupePeerIdentities(group.removedMembers).filter((member) => removedPeerIds.includes(member.peerId)) : [];
     const members = dedupePeerIdentities(rawMembers, self ?? undefined).filter((member) => !removedPeerIds.includes(member.peerId));
     let administratorPeerIds = Array.isArray(group.administratorPeerIds) ? [...new Set(group.administratorPeerIds.filter((peerId) => typeof peerId === "string" && peerId.length <= 128 && peerId !== ownerPeerId))] : [];
     administratorPeerIds = administratorPeerIds.filter((peerId) => members.some((member) => member.peerId === peerId));
-    let changed = members.length !== rawMembers.length || group.ownerPeerId !== ownerPeerId || group.membershipVersion !== membershipVersion || group.manifestVersion !== manifestVersion || JSON.stringify(group.removedPeerIds ?? []) !== JSON.stringify(removedPeerIds) || JSON.stringify(group.administratorPeerIds ?? []) !== JSON.stringify(administratorPeerIds) || JSON.stringify(group.removedMembers ?? []) !== JSON.stringify(removedMembers);
+    let changed = members.length !== rawMembers.length || group.ownerPeerId !== ownerPeerId || group.membershipVersion !== membershipVersion || group.manifestVersion !== manifestVersion || group.manifestActorPeerId !== manifestActorPeerId || group.manifestOperationId !== manifestOperationId || group.administratorEpoch !== administratorEpoch || JSON.stringify(group.removedPeerIds ?? []) !== JSON.stringify(removedPeerIds) || JSON.stringify(group.administratorPeerIds ?? []) !== JSON.stringify(administratorPeerIds) || JSON.stringify(group.removedMembers ?? []) !== JSON.stringify(removedMembers) || JSON.stringify(group.revocations ?? []) !== JSON.stringify(revocations);
     const index = self ? members.findIndex((member) => samePeerIdentity(member, self)) : -1;
     if (self && index < 0 && (self.peerId === ownerPeerId || !removedPeerIds.includes(self.peerId))) {
       members.push(self);
@@ -379,7 +602,7 @@ export async function reconcileIdentityMembership(
       reconciled.push(group);
       continue;
     }
-    const updated = { ...group, ownerPeerId, membershipVersion, manifestVersion, administratorPeerIds, removedPeerIds, removedMembers, members };
+    const updated = { ...group, ownerPeerId, membershipVersion, manifestVersion, manifestActorPeerId, manifestOperationId, administratorEpoch, administratorPeerIds, removedPeerIds, removedMembers, revocations, members };
     await persist(updated);
     reconciled.push(updated);
   }
@@ -418,6 +641,46 @@ function validPublicPeerIdentity(identity: PublicPeerIdentity): boolean {
 
 function samePublicKey(left: JsonWebKey, right: JsonWebKey): boolean {
   return left.kty === right.kty && left.crv === right.crv && left.x === right.x && left.y === right.y;
+}
+
+function canonicalPublicKey(key: JsonWebKey): object {
+  return { kty: key.kty ?? null, crv: key.crv ?? null, x: key.x ?? null, y: key.y ?? null };
+}
+
+export function compareGroupManifestRevisions(left: PublicGroupMetadata, right: PublicGroupMetadata): number {
+  if (left.manifestVersion !== right.manifestVersion) return left.manifestVersion - right.manifestVersion;
+  const leftOwnerPriority = (left.manifestActorPeerId ?? left.ownerPeerId) === left.ownerPeerId ? 1 : 0;
+  const rightOwnerPriority = (right.manifestActorPeerId ?? right.ownerPeerId) === right.ownerPeerId ? 1 : 0;
+  if (leftOwnerPriority !== rightOwnerPriority) return leftOwnerPriority - rightOwnerPriority;
+  const actor = (left.manifestActorPeerId ?? left.ownerPeerId).localeCompare(right.manifestActorPeerId ?? right.ownerPeerId);
+  if (actor !== 0) return actor;
+  return (left.manifestOperationId ?? `legacy-${left.manifestVersion}`).localeCompare(right.manifestOperationId ?? `legacy-${right.manifestVersion}`);
+}
+
+export function mergeGroupRevocations(left: GroupRevocationCertificate[], right: GroupRevocationCertificate[]): GroupRevocationCertificate[] {
+  const byTarget = new Map<string, GroupRevocationCertificate>();
+  for (const certificate of [...left, ...right]) {
+    if (!validGroupRevocationCertificate(certificate)) continue;
+    const current = byTarget.get(certificate.targetPeerId);
+    if (!current
+      || certificate.membershipVersion > current.membershipVersion
+      || (certificate.membershipVersion === current.membershipVersion && certificate.messageId > current.messageId)) {
+      byTarget.set(certificate.targetPeerId, certificate);
+    }
+  }
+  return [...byTarget.values()].sort((a, b) => a.targetPeerId.localeCompare(b.targetPeerId)).slice(0, MAX_GROUP_REVOCATIONS);
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlToArrayBuffer(value: string): ArrayBuffer {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+  const binary = atob(normalized);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0)).buffer;
 }
 
 async function desktopConfig(): Promise<DesktopBackendConfig | null> {

@@ -6,8 +6,8 @@ import { loadEnv } from "vite";
 
 const repoRoot = resolve(fileURLToPath(new URL(".", import.meta.url)), "../../..");
 const env = loadEnv("development", repoRoot, "VITE_");
-const url = env.VITE_SUPABASE_URL;
-const key = env.VITE_SUPABASE_ANON_KEY;
+const url = process.env.VITE_SUPABASE_URL || env.VITE_SUPABASE_URL;
+const key = process.env.VITE_SUPABASE_ANON_KEY || env.VITE_SUPABASE_ANON_KEY;
 if (!url || !key) throw new Error("Configure VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY antes da verificação.");
 
 const options = { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } };

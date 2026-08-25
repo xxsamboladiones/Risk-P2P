@@ -37,6 +37,35 @@ struct P2pGroup {
     administrator_peer_ids: Value,
     removed_peer_ids: Value,
     removed_members: Value,
+    #[serde(default)]
+    manifest_actor_peer_id: String,
+    #[serde(default)]
+    manifest_operation_id: String,
+    #[serde(default = "default_group_epoch")]
+    administrator_epoch: i64,
+    #[serde(default = "empty_json_array")]
+    revocations: Value,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct P2pGroupConsistency {
+    #[serde(default)]
+    manifest_actor_peer_id: String,
+    #[serde(default)]
+    manifest_operation_id: String,
+    #[serde(default = "default_group_epoch")]
+    administrator_epoch: i64,
+    #[serde(default = "empty_json_array")]
+    revocations: Value,
+}
+
+fn default_group_epoch() -> i64 {
+    1
+}
+
+fn empty_json_array() -> Value {
+    Value::Array(Vec::new())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -150,8 +179,8 @@ async fn list_groups(
     headers: HeaderMap,
 ) -> Result<Json<Vec<P2pGroup>>, ApiError> {
     let owner = bearer(&headers, &state)?;
-    let rows = sqlx::query_as::<_, (String, String, Option<String>, String, String, i64, String, i64, i64, String, String, String)>(
-        "SELECT group_id,name,avatar,channels_json,members_json,joined_at,owner_peer_id,membership_version,manifest_version,administrator_peer_ids_json,removed_peer_ids_json,removed_members_json FROM p2p_groups WHERE owner_user_id=? ORDER BY joined_at",
+    let rows = sqlx::query_as::<_, (String, String, Option<String>, String, String, i64, String, i64, i64, String, String, String, String)>(
+        "SELECT group_id,name,avatar,channels_json,members_json,joined_at,owner_peer_id,membership_version,manifest_version,administrator_peer_ids_json,removed_peer_ids_json,removed_members_json,consistency_json FROM p2p_groups WHERE owner_user_id=? ORDER BY joined_at",
     )
     .bind(owner)
     .fetch_all(&state.db)
@@ -171,6 +200,7 @@ async fn list_groups(
         administrator_peer_ids_json,
         removed_peer_ids_json,
         removed_members_json,
+        consistency_json,
     ) in rows
     {
         let channels = serde_json::from_str(&channels_json)
@@ -182,6 +212,8 @@ async fn list_groups(
         let administrator_peer_ids = serde_json::from_str(&administrator_peer_ids_json)
             .map_err(|error| ApiError::Internal(error.into()))?;
         let removed_members = serde_json::from_str(&removed_members_json)
+            .map_err(|error| ApiError::Internal(error.into()))?;
+        let consistency: P2pGroupConsistency = serde_json::from_str(&consistency_json)
             .map_err(|error| ApiError::Internal(error.into()))?;
         result.push(P2pGroup {
             group_id,
@@ -196,6 +228,10 @@ async fn list_groups(
             administrator_peer_ids,
             removed_peer_ids,
             removed_members,
+            manifest_actor_peer_id: consistency.manifest_actor_peer_id,
+            manifest_operation_id: consistency.manifest_operation_id,
+            administrator_epoch: consistency.administrator_epoch,
+            revocations: consistency.revocations,
         });
     }
     Ok(Json(result))
@@ -220,7 +256,7 @@ async fn save_group(
         .as_array()
         .ok_or_else(|| ApiError::Bad("Membros P2P inválidos".into()))?;
     if channels.len() > 100
-        || members.len() > 256
+        || members.len() > 48
         || group.joined_at <= 0
         || !valid_id(&group.owner_peer_id)
         || group.membership_version < 1
@@ -228,6 +264,14 @@ async fn save_group(
         || !group.administrator_peer_ids.is_array()
         || !group.removed_peer_ids.is_array()
         || !group.removed_members.is_array()
+        || group.administrator_epoch < 1
+        || !group.revocations.is_array()
+        || group
+            .revocations
+            .as_array()
+            .is_some_and(|items| items.len() > 48)
+        || (!group.manifest_actor_peer_id.is_empty() && !valid_id(&group.manifest_actor_peer_id))
+        || (!group.manifest_operation_id.is_empty() && !valid_id(&group.manifest_operation_id))
     {
         return Err(ApiError::Bad(
             "Metadados do grupo P2P excedem os limites".into(),
@@ -243,8 +287,15 @@ async fn save_group(
         .map_err(|error| ApiError::Internal(error.into()))?;
     let removed_members_json = serde_json::to_string(&group.removed_members)
         .map_err(|error| ApiError::Internal(error.into()))?;
+    let consistency_json = serde_json::to_string(&P2pGroupConsistency {
+        manifest_actor_peer_id: group.manifest_actor_peer_id.clone(),
+        manifest_operation_id: group.manifest_operation_id.clone(),
+        administrator_epoch: group.administrator_epoch,
+        revocations: group.revocations.clone(),
+    })
+    .map_err(|error| ApiError::Internal(error.into()))?;
     sqlx::query(
-        "INSERT INTO p2p_groups(owner_user_id,group_id,name,avatar,channels_json,members_json,joined_at,owner_peer_id,membership_version,manifest_version,administrator_peer_ids_json,removed_peer_ids_json,removed_members_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(owner_user_id,group_id) DO UPDATE SET name=excluded.name,avatar=excluded.avatar,channels_json=excluded.channels_json,members_json=excluded.members_json,joined_at=excluded.joined_at,owner_peer_id=excluded.owner_peer_id,membership_version=excluded.membership_version,manifest_version=excluded.manifest_version,administrator_peer_ids_json=excluded.administrator_peer_ids_json,removed_peer_ids_json=excluded.removed_peer_ids_json,removed_members_json=excluded.removed_members_json",
+        "INSERT INTO p2p_groups(owner_user_id,group_id,name,avatar,channels_json,members_json,joined_at,owner_peer_id,membership_version,manifest_version,administrator_peer_ids_json,removed_peer_ids_json,removed_members_json,consistency_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(owner_user_id,group_id) DO UPDATE SET name=excluded.name,avatar=excluded.avatar,channels_json=excluded.channels_json,members_json=excluded.members_json,joined_at=excluded.joined_at,owner_peer_id=excluded.owner_peer_id,membership_version=excluded.membership_version,manifest_version=excluded.manifest_version,administrator_peer_ids_json=excluded.administrator_peer_ids_json,removed_peer_ids_json=excluded.removed_peer_ids_json,removed_members_json=excluded.removed_members_json,consistency_json=excluded.consistency_json",
     )
     .bind(owner)
     .bind(&group.group_id)
@@ -259,6 +310,7 @@ async fn save_group(
     .bind(administrator_peer_ids_json)
     .bind(removed_peer_ids_json)
     .bind(removed_members_json)
+    .bind(consistency_json)
     .execute(&state.db)
     .await
     .map_err(internal)?;

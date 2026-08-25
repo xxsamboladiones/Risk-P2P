@@ -156,6 +156,8 @@ export class MeshWebRTCTransport implements CallTransport {
   private readonly peers = new Map<string, PeerEntry>();
   private readonly localTracks = new Map<string, { track: MediaStreamTrack; stream: MediaStream }>();
   private readonly mediaAuthorizedPeers = new Set<string>();
+  private readonly pendingRemoteStreams = new Map<string, Map<string, MediaStream>>();
+  private readonly activeRemoteStreams = new Map<string, Map<string, MediaStream>>();
   private readonly disconnectedTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private mediaAuthorizationRequired = false;
   private readonly previousOutboundBytes = new Map<string, { bytes: number; timestamp: number }>();
@@ -189,12 +191,34 @@ export class MeshWebRTCTransport implements CallTransport {
   async authorizePeerMedia(peerId: string): Promise<void> {
     this.mediaAuthorizedPeers.add(peerId);
     const entry = this.requirePeer(peerId);
+    const pendingStreams = this.pendingRemoteStreams.get(peerId);
+    if (pendingStreams) {
+      this.pendingRemoteStreams.delete(peerId);
+      for (const stream of pendingStreams.values()) {
+        stream.getTracks().forEach((track) => { track.enabled = true; });
+        this.rememberActiveRemoteStream(peerId, stream);
+        this.events.onRemoteStream(peerId, stream);
+      }
+    }
     for (const { track, stream } of this.localTracks.values()) {
       if (!entry.pc.getSenders().some((sender) => sender.track?.id === track.id)) entry.pc.addTrack(track, stream);
     }
     entry.needsNegotiation = true;
     await this.negotiateIfNeeded(peerId, entry);
     await this.applyAdaptiveVideoParameters();
+  }
+
+  revokePeerMedia(peerId: string): void {
+    this.mediaAuthorizedPeers.delete(peerId);
+    this.pendingRemoteStreams.get(peerId)?.forEach((stream) => stream.getTracks().forEach((track) => { track.enabled = false; }));
+    this.pendingRemoteStreams.delete(peerId);
+    this.activeRemoteStreams.get(peerId)?.forEach((stream) => stream.getTracks().forEach((track) => { track.enabled = false; }));
+    const entry = this.peers.get(peerId);
+    if (entry) {
+      for (const sender of entry.pc.getSenders()) {
+        if (sender.track) entry.pc.removeTrack(sender);
+      }
+    }
   }
 
   async acceptOffer(peerId: string, description: RTCSessionDescriptionInit): Promise<void> {
@@ -362,6 +386,10 @@ export class MeshWebRTCTransport implements CallTransport {
       entry.pc.close();
       this.peers.delete(id);
       this.mediaAuthorizedPeers.delete(id);
+      const pendingStreams = this.pendingRemoteStreams.get(id);
+      pendingStreams?.forEach((stream) => stream.getTracks().forEach((track) => { track.enabled = false; }));
+      this.pendingRemoteStreams.delete(id);
+      this.activeRemoteStreams.delete(id);
       this.previousOutboundBytes.delete(id);
       const timer = this.disconnectedTimers.get(id);
       if (timer) clearTimeout(timer);
@@ -429,7 +457,19 @@ export class MeshWebRTCTransport implements CallTransport {
     };
     pc.ontrack = ({ streams }) => {
       const stream = streams[0];
-      if (stream) this.events.onRemoteStream(peerId, stream);
+      if (!stream) return;
+      if (!this.mediaAuthorizationRequired || this.mediaAuthorizedPeers.has(peerId)) {
+        this.rememberActiveRemoteStream(peerId, stream);
+        this.events.onRemoteStream(peerId, stream);
+        return;
+      }
+      // Mídia recebida de um peer ainda não autenticado nunca chega à UI nem ao
+      // mixer. Desabilitar as tracks também impede reprodução acidental enquanto
+      // a prova bilateral percorre o DataChannel de controle.
+      stream.getTracks().forEach((track) => { track.enabled = false; });
+      const pending = this.pendingRemoteStreams.get(peerId) ?? new Map<string, MediaStream>();
+      pending.set(stream.id, stream);
+      this.pendingRemoteStreams.set(peerId, pending);
     };
     pc.ondatachannel = ({ channel }) => {
       if (channel.label === TRANSFER_CHANNEL_LABEL) this.bindTransferDataChannel(peerId, entry, channel);
@@ -545,6 +585,12 @@ export class MeshWebRTCTransport implements CallTransport {
     const entry = this.peers.get(peerId);
     if (!entry) throw new Error(`Peer desconhecido: ${peerId}`);
     return entry;
+  }
+
+  private rememberActiveRemoteStream(peerId: string, stream: MediaStream): void {
+    const streams = this.activeRemoteStreams.get(peerId) ?? new Map<string, MediaStream>();
+    streams.set(stream.id, stream);
+    this.activeRemoteStreams.set(peerId, streams);
   }
 
   private async negotiateIfNeeded(peerId: string, entry: PeerEntry): Promise<void> {

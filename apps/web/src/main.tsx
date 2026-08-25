@@ -177,10 +177,16 @@ function SocialHome() {
         setChannels([]);
         setActiveChannel(null);
       }
+      if (callContext?.groupId === detail.groupId && roomId) {
+        void call.leave(roomId);
+        setRoom(null);
+        setCallContext(null);
+        setCallWorkspaceOpen(false);
+      }
     };
     window.addEventListener("risk:group-removed", removed);
     return () => window.removeEventListener("risk:group-removed", removed);
-  }, [selectedCommunity?.id]);
+  }, [callContext?.groupId, roomId, selectedCommunity?.id]);
 
   useEffect(() => {
     if (!currentUser) return;
@@ -358,7 +364,19 @@ function SocialHome() {
         loadLocalGroups(),
       ]);
       const localGroup = localGroups.find((group) => group.groupId === community?.id);
-      await call.join(token, channel.voiceRoomId, iceServers, localGroup ? { identity, trustedPeers: localGroup.members } : {});
+      if (community?.local && !localGroup) {
+        throw new Error("Os dados locais deste grupo não estão disponíveis. A chamada foi bloqueada para proteger sua identidade e mídia.");
+      }
+      await call.join(token, channel.voiceRoomId, iceServers, localGroup
+        ? {
+            identity,
+            trustedPeers: localGroup.members,
+            revokedPeers: localGroup.removedMembers,
+            revocations: localGroup.revocations,
+            groupId: localGroup.groupId,
+            requireIdentityAuthentication: true,
+          }
+        : {});
       const textChannel = availableChannels.find((item) => item.kind === "text") ?? null;
       setCallContext({
         groupId: community?.id ?? "",
@@ -397,7 +415,22 @@ function SocialHome() {
         return;
       }
       if (!activeChannel || activeChannel.kind !== "text") return;
-      await chat.connect(activeChannel.id, currentUser.displayName, iceServers);
+      const [identity, groups] = await Promise.all([
+        getOrCreateLocalIdentity(currentUser.displayName),
+        loadLocalGroups(),
+      ]);
+      const group = groups.find((item) => item.groupId === selectedCommunity?.id);
+      if (selectedCommunity?.local && !group) {
+        throw new Error("Os dados locais deste grupo não estão disponíveis. O chat foi bloqueado para evitar uma conexão sem autenticação.");
+      }
+      await chat.connect(activeChannel.id, currentUser.displayName, iceServers, group ? {
+        identity,
+        trustedPeers: group.members,
+        revokedPeers: group.removedMembers,
+        revocations: group.revocations,
+        groupId: group.groupId,
+        requireIdentityAuthentication: true,
+      } : {});
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Falha ao conectar o chat"); }
   }
 

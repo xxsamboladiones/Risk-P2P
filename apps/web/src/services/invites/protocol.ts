@@ -1,4 +1,4 @@
-import type { LocalIdentity, PublicGroupMetadata, PublicPeerIdentity } from "../offline/social-storage";
+import { validGroupRevocationCertificate, type LocalIdentity, type PublicGroupMetadata, type PublicPeerIdentity } from "../offline/social-storage";
 import { validAvatarDataUrl } from "../offline/profile";
 
 export type InviteProtocolType = "friend.request" | "friend.accept" | "friend.reject" | "group.join.request" | "group.join.accept" | "group.join.reject" | "invite.ack" | "invite.busy";
@@ -56,6 +56,10 @@ function isGroup(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   const group = value as Record<string, unknown>;
   if (!validId(group.groupId) || !validId(group.ownerPeerId) || !Number.isSafeInteger(group.membershipVersion) || Number(group.membershipVersion) < 1 || !Number.isSafeInteger(group.manifestVersion) || Number(group.manifestVersion) < 1 || !Array.isArray(group.administratorPeerIds) || group.administratorPeerIds.length > 64 || !group.administratorPeerIds.every(validId) || !Array.isArray(group.removedPeerIds) || group.removedPeerIds.length > 256 || !group.removedPeerIds.every(validId) || !Array.isArray(group.removedMembers) || group.removedMembers.length > 256 || !group.removedMembers.every(isPeerIdentity) || typeof group.name !== "string" || group.name.length < 1 || group.name.length > 80 || (group.avatar !== undefined && !validAvatarDataUrl(group.avatar)) || !Array.isArray(group.channels) || group.channels.length > 100) return false;
+  if ((group.manifestActorPeerId !== undefined && !validId(group.manifestActorPeerId))
+    || (group.manifestOperationId !== undefined && !validId(group.manifestOperationId))
+    || (group.administratorEpoch !== undefined && (!Number.isSafeInteger(group.administratorEpoch) || Number(group.administratorEpoch) < 1))
+    || (group.revocations !== undefined && (!Array.isArray(group.revocations) || group.revocations.length > 48 || !group.revocations.every(validGroupRevocationCertificate)))) return false;
   if (group.ownerIdentity !== undefined) {
     const owner = group.ownerIdentity as Record<string, unknown>;
     if (!owner || owner.peerId !== group.ownerPeerId || !isPeerIdentity(owner)) return false;

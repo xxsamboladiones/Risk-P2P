@@ -1,4 +1,4 @@
-import { canManageLocalGroup, loadLocalGroups, loadLocalIdentity, saveLocalGroup, type LocalGroupChannel } from "./social-storage";
+import { canManageLocalGroup, loadLocalGroups, loadLocalIdentity, nextGroupManifestRevision, saveLocalGroup, type LocalGroupChannel } from "./social-storage";
 
 function validateChannelName(name: string): string {
   const normalized = name.trim();
@@ -26,7 +26,7 @@ export async function renameLocalGroupChannel(
     name: validateChannelName(name),
   };
   group.channels[index] = updated;
-  group.manifestVersion += 1;
+  Object.assign(group, nextGroupManifestRevision(group, identity.peerId));
   await saveLocalGroup(group);
   return updated;
 }
@@ -41,6 +41,6 @@ export async function deleteLocalGroupChannel(groupId: string, channelId: string
   if (index < 0) throw new Error("Canal não encontrado.");
 
   group.channels.splice(index, 1);
-  group.manifestVersion += 1;
+  Object.assign(group, nextGroupManifestRevision(group, identity.peerId));
   await saveLocalGroup(group);
 }

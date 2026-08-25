@@ -39,6 +39,9 @@ jobs:
       - run: node scripts/verify-release-version.mjs
       - run: pnpm typecheck
       - run: pnpm test
+      - name: Verify ephemeral Supabase Realtime rendezvous
+        if: matrix.os == 'ubuntu-latest'
+        run: node apps/web/scripts/verify-supabase-realtime.mjs
       - run: pnpm ${{ matrix.command }}
       - uses: actions/upload-artifact@v4
         with:

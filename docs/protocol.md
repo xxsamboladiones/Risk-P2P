@@ -123,9 +123,11 @@ O perfil usa `chat.profile.update`, assinado pela identidade P2P. Avatares são 
 
 ## Manifesto de grupo v2
 
-O proprietário e administradores autorizados distribuem pelo DataChannel um snapshot assinado com `manifestVersion`, `membershipVersion`, canais, membros, `administratorPeerIds`, `removedPeerIds` e as identidades públicas revogadas necessárias para entregar o aviso de remoção. Apenas versões monotonicamente maiores e assinadas por uma chave já autorizada são aplicadas. Somente um snapshot do proprietário pode mudar a lista de administradores; administradores podem editar o grupo, os canais, criar convites e remover membros comuns. Perfis conhecidos preservam o avatar armazenado localmente, enquanto remoções são mantidas como tombstones para não ressuscitar identidades antigas durante uma reconciliação.
+O proprietário e administradores autorizados distribuem pelo DataChannel um snapshot assinado com `manifestVersion`, `manifestActorPeerId`, `manifestOperationId`, `administratorEpoch`, `membershipVersion`, canais, membros, `administratorPeerIds`, `removedPeerIds` e certificados de revogação. Revisões iguais são desempatadas de forma determinística; o proprietário vence um administrador no mesmo número de versão. Somente o proprietário incrementa `administratorEpoch` e muda cargos. Um epoch mais novo substitui snapshots de administradores rebaixados. Administradores podem editar o grupo, os canais, criar convites e remover membros comuns.
 
-Quando o peer removido volta a conectar um chat do grupo, um membro autorizado entrega o manifesto de revogação diretamente pelo WebRTC. O receptor apaga a cópia local do grupo e notifica a interface. Esse estado social continua local e P2P; Supabase Realtime é usado apenas para o rendezvous efêmero.
+Cada remoção gera um certificado ECDSA independente. Qualquer membro que já o possua pode retransmiti-lo pelo chat ou pela chamada, mas não pode alterá-lo. O peer removido passa por autenticação apenas para receber o certificado; ele não recebe mensagens, histórico, outbox, anexos, estados de mídia ou tracks. O receptor apaga a cópia local do grupo e notifica a interface. Esse estado social continua local e P2P; Supabase Realtime é usado apenas para o rendezvous efêmero.
+
+O manifesto Alpha limita a lista ativa a 48 membros e o conjunto retransmissível a 48 certificados. Tombstones têm precedência sobre adições concorrentes e uma identidade revogada não pode ser readmitida no mesmo grupo.
 
 O transporte rejeita payloads acima de 64 KiB. O chat usa limite menor na validação e mensagens de até 4.000 caracteres. Quando `RTCDataChannel.bufferedAmount` ultrapassa o limite local de segurança, novas mensagens deixam de ser enfileiradas e o envio retorna falha ao chamador.
 

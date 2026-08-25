@@ -93,7 +93,9 @@ O chat negocia um DataChannel ordenado usando o mesmo modelo de signaling. Mensa
 
 Mensagens versão 2 são assinadas pela identidade ECDSA permanente. Antes de aceitar conteúdo ou histórico, os peers concluem um desafio bilateral e conferem a chave pública com a lista local de membros/amigos. Até oito canais locais podem manter sessões leves em segundo plano para não lidas e notificações.
 
-Snapshots de membership são aceitos apenas quando assinados pelo dono do grupo e quando possuem uma versão superior à versão local. Somente o dono pode gerar convites de entrada nesta versão.
+O proprietário e administradores autorizados podem assinar snapshots de membership. Revisões usam versão, autor e ID de operação para desempatar edições concorrentes; mudanças de cargo incrementam um `administratorEpoch` controlado pelo proprietário. Remoções são *remove-wins* e produzem um certificado assinado que membros comuns podem retransmitir sem possuir a chave da autoridade. Uma identidade revogada abre apenas o caminho restrito necessário para receber esse certificado: histórico, outbox, anexos e mídia permanecem bloqueados.
+
+Nesta fase Alpha, cada grupo aceita no máximo 48 membros ativos e conserva até 48 certificados de revogação. Uma chave revogada não pode ser readmitida no mesmo grupo: o retorno exige uma nova identidade P2P. O monitor de atividade acompanha até 32 grupos e o cliente mantém até oito chats autenticados em segundo plano.
 
 ## Convites P2P
 
@@ -163,5 +165,7 @@ Além da CI, validar manualmente:
 - upgrade sem perda de dados;
 - encerramento do sidecar junto com Electron;
 - dois PCs em redes diferentes;
-- fallback TURN em NAT restritivo;
+- diagnóstico explícito quando a conexão direta STUN falhar em NAT/CGNAT restritivo;
 - câmera, microfone e compartilhamento de tela/áudio.
+- promoção/rebaixamento de administrador e remoção com proprietário offline;
+- atualização de um banco 0.1 com grupos legados para o schema 0.2.

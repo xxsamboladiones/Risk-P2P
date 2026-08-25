@@ -52,7 +52,7 @@ export function GroupInvitePanel({
             const community = communities.find((group) => group.id === preferredGroupId);
             if (!community) throw new Error("Grupo selecionado não foi encontrado.");
             const identity = await getOrCreateLocalIdentity(displayName);
-            metadata = { groupId: preferredGroupId, name: preferredGroupName ?? community.name, channels: preferredGroupChannels ?? await api.channels(token, preferredGroupId).catch(() => []), ownerPeerId: identity.peerId, membershipVersion: 1, manifestVersion: 1, administratorPeerIds: [], removedPeerIds: [], removedMembers: [] };
+            metadata = { groupId: preferredGroupId, name: preferredGroupName ?? community.name, channels: preferredGroupChannels ?? await api.channels(token, preferredGroupId).catch(() => []), ownerPeerId: identity.peerId, membershipVersion: 1, manifestVersion: 1, manifestActorPeerId: identity.peerId, manifestOperationId: crypto.randomUUID(), administratorEpoch: 1, administratorPeerIds: [], removedPeerIds: [], removedMembers: [], revocations: [] };
           }
 
           try {
@@ -68,6 +68,10 @@ export function GroupInvitePanel({
               metadata.removedPeerIds,
               metadata.administratorPeerIds,
               metadata.removedMembers,
+              metadata.manifestActorPeerId,
+              metadata.manifestOperationId,
+              metadata.administratorEpoch,
+              metadata.revocations,
             );
             localGroups = await loadLocalGroups();
             window.dispatchEvent(new Event("risk:social-updated"));
@@ -111,9 +115,13 @@ export function GroupInvitePanel({
         ownerPeerId: selected.ownerPeerId,
         membershipVersion: selected.membershipVersion,
         manifestVersion: selected.manifestVersion,
+        manifestActorPeerId: selected.manifestActorPeerId,
+        manifestOperationId: selected.manifestOperationId,
+        administratorEpoch: selected.administratorEpoch,
         administratorPeerIds: selected.administratorPeerIds ?? [],
         removedPeerIds: selected.removedPeerIds ?? [],
         removedMembers: (selected.removedMembers ?? []).map(({ avatar: _avatar, ...member }) => member),
+        revocations: selected.revocations ?? [],
         ownerIdentity: selected.members.find((member) => member.peerId === selected.ownerPeerId),
       }
     : preferredMetadata && selectedId === preferredMetadata.groupId

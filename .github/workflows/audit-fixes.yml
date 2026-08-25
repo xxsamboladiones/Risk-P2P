@@ -1,4 +1,4 @@
-name: Apply persistent private chat session fix
+name: Apply private chat pool fix
 
 on:
   push:
@@ -18,96 +18,432 @@ jobs:
         with: { version: 10.15.0 }
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: pnpm }
-      - name: Keep private chat session alive across navigation
+      - name: Apply private session pool
         shell: python
         run: |
           from pathlib import Path
 
-          chat = Path("apps/web/src/chat.ts")
-          source = chat.read_text(encoding="utf-8")
+          manager = '''import { ChatController, type ChatConnectionOptions, type ChatConnectionStatus } from "../../chat";
+          import type { LocalGroup } from "../offline/social-storage";
 
-          old = '  private channelId?: string;\n  private groupId?: string;'
-          new = '  private channelId?: string;\n  private targetChannelId?: string;\n  private groupId?: string;'
-          if old not in source:
-              raise SystemExit("chat target field anchor not found")
-          source = source.replace(old, new, 1)
+          const MAX_BACKGROUND_CHANNELS = 8;
+          export const MAX_BACKGROUND_PRIVATE_CHATS = 8;
 
-          old = '  history(channelId: string, options?: MessagePageOptions): Promise<LocalChatMessage[]> { return loadLocalMessages(channelId, options); }\n\n  async attachmentHistory'
-          new = '  history(channelId: string, options?: MessagePageOptions): Promise<LocalChatMessage[]> { return loadLocalMessages(channelId, options); }\n\n  connectionSnapshot(): { channelId?: string; status: ChatConnectionStatus } {\n    return { channelId: this.targetChannelId ?? this.channelId, status: this.status };\n  }\n\n  async attachmentHistory'
-          if old not in source:
-              raise SystemExit("chat snapshot anchor not found")
-          source = source.replace(old, new, 1)
+          type PrivateChatSession = {
+            controller: ChatController;
+            status: ChatConnectionStatus;
+            lastUsedAt: number;
+            connecting?: Promise<void>;
+            offStatus: () => void;
+            offMessage: () => void;
+          };
 
-          old = '    await this.disconnect();\n    this.setStatus("connecting");\n    const sessionToken = {};'
-          new = '    await this.disconnect();\n    this.targetChannelId = channelId;\n    this.setStatus("connecting");\n    const sessionToken = {};'
-          if old not in source:
-              raise SystemExit("chat connect target anchor not found")
-          source = source.replace(old, new, 1)
+          export type PrivateChatSessionSnapshot = {
+            controller: ChatController;
+            status: ChatConnectionStatus;
+          };
 
-          old = '    this.attachmentService = undefined;\n    this.channelId = undefined;\n    this.groupId = undefined;'
-          new = '    this.attachmentService = undefined;\n    this.channelId = undefined;\n    this.targetChannelId = undefined;\n    this.groupId = undefined;'
-          if old not in source:
-              raise SystemExit("chat disconnect target anchor not found")
-          source = source.replace(old, new, 1)
-          chat.write_text(source, encoding="utf-8")
+          export class BackgroundChatManager {
+            private readonly sessions = new Map<string, ChatController>();
+            private readonly privateSessions = new Map<string, PrivateChatSession>();
+            private readonly unread = new Map<string, number>();
+            private desiredChannels = new Set<string>();
+            private listener?: (unread: ReadonlyMap<string, number>) => void;
+            private privateUseCounter = 0;
+
+            onUnread(listener: (unread: ReadonlyMap<string, number>) => void): () => void {
+              this.listener = listener;
+              listener(new Map(this.unread));
+              return () => { if (this.listener === listener) this.listener = undefined; };
+            }
+
+            clear(channelId: string): void {
+              if (!this.unread.delete(channelId)) return;
+              this.listener?.(new Map(this.unread));
+            }
+
+            privateSession(channelId: string): PrivateChatSessionSnapshot | undefined {
+              const session = this.privateSessions.get(channelId);
+              if (!session) return undefined;
+              session.lastUsedAt = ++this.privateUseCounter;
+              return { controller: session.controller, status: session.status };
+            }
+
+            async connectPrivate(
+              channelId: string,
+              displayName: string,
+              iceServers: RTCIceServer[],
+              options: ChatConnectionOptions,
+            ): Promise<ChatController> {
+              const existing = this.privateSessions.get(channelId);
+              if (existing && existing.status !== "error" && existing.status !== "incompatible" && existing.status !== "disconnected") {
+                existing.lastUsedAt = ++this.privateUseCounter;
+                if (existing.connecting) await existing.connecting;
+                return existing.controller;
+              }
+              if (existing) await this.disconnectPrivate(channelId);
+              await this.evictPrivateSessionIfNeeded();
+
+              const controller = new ChatController();
+              const session: PrivateChatSession = {
+                controller,
+                status: "disconnected",
+                lastUsedAt: ++this.privateUseCounter,
+                offStatus: () => undefined,
+                offMessage: () => undefined,
+              };
+              session.offStatus = controller.onStatus((status) => { session.status = status; });
+              session.offMessage = controller.onMessage((message) => {
+                if (message.channelId !== channelId) return;
+                this.unread.set(channelId, (this.unread.get(channelId) ?? 0) + 1);
+                this.listener?.(new Map(this.unread));
+                if (document.visibilityState !== "visible" && "Notification" in window && Notification.permission === "granted") {
+                  new Notification("Nova mensagem privada no Risk", { body: `${message.author}: ${message.content.slice(0, 120)}` });
+                }
+              });
+              this.privateSessions.set(channelId, session);
+
+              const connecting = controller.connect(channelId, displayName, iceServers, options);
+              session.connecting = connecting;
+              try {
+                await connecting;
+              } catch (error) {
+                if (this.privateSessions.get(channelId) === session) {
+                  this.privateSessions.delete(channelId);
+                  session.offStatus();
+                  session.offMessage();
+                }
+                await controller.disconnect().catch(() => undefined);
+                throw error;
+              } finally {
+                if (this.privateSessions.get(channelId) === session) session.connecting = undefined;
+              }
+              return controller;
+            }
+
+            async disconnectPrivate(channelId: string): Promise<void> {
+              const session = this.privateSessions.get(channelId);
+              if (!session) return;
+              this.privateSessions.delete(channelId);
+              session.offStatus();
+              session.offMessage();
+              this.clear(channelId);
+              await session.controller.disconnect();
+            }
+
+            async release(channelId: string): Promise<void> {
+              this.desiredChannels.delete(channelId);
+              const controller = this.sessions.get(channelId);
+              if (!controller) return;
+              this.sessions.delete(channelId);
+              await controller.disconnect();
+            }
+
+            async sync(
+              groups: LocalGroup[],
+              displayName: string,
+              iceServers: RTCIceServer[],
+              activeChannelId?: string,
+              reservedChannelIds: readonly string[] = [],
+            ): Promise<void> {
+              const excluded = new Set<string>(reservedChannelIds);
+              if (activeChannelId) excluded.add(activeChannelId);
+              const desired = groups.flatMap((group) => group.channels.filter((channel) => channel.kind === "text").map((channel) => channel.id))
+                .filter((channelId) => !excluded.has(channelId))
+                .slice(0, MAX_BACKGROUND_CHANNELS);
+              this.desiredChannels = new Set(desired);
+
+              await Promise.all([...this.sessions].filter(([channelId]) => !this.desiredChannels.has(channelId)).map(async ([channelId, controller]) => {
+                if (this.sessions.get(channelId) !== controller) return;
+                this.sessions.delete(channelId);
+                await controller.disconnect();
+              }));
+
+              await Promise.all(desired.map(async (channelId) => {
+                if (!this.desiredChannels.has(channelId) || this.sessions.has(channelId)) return;
+                const controller = new ChatController();
+                this.sessions.set(channelId, controller);
+                controller.onMessage((message) => {
+                  if (message.channelId !== channelId) return;
+                  this.unread.set(channelId, (this.unread.get(channelId) ?? 0) + 1);
+                  this.listener?.(new Map(this.unread));
+                  if (document.visibilityState !== "visible" && "Notification" in window && Notification.permission === "granted") {
+                    new Notification("Nova mensagem no Risk", { body: `${message.author}: ${message.content.slice(0, 120)}` });
+                  }
+                });
+                try {
+                  await controller.connect(channelId, displayName, iceServers);
+                  if (!this.desiredChannels.has(channelId) || this.sessions.get(channelId) !== controller) {
+                    if (this.sessions.get(channelId) === controller) this.sessions.delete(channelId);
+                    await controller.disconnect();
+                  }
+                } catch {
+                  if (this.sessions.get(channelId) === controller) this.sessions.delete(channelId);
+                  await controller.disconnect();
+                }
+              }));
+            }
+
+            async disconnect(): Promise<void> {
+              this.desiredChannels.clear();
+              const sessions = [...this.sessions.values()];
+              const privateSessions = [...this.privateSessions.values()];
+              this.sessions.clear();
+              this.privateSessions.clear();
+              privateSessions.forEach((session) => { session.offStatus(); session.offMessage(); });
+              await Promise.all([
+                ...sessions.map((session) => session.disconnect()),
+                ...privateSessions.map((session) => session.controller.disconnect()),
+              ]);
+            }
+
+            private async evictPrivateSessionIfNeeded(): Promise<void> {
+              if (this.privateSessions.size < MAX_BACKGROUND_PRIVATE_CHATS) return;
+              const oldest = [...this.privateSessions.entries()]
+                .sort((left, right) => left[1].lastUsedAt - right[1].lastUsedAt)[0];
+              if (oldest) await this.disconnectPrivate(oldest[0]);
+            }
+          }
+          '''
+          Path("apps/web/src/services/chat/background-manager.ts").write_text(manager, encoding="utf-8")
+
+          tests = '''import { beforeEach, describe, expect, it, vi } from "vitest";
+          import type { LocalGroup } from "../offline/social-storage";
+
+          const runtime = vi.hoisted(() => ({
+            connected: [] as string[],
+            disconnected: [] as string[],
+          }));
+
+          vi.mock("../../chat", () => ({
+            ChatController: class FakeChatController {
+              private channelId?: string;
+              private readonly statusListeners = new Set<(status: string) => void>();
+
+              onMessage(): () => void { return () => undefined; }
+              onStatus(listener: (status: string) => void): () => void {
+                this.statusListeners.add(listener);
+                return () => this.statusListeners.delete(listener);
+              }
+
+              async connect(channelId: string): Promise<void> {
+                this.channelId = channelId;
+                runtime.connected.push(channelId);
+                this.statusListeners.forEach((listener) => listener("connected"));
+                this.statusListeners.forEach((listener) => listener("ready"));
+              }
+
+              async disconnect(): Promise<void> {
+                if (this.channelId) runtime.disconnected.push(this.channelId);
+                this.channelId = undefined;
+                this.statusListeners.forEach((listener) => listener("disconnected"));
+              }
+            },
+          }));
+
+          import { BackgroundChatManager, MAX_BACKGROUND_PRIVATE_CHATS } from "./background-manager";
+
+          function groupWithTextChannels(...ids: string[]): LocalGroup {
+            return {
+              groupId: "group-background-test",
+              name: "Teste",
+              ownerPeerId: "owner-background-test",
+              membershipVersion: 1,
+              manifestVersion: 1,
+              manifestActorPeerId: "owner-background-test",
+              manifestOperationId: "operation-background-test",
+              administratorEpoch: 1,
+              administratorPeerIds: [],
+              administratorGrants: [],
+              removedPeerIds: [],
+              removedMembers: [],
+              revocations: [],
+              rendezvousVersion: 1,
+              rendezvousSecret: "A".repeat(43),
+              members: [],
+              channels: ids.map((id) => ({ id, name: id, kind: "text" as const, voiceRoomId: null })),
+              joinedAt: 0,
+              createdAt: new Date(0).toISOString(),
+              updatedAt: new Date(0).toISOString(),
+            } as LocalGroup;
+          }
+
+          describe("BackgroundChatManager", () => {
+            beforeEach(() => {
+              runtime.connected.length = 0;
+              runtime.disconnected.length = 0;
+            });
+
+            it("não ocupa o canal ativo nem o canal reservado pela chamada", async () => {
+              const manager = new BackgroundChatManager();
+              const group = groupWithTextChannels("foreground", "call-chat", "background");
+              await manager.sync([group], "Ana", [], "foreground", ["call-chat"]);
+              expect(runtime.connected).toEqual(["background"]);
+              expect(runtime.disconnected).toEqual([]);
+              await manager.disconnect();
+            });
+
+            it("libera uma sessão de grupo já aberta quando a chamada assume o canal", async () => {
+              const manager = new BackgroundChatManager();
+              const group = groupWithTextChannels("call-chat");
+              await manager.sync([group], "Ana", []);
+              expect(runtime.connected).toEqual(["call-chat"]);
+              await manager.release("call-chat");
+              expect(runtime.disconnected).toEqual(["call-chat"]);
+              await manager.sync([group], "Ana", [], undefined, ["call-chat"]);
+              expect(runtime.connected).toEqual(["call-chat"]);
+            });
+
+            it("mantém até oito chats privados conectados ao navegar", async () => {
+              const manager = new BackgroundChatManager();
+              for (let index = 0; index < MAX_BACKGROUND_PRIVATE_CHATS; index += 1) {
+                await manager.connectPrivate(`dm-private-${index}`, "Ana", [], {});
+              }
+              expect(runtime.connected.filter((id) => id.startsWith("dm-private-"))).toHaveLength(8);
+              for (let index = 0; index < MAX_BACKGROUND_PRIVATE_CHATS; index += 1) {
+                expect(manager.privateSession(`dm-private-${index}`)?.status).toBe("ready");
+              }
+              await manager.sync([groupWithTextChannels("group-background")], "Ana", []);
+              expect(runtime.disconnected.filter((id) => id.startsWith("dm-private-"))).toEqual([]);
+              await manager.disconnect();
+            });
+
+            it("ao abrir o nono privado remove somente a sessão menos usada", async () => {
+              const manager = new BackgroundChatManager();
+              for (let index = 0; index < MAX_BACKGROUND_PRIVATE_CHATS; index += 1) {
+                await manager.connectPrivate(`dm-lru-${index}`, "Ana", [], {});
+              }
+              expect(manager.privateSession("dm-lru-0")).toBeDefined();
+              await manager.connectPrivate("dm-lru-8", "Ana", [], {});
+              expect(manager.privateSession("dm-lru-0")).toBeDefined();
+              expect(manager.privateSession("dm-lru-1")).toBeUndefined();
+              expect(manager.privateSession("dm-lru-8")?.status).toBe("ready");
+              expect(runtime.disconnected).toContain("dm-lru-1");
+              await manager.disconnect();
+            });
+          });
+          '''
+          Path("apps/web/src/services/chat/background-manager.test.ts").write_text(tests, encoding="utf-8")
 
           main = Path("apps/web/src/main.tsx")
           source = main.read_text(encoding="utf-8")
 
+          anchor = '  const [chatStatus, setChatStatus] = useState<ChatConnectionStatus>("disconnected");\n'
+          replacement = anchor + '  const [privateChatController, setPrivateChatController] = useState<ChatController | null>(null);\n'
+          if anchor not in source:
+            raise SystemExit("private controller state anchor not found")
+          source = source.replace(anchor, replacement, 1)
+
+          anchor = '  const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;\n\n'
+          replacement = anchor + '  const activeConversationChat = activeFriend ? (privateChatController ?? chat) : chat;\n\n'
+          if anchor not in source:
+            raise SystemExit("conversation controller anchor not found")
+          source = source.replace(anchor, replacement, 1)
+
           old = '''  useEffect(() => {
-    if (!conversationId) { setMessages([]); setHasOlderMessages(false); setAttachments([]); setAttachmentProgress({}); return; }
-    let alive = true;
-    const offMessage = chat.onMessage((message) => {
-      if (!alive) return;'''
+            if (!conversationId) { setMessages([]); setHasOlderMessages(false); setAttachments([]); setAttachmentProgress({}); return; }
+            let alive = true;
+            const offMessage = chat.onMessage((message) => {
+              if (!alive) return;'''
           new = '''  useEffect(() => {
-    if (!conversationId) { setMessages([]); setHasOlderMessages(false); setAttachments([]); setAttachmentProgress({}); return; }
-    const connection = chat.connectionSnapshot();
-    if (connection.channelId && connection.channelId !== conversationId) {
-      void chat.disconnect();
-      setChatStatus("disconnected");
-    } else {
-      setChatStatus(connection.channelId === conversationId ? connection.status : "disconnected");
-    }
-    let alive = true;
-    const offMessage = chat.onMessage((message) => {
-      if (!alive || message.channelId !== conversationId) return;'''
+            if (!conversationId) { setMessages([]); setHasOlderMessages(false); setAttachments([]); setAttachmentProgress({}); return; }
+            const privateSession = activeFriend ? backgroundChats.privateSession(conversationId) : undefined;
+            const controller = activeFriend ? (privateSession?.controller ?? privateChatController) : chat;
+            setChatStatus(activeFriend ? (privateSession?.status ?? "disconnected") : "disconnected");
+            let alive = true;
+            const historyController = controller ?? chat;
+            const offMessage = controller?.onMessage((message) => {
+              if (!alive || message.channelId !== conversationId) return;'''
           if old not in source:
-              raise SystemExit("main conversation start anchor not found")
+            raise SystemExit("conversation effect start anchor not found")
           source = source.replace(old, new, 1)
 
-          old = '''    const offStatus = chat.onStatus((status) => {
-      if (!alive) return;
-      setChatStatus(status);
-      if (status === "incompatible") setError(incompatiblePeerMessage());
-    });'''
-          new = '''    const offStatus = chat.onStatus((status) => {
-      if (!alive) return;
-      const current = chat.connectionSnapshot();
-      const scopedStatus = current.channelId === conversationId ? status : "disconnected";
-      setChatStatus(scopedStatus);
-      if (scopedStatus === "incompatible") setError(incompatiblePeerMessage());
-    });'''
+          source = source.replace('''    const offStatus = chat.onStatus((status) => {
+              if (!alive) return;
+              setChatStatus(status);
+              if (status === "incompatible") setError(incompatiblePeerMessage());
+            });''', '''    const offStatus = controller?.onStatus((status) => {
+              if (!alive) return;
+              setChatStatus(status);
+              if (status === "incompatible") setError(incompatiblePeerMessage());
+            });''', 1)
+          source = source.replace('''    const offAttachment = chat.onAttachment((record) => {''', '''    const offAttachment = controller?.onAttachment((record) => {''', 1)
+          source = source.replace('''    const offProgress = chat.onAttachmentProgress((progress) => {''', '''    const offProgress = controller?.onAttachmentProgress((progress) => {''', 1)
+          source = source.replace('''    void Promise.all([chat.history(conversationId), chat.attachmentHistory(conversationId)])''', '''    void Promise.all([historyController.history(conversationId), historyController.attachmentHistory(conversationId)])''', 1)
+          source = source.replace('''      offMessage();
+              offStatus();
+              offAttachment();
+              offProgress();
+              void chat.disconnect();
+              setChatStatus("disconnected");
+              setAttachmentProgress({});''', '''      offMessage?.();
+              offStatus?.();
+              offAttachment?.();
+              offProgress?.();
+              if (!activeFriend) void chat.disconnect();
+              setChatStatus("disconnected");
+              setAttachmentProgress({});''', 1)
+          source = source.replace('''  }, [conversationId]);''', '''  }, [conversationId, privateChatController, Boolean(activeFriend)]);''', 1)
+
+          old = '''        await chat.connect(privateChannelId, currentUser.displayName, iceServers, {
+                  identity,
+                  trustedPeers: [friend],
+                  namespace: "friend",
+                  maxRemotePeers: 1,
+                });
+                return;'''
+          new = '''        const controller = await backgroundChats.connectPrivate(privateChannelId, currentUser.displayName, iceServers, {
+                  identity,
+                  trustedPeers: [friend],
+                  namespace: "friend",
+                  maxRemotePeers: 1,
+                });
+                setPrivateChatController(controller);
+                setChatStatus(backgroundChats.privateSession(privateChannelId)?.status ?? "connected");
+                return;'''
           if old not in source:
-              raise SystemExit("main scoped status anchor not found")
+            raise SystemExit("private connect anchor not found")
           source = source.replace(old, new, 1)
 
-          old = '''      offAttachment();
-      offProgress();
-      void chat.disconnect();
-      setChatStatus("disconnected");
-      setAttachmentProgress({});'''
-          new = '''      offAttachment();
-      offProgress();
-      setAttachmentProgress({});'''
+          source = source.replace('''      else await chat.send(content);''', '''      else await activeConversationChat.send(content);''', 1)
+          source = source.replace('''    try {
+              for (const file of files) await chat.sendAttachment(file);''', '''    try {
+              for (const file of files) await activeConversationChat.sendAttachment(file);''', 1)
+          source = source.replace('''      const older = await chat.history(conversationId, { before, limit: 100 });''', '''      const older = await activeConversationChat.history(conversationId, { before, limit: 100 });''', 1)
+
+          old = '''        if (activeFriend?.id === target.friend.id) {
+                  await chat.disconnect().catch(() => undefined);
+                  setActiveFriend(null);
+                }'''
+          new = '''        const identity = await getOrCreateLocalIdentity(currentUser?.displayName ?? "Participante");
+                const privateId = await privateConversationId(identity.peerId, target.friend.id);
+                await backgroundChats.disconnectPrivate(privateId).catch(() => undefined);
+                if (activeFriend?.id === target.friend.id) {
+                  setPrivateChatController(null);
+                  setActiveFriend(null);
+                }'''
           if old not in source:
-              raise SystemExit("main cleanup anchor not found")
+            raise SystemExit("friend delete anchor not found")
           source = source.replace(old, new, 1)
+
+          source = source.replace('''    loadBlob={(record) => chat.attachmentBlob(record)}
+            onDownload={(record) => attachmentAction((item) => chat.downloadAttachment(item), record)}
+            onRequest={(record) => attachmentAction((item) => chat.requestAttachment(item), record)}
+            onPause={(record) => attachmentAction((item) => chat.pauseAttachment(item), record)}
+            onResume={(record) => attachmentAction((item) => chat.resumeAttachment(item), record)}
+            onCancel={(record) => attachmentAction((item) => chat.cancelAttachment(item), record)}''', '''    loadBlob={(record) => activeConversationChat.attachmentBlob(record)}
+            onDownload={(record) => attachmentAction((item) => activeConversationChat.downloadAttachment(item), record)}
+            onRequest={(record) => attachmentAction((item) => activeConversationChat.requestAttachment(item), record)}
+            onPause={(record) => attachmentAction((item) => activeConversationChat.pauseAttachment(item), record)}
+            onResume={(record) => attachmentAction((item) => activeConversationChat.resumeAttachment(item), record)}
+            onCancel={(record) => attachmentAction((item) => activeConversationChat.cancelAttachment(item), record)}''', 1)
+
           main.write_text(source, encoding="utf-8")
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build:web
-      - name: Commit validated fix
+      - name: Commit validated private chat pool
         shell: bash
         run: |
           if git diff --quiet; then
@@ -116,6 +452,6 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add apps/web/src/chat.ts apps/web/src/main.tsx
-          git commit -m "fix(chat): preserve private P2P session across navigation"
+          git add apps/web/src/main.tsx apps/web/src/services/chat/background-manager.ts apps/web/src/services/chat/background-manager.test.ts
+          git commit -m "fix(chat): keep eight private P2P sessions alive"
           git push

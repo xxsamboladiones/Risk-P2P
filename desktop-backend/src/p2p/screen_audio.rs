@@ -33,7 +33,7 @@ const RISK_APPLICATION_ID: &str = "com.risk.calls";
 #[cfg(target_os = "linux")]
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(750);
 #[cfg(target_os = "linux")]
-const MIX_NODE_WAIT_ATTEMPTS: usize = 30;
+const MIX_NODE_WAIT_ATTEMPTS: usize = 80;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -248,6 +248,8 @@ async fn wait_for_mix_nodes(
 ) -> anyhow::Result<()> {
     let mut last_sink = false;
     let mut last_source = false;
+    let mut last_sink_ports = 0usize;
+    let mut last_source_ports = 0usize;
     for _ in 0..MIX_NODE_WAIT_ATTEMPTS {
         if let Some(status) = child.try_wait()? {
             let detail = stderr_summary(stderr_lines).await;
@@ -262,23 +264,54 @@ async fn wait_for_mix_nodes(
         }
 
         let graph = read_graph().await?;
-        last_sink = graph.iter().any(is_mix_sink);
-        last_source = graph.iter().any(is_mix_source);
-        if last_sink && last_source {
+        (last_sink, last_source, last_sink_ports, last_source_ports) =
+            mix_graph_readiness(&graph);
+        if last_sink && last_source && last_sink_ports > 0 && last_source_ports > 0 {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    let readiness = format!(
+        "sink={last_sink}, sink_ports={last_sink_ports}, source={last_source}, source_ports={last_source_ports}"
+    );
     let detail = stderr_summary(stderr_lines).await;
     if detail.is_empty() {
         anyhow::bail!(
-            "PipeWire não publicou os nós virtuais do Risk dentro do tempo esperado (sink={last_sink}, source={last_source})"
+            "PipeWire não publicou os nós/portas virtuais do Risk dentro do tempo esperado ({readiness})"
         );
     }
     anyhow::bail!(
-        "PipeWire não publicou os nós virtuais do Risk dentro do tempo esperado (sink={last_sink}, source={last_source}). pw-loopback: {detail}"
+        "PipeWire não publicou os nós/portas virtuais do Risk dentro do tempo esperado ({readiness}). pw-loopback: {detail}"
     )
+}
+
+#[cfg(target_os = "linux")]
+fn mix_graph_readiness(graph: &[PwObject]) -> (bool, bool, usize, usize) {
+    let sink_id = graph.iter().find(|object| is_mix_sink(object)).and_then(|object| object.id);
+    let source_id = graph
+        .iter()
+        .find(|object| is_mix_source(object))
+        .and_then(|object| object.id);
+
+    let sink_ports = sink_id.map_or(0, |id| {
+        graph
+            .iter()
+            .filter(|object| object.type_name().ends_with(":Port"))
+            .filter(|object| object.prop_u32("node.id") == Some(id))
+            .filter(|object| object.prop_str("port.direction") == Some("in"))
+            .count()
+    });
+    let source_ports = source_id.map_or(0, |id| {
+        graph
+            .iter()
+            .filter(|object| object.type_name().ends_with(":Port"))
+            .filter(|object| object.prop_u32("node.id") == Some(id))
+            .filter(|object| object.prop_str("port.direction") == Some("out"))
+            .count()
+    });
+
+    (sink_id.is_some(), source_id.is_some(), sink_ports, source_ports)
 }
 
 #[cfg(target_os = "linux")]
@@ -567,6 +600,22 @@ mod tests {
         }
     }
 
+    fn port(id: u32, node_id: u32, direction: &str) -> PwObject {
+        PwObject {
+            id: Some(id),
+            object_type: Some("PipeWire:Interface:Port".into()),
+            info: Some(PwInfo {
+                props: Some(
+                    serde_json::from_value(serde_json::json!({
+                        "node.id": node_id,
+                        "port.direction": direction,
+                    }))
+                    .unwrap(),
+                ),
+            }),
+        }
+    }
+
     #[test]
     fn detects_playback_streams() {
         assert!(is_playback_stream(&node(serde_json::json!({
@@ -589,6 +638,28 @@ mod tests {
             "node.description": MIX_SOURCE_LABEL,
             "media.class": "Audio/Source"
         }))));
+    }
+
+    #[test]
+    fn waits_for_virtual_ports_before_reporting_ready() {
+        let sink = node(serde_json::json!({
+            "node.name": MIX_SINK_NAME,
+            "node.description": MIX_SINK_LABEL,
+            "media.class": "Audio/Sink"
+        }));
+        let mut source = node(serde_json::json!({
+            "node.name": MIX_SOURCE_NAME,
+            "node.description": MIX_SOURCE_LABEL,
+            "media.class": "Audio/Source"
+        }));
+        source.id = Some(20);
+
+        let mut graph = vec![sink, source];
+        assert_eq!(mix_graph_readiness(&graph), (true, true, 0, 0));
+
+        graph.push(port(30, 10, "in"));
+        graph.push(port(31, 20, "out"));
+        assert_eq!(mix_graph_readiness(&graph), (true, true, 1, 1));
     }
 
     #[test]

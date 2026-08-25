@@ -33,55 +33,61 @@ jobs:
           path = Path("apps/web/src/main.tsx")
           text = path.read_text(encoding="utf-8")
 
-          old = '''  useEffect(() => {
-            if (!currentUser) return;
-            let alive = true;
-            void Promise.all([loadLocalGroups(), api.turnCredentials(token)])
-              .then(([groups, { iceServers }]) => { if (alive) return backgroundChats.sync(groups, currentUser.displayName, iceServers, activeChannel?.id); })
-              .catch(() => undefined);
-            return () => { alive = false; };
-          }, [activeChannel?.id, currentUser, communities, token]);'''
-          new = '''  useEffect(() => {
-            if (!currentUser) return;
-            let alive = true;
-            const reservedChannelIds = roomId && callContext?.textChannelId ? [callContext.textChannelId] : [];
-            void Promise.all([loadLocalGroups(), api.turnCredentials(token)])
-              .then(([groups, { iceServers }]) => { if (alive) return backgroundChats.sync(groups, currentUser.displayName, iceServers, activeChannel?.id, reservedChannelIds); })
-              .catch(() => undefined);
-            return () => { alive = false; };
-          }, [activeChannel?.id, callContext?.textChannelId, currentUser, communities, roomId, token]);'''
+          old = (
+              "  useEffect(() => {\n"
+              "    if (!currentUser) return;\n"
+              "    let alive = true;\n"
+              "    void Promise.all([loadLocalGroups(), api.turnCredentials(token)])\n"
+              "      .then(([groups, { iceServers }]) => { if (alive) return backgroundChats.sync(groups, currentUser.displayName, iceServers, activeChannel?.id); })\n"
+              "      .catch(() => undefined);\n"
+              "    return () => { alive = false; };\n"
+              "  }, [activeChannel?.id, currentUser, communities, token]);"
+          )
+          new = (
+              "  useEffect(() => {\n"
+              "    if (!currentUser) return;\n"
+              "    let alive = true;\n"
+              "    const reservedChannelIds = roomId && callContext?.textChannelId ? [callContext.textChannelId] : [];\n"
+              "    void Promise.all([loadLocalGroups(), api.turnCredentials(token)])\n"
+              "      .then(([groups, { iceServers }]) => { if (alive) return backgroundChats.sync(groups, currentUser.displayName, iceServers, activeChannel?.id, reservedChannelIds); })\n"
+              "      .catch(() => undefined);\n"
+              "    return () => { alive = false; };\n"
+              "  }, [activeChannel?.id, callContext?.textChannelId, currentUser, communities, roomId, token]);"
+          )
           if old not in text:
               raise SystemExit("background chat sync block not found")
           text = text.replace(old, new, 1)
 
-          old = '''      const textChannel = availableChannels.find((item) => item.kind === "text") ?? null;
-          setCallContext({'''
-          new = '''      const textChannel = availableChannels.find((item) => item.kind === "text") ?? null;
-          if (textChannel) {
-            await backgroundChats.release(textChannel.id);
-            if (!activeFriend && activeChannel?.id === textChannel.id) {
-              await chat.disconnect().catch(() => undefined);
-              setChatStatus("disconnected");
-            }
-          }
-          setCallContext({'''
+          old = "      const textChannel = availableChannels.find((item) => item.kind === \"text\") ?? null;\n      setCallContext({"
+          new = (
+              "      const textChannel = availableChannels.find((item) => item.kind === \"text\") ?? null;\n"
+              "      if (textChannel) {\n"
+              "        await backgroundChats.release(textChannel.id);\n"
+              "        if (!activeFriend && activeChannel?.id === textChannel.id) {\n"
+              "          await chat.disconnect().catch(() => undefined);\n"
+              "          setChatStatus(\"disconnected\");\n"
+              "        }\n"
+              "      }\n"
+              "      setCallContext({"
+          )
           if old not in text:
               raise SystemExit("enterVoice text channel block not found")
           text = text.replace(old, new, 1)
 
-          old = '''      if (!activeChannel || activeChannel.kind !== "text") return;
-          const [identity, groups] = await Promise.all(['''
-          new = '''      if (!activeChannel || activeChannel.kind !== "text") return;
-          if (roomId && callContext?.textChannelId === activeChannel.id) {
-            throw new Error("Este canal já pertence ao chat automático da chamada enquanto você estiver na sala de voz.");
-          }
-          const [identity, groups] = await Promise.all(['''
+          old = "      if (!activeChannel || activeChannel.kind !== \"text\") return;\n      const [identity, groups] = await Promise.all(["
+          new = (
+              "      if (!activeChannel || activeChannel.kind !== \"text\") return;\n"
+              "      if (roomId && callContext?.textChannelId === activeChannel.id) {\n"
+              "        throw new Error(\"Este canal já pertence ao chat automático da chamada enquanto você estiver na sala de voz.\");\n"
+              "      }\n"
+              "      const [identity, groups] = await Promise.all(["
+          )
           if old not in text:
               raise SystemExit("group connect block not found")
           text = text.replace(old, new, 1)
 
-          old = '''      await Promise.all([chat.disconnect(), callChat.disconnect()]);'''
-          new = '''      await Promise.all([chat.disconnect(), callChat.disconnect(), backgroundChats.disconnect()]);'''
+          old = "      await Promise.all([chat.disconnect(), callChat.disconnect()]);"
+          new = "      await Promise.all([chat.disconnect(), callChat.disconnect(), backgroundChats.disconnect()]);"
           if old not in text:
               raise SystemExit("logout disconnect block not found")
           text = text.replace(old, new, 1)

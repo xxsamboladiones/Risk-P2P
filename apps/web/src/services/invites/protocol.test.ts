@@ -22,4 +22,13 @@ describe("protocolo assinado de convites", () => {
     expect(await parseAndVerifyInviteMessage(JSON.stringify(message), now + 180_000)).toBeNull();
     expect(await parseAndVerifyInviteMessage(`{"padding":"${"x".repeat(50_000)}"}`, now)).toBeNull();
   });
+
+  it("aceita manifesto de grupo somente quando o autor é o dono declarado", async () => {
+    const owner = await identity("Dona"); const now = Date.now();
+    const group = { groupId: crypto.randomUUID(), name: "Clã", channels: [], ownerPeerId: owner.peerId, membershipVersion: 1 };
+    const valid = await createSignedInviteMessage(owner, { type: "group.join.accept", requestId: crypto.randomUUID(), timestamp: now, group });
+    expect(await parseAndVerifyInviteMessage(JSON.stringify(valid), now)).not.toBeNull();
+    const invalid = await createSignedInviteMessage(owner, { type: "group.join.accept", requestId: crypto.randomUUID(), timestamp: now, group: { ...group, ownerPeerId: crypto.randomUUID() } });
+    expect(await parseAndVerifyInviteMessage(JSON.stringify(invalid), now)).toBeNull();
+  });
 });

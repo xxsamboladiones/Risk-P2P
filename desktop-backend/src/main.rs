@@ -140,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from("risk-data"));
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("não foi possível criar {}", data_dir.display()))?;
+    p2p::attachments::cleanup_stale_transfers().await;
     let db_path = data_dir.join("risk.sqlite3");
     let options = SqliteConnectOptions::new()
         .filename(&db_path)

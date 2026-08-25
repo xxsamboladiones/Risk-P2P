@@ -95,6 +95,8 @@ type GroupMembersWireMessage = {
   channelId: string;
   groupId: string;
   senderPeerId: string;
+  ownerPeerId: string;
+  membershipVersion: number;
   members: PublicPeerIdentity[];
   timestamp: number;
   signature: string;
@@ -251,7 +253,6 @@ export class ChatController {
       if (this.sessionToken !== sessionToken) throw new DOMException("Conexão do chat substituída por outra sessão.", "AbortError");
       this.setStatus("connected");
       this.armReadyTimeout(sessionToken);
-      await signaling.sendPeerProfile(this.displayName);
       if (this.groupId) await this.refreshGroupMembership(false);
       else await this.connectPresentTrustedPeers();
     } catch (error) {
@@ -444,10 +445,6 @@ export class ChatController {
         if (!this.isTrustedRemote(message.fromPeerId)) return;
         void this.transport?.addIceCandidate(message.fromPeerId, message.payload.candidate).catch(() => undefined);
       }),
-      signaling.onPeerProfile((message) => {
-        if (!this.isTrustedRemote(message.fromPeerId)) return;
-        if (!this.peerNames.has(message.fromPeerId)) this.peerNames.set(message.fromPeerId, message.payload.displayName);
-      }),
       signaling.onStatusChange((status) => {
         if (status === "connected" && this.openDataPeers.size === 0) {
           this.setStatus("connected");
@@ -467,7 +464,6 @@ export class ChatController {
       this.setStatus(this.openDataPeers.size ? "ready" : "connected");
       if (this.sessionToken && this.openDataPeers.size === 0) this.armReadyTimeout(this.sessionToken);
     });
-    await this.signaling?.sendPeerProfile(this.displayName).catch(() => undefined);
   }
 
   private isTrustedRemote(remotePeerId: string): boolean {
@@ -674,9 +670,9 @@ export class ChatController {
 
     if (!this.identity) return;
     if (envelope.type === "chat.members.snapshot") {
-      if (!this.groupId || envelope.groupId !== this.groupId || envelope.senderPeerId !== remotePeerId) return;
+      if (!this.groupId || envelope.groupId !== this.groupId || envelope.senderPeerId !== remotePeerId || envelope.ownerPeerId !== remotePeerId) return;
       if (!(await this.verifyGroupMembership(envelope))) return;
-      const merged = await mergeLocalGroupMembers(this.groupId, envelope.members);
+      const merged = await mergeLocalGroupMembers(this.groupId, envelope.members, envelope.ownerPeerId, envelope.membershipVersion);
       this.installTrustedPeers(merged.members);
       await this.connectPresentTrustedPeers();
       return;
@@ -775,7 +771,7 @@ export class ChatController {
   private async sendGroupMembership(remotePeerId: string): Promise<void> {
     if (!this.groupId || !this.identity || !this.channelId || !this.transport || !this.openDataPeers.has(remotePeerId)) return;
     const group = (await loadLocalGroups()).find((item) => item.groupId === this.groupId);
-    if (!group) return;
+    if (!group || group.ownerPeerId !== this.identity.peerId) return;
     const members = group.members.slice(0, MAX_GROUP_SYNC_MEMBERS);
     const unsigned: Omit<GroupMembersWireMessage, "signature"> = {
       version: 2,
@@ -783,6 +779,8 @@ export class ChatController {
       channelId: this.channelId,
       groupId: this.groupId,
       senderPeerId: this.identity.peerId,
+      ownerPeerId: group.ownerPeerId,
+      membershipVersion: group.membershipVersion,
       members,
       timestamp: Date.now(),
     };
@@ -969,6 +967,7 @@ function parseIdentityProof(message: Record<string, unknown>, channelId?: string
 
 function parseGroupMembership(message: Record<string, unknown>, channelId?: string): GroupMembersWireMessage | null {
   if (!validWireId(message.groupId) || !validWireId(message.senderPeerId)) return null;
+  if (!validWireId(message.ownerPeerId) || message.ownerPeerId !== message.senderPeerId || !Number.isSafeInteger(message.membershipVersion) || Number(message.membershipVersion) < 1) return null;
   if (!Array.isArray(message.members) || message.members.length === 0 || message.members.length > MAX_GROUP_SYNC_MEMBERS) return null;
   if (!message.members.every(isPublicPeerIdentity) || !freshTimestamp(message.timestamp)) return null;
   if (typeof message.signature !== "string" || !/^[A-Za-z0-9_-]{16,256}$/.test(message.signature)) return null;
@@ -978,6 +977,8 @@ function parseGroupMembership(message: Record<string, unknown>, channelId?: stri
     channelId: channelId!,
     groupId: message.groupId,
     senderPeerId: message.senderPeerId,
+    ownerPeerId: message.ownerPeerId,
+    membershipVersion: Number(message.membershipVersion),
     members: message.members,
     timestamp: message.timestamp,
     signature: message.signature,
@@ -1016,6 +1017,8 @@ function canonicalGroupMembership(message: Omit<GroupMembersWireMessage, "signat
     channelId: message.channelId,
     groupId: message.groupId,
     senderPeerId: message.senderPeerId,
+    ownerPeerId: message.ownerPeerId,
+    membershipVersion: message.membershipVersion,
     members: [...message.members]
       .sort((left, right) => left.peerId.localeCompare(right.peerId))
       .map((member) => ({

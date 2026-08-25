@@ -1,0 +1,2 @@
+ALTER TABLE p2p_groups ADD COLUMN owner_peer_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE p2p_groups ADD COLUMN membership_version INTEGER NOT NULL DEFAULT 1;

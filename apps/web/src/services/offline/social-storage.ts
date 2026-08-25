@@ -4,7 +4,7 @@ export type PublicPeerIdentity = { peerId: string; publicKey: JsonWebKey; displa
 export type LocalIdentity = PublicPeerIdentity & { id: "self"; privateKey: CryptoKey };
 export type LocalFriend = PublicPeerIdentity & { addedAt: number };
 export type LocalGroupChannel = { id: string; name: string; kind: "text" | "voice"; voiceRoomId?: string | null };
-export type PublicGroupMetadata = { groupId: string; name: string; avatar?: string; channels: LocalGroupChannel[] };
+export type PublicGroupMetadata = { groupId: string; name: string; avatar?: string; channels: LocalGroupChannel[]; ownerPeerId: string; membershipVersion: number };
 export type LocalGroup = PublicGroupMetadata & { members: PublicPeerIdentity[]; joinedAt: number };
 
 type DesktopBackendConfig = { baseUrl: string; token?: string };
@@ -47,6 +47,15 @@ export async function getOrCreateLocalIdentity(displayName: string): Promise<Loc
   await putInStore(OFFLINE_STORES.identity, identity);
   await refreshIdentityMembership().catch((error) => console.warn("Não foi possível incluir a nova identidade P2P nos grupos locais.", error));
   return identity;
+}
+
+export async function updateLocalIdentityProfile(displayName: string, avatar?: string): Promise<LocalIdentity> {
+  const identity = await loadLocalIdentity();
+  if (!identity) throw new Error("Perfil P2P local não encontrado.");
+  const updated: LocalIdentity = { ...identity, displayName, avatar };
+  await putInStore(OFFLINE_STORES.identity, updated);
+  await refreshIdentityMembership().catch((error) => console.warn("Não foi possível atualizar o perfil nos grupos locais.", error));
+  return updated;
 }
 
 export async function loadLocalFriends(): Promise<LocalFriend[]> {
@@ -109,7 +118,7 @@ export async function createLocalGroup(name: string, owner: PublicPeerIdentity):
   if (trimmedName.length < 2 || trimmedName.length > 80) throw new Error("O nome do grupo deve ter entre 2 e 80 caracteres.");
   const groupId = crypto.randomUUID();
   const group: LocalGroup = {
-    groupId, name: trimmedName, members: [owner], joinedAt: Date.now(),
+    groupId, name: trimmedName, members: [owner], joinedAt: Date.now(), ownerPeerId: owner.peerId, membershipVersion: 1,
     channels: [
       { id: crypto.randomUUID(), name: "geral", kind: "text" },
       { id: crypto.randomUUID(), name: "Geral", kind: "voice", voiceRoomId: crypto.randomUUID() },
@@ -129,38 +138,37 @@ export async function addLocalGroupChannel(groupId: string, channel: LocalGroupC
   await saveLocalGroup(group);
 }
 
-export async function ensureLocalGroup(groupId: string, name: string, owner: PublicPeerIdentity, channels: LocalGroupChannel[] = []): Promise<LocalGroup> {
+export async function ensureLocalGroup(groupId: string, name: string, owner: PublicPeerIdentity, channels: LocalGroupChannel[] = [], ownerPeerId = owner.peerId, membershipVersion = 1): Promise<LocalGroup> {
   const existing = (await loadLocalGroups()).find((item) => item.groupId === groupId);
   if (existing) return existing;
-  const local: LocalGroup = { groupId, name, members: [owner], joinedAt: Date.now(), channels };
+  const local: LocalGroup = { groupId, name, members: [owner], joinedAt: Date.now(), channels, ownerPeerId, membershipVersion };
   await saveLocalGroup(local);
   return local;
 }
 
 export async function addLocalGroupMember(group: PublicGroupMetadata, member: PublicPeerIdentity, owner: PublicPeerIdentity): Promise<void> {
+  if (group.ownerPeerId !== owner.peerId) throw new Error("Somente o dono do grupo pode aprovar novos membros.");
   const current = (await loadLocalGroups()).find((item) => item.groupId === group.groupId);
   const members = [...(current?.members ?? [owner])];
   if (!members.some((item) => samePeerIdentity(item, member))) members.push(member);
-  await saveLocalGroup({ ...group, members, joinedAt: current?.joinedAt ?? Date.now() });
+  await saveLocalGroup({ ...group, members, membershipVersion: Math.max(group.membershipVersion, current?.membershipVersion ?? 0) + 1, joinedAt: current?.joinedAt ?? Date.now() });
 }
 
-export async function mergeLocalGroupMembers(groupId: string, incoming: PublicPeerIdentity[]): Promise<LocalGroup> {
+export async function mergeLocalGroupMembers(groupId: string, incoming: PublicPeerIdentity[], ownerPeerId: string, membershipVersion: number): Promise<LocalGroup> {
   const group = (await loadLocalGroups()).find((item) => item.groupId === groupId);
   if (!group) throw new Error("Grupo local não encontrado para sincronizar membros.");
-  const members = dedupePeerIdentities(group.members);
-  for (const member of incoming) {
-    if (!validPublicPeerIdentity(member)) continue;
-    const index = members.findIndex((existing) => samePeerIdentity(existing, member));
-    if (index < 0) {
-      members.push(member);
-      continue;
-    }
-    const existing = members[index]!;
-    if (samePublicKey(existing.publicKey, member.publicKey)) {
-      members[index] = { ...existing, displayName: member.displayName, avatar: member.avatar };
-    }
+  if (group.ownerPeerId !== ownerPeerId || membershipVersion <= group.membershipVersion) return group;
+  const members = dedupePeerIdentities(incoming);
+  const knownOwner = group.members.find((member) => member.peerId === ownerPeerId);
+  const incomingOwner = members.find((member) => member.peerId === ownerPeerId);
+  if (!knownOwner || !incomingOwner || !samePublicKey(knownOwner.publicKey, incomingOwner.publicKey)) return group;
+  const merged = { ...group, members, membershipVersion };
+  const identity = await loadLocalIdentity();
+  if (identity && !members.some((member) => member.peerId === identity.peerId && samePublicKey(member.publicKey, identity.publicKey))) {
+    await deleteLocalGroup(groupId);
+    window.dispatchEvent(new Event("risk:social-updated"));
+    return merged;
   }
-  const merged = { ...group, members };
   await saveLocalGroup(merged);
   return merged;
 }
@@ -181,8 +189,10 @@ async function reconcileIdentityMembership(
   const self = publicIdentity(identity);
   const reconciled: LocalGroup[] = [];
   for (const group of groups) {
+    const ownerPeerId = group.ownerPeerId || group.members[0]?.peerId || identity.peerId;
+    const membershipVersion = Number.isSafeInteger(group.membershipVersion) && group.membershipVersion > 0 ? group.membershipVersion : 1;
     const members = dedupePeerIdentities(group.members, self);
-    let changed = members.length !== group.members.length;
+    let changed = members.length !== group.members.length || group.ownerPeerId !== ownerPeerId || group.membershipVersion !== membershipVersion;
     const index = members.findIndex((member) => samePeerIdentity(member, self));
     if (index < 0) {
       members.push(self);
@@ -201,7 +211,7 @@ async function reconcileIdentityMembership(
       reconciled.push(group);
       continue;
     }
-    const updated = { ...group, members };
+    const updated = { ...group, ownerPeerId, membershipVersion, members };
     await persist(updated);
     reconciled.push(updated);
   }

@@ -36,8 +36,7 @@ Eventos utilizados pelo signaling:
 - `webrtc.offer`;
 - `webrtc.answer`;
 - `webrtc.ice-candidate`;
-- `peer.state`;
-- `peer.profile`.
+- `peer.state`.
 
 Cada payload usa envelope versão 1:
 
@@ -96,7 +95,7 @@ Ao sair, o provider executa `untrack`/remoção do canal e o transporte fecha Da
 }
 ```
 
-`peer.profile` transporta somente o nome de exibição necessário à interface. Esses dados são efêmeros e não substituem a identidade persistente da conta.
+Perfis não passam pelo Supabase. Nome, avatar e prova da identidade atravessam somente o DataChannel WebRTC.
 
 ## Chat por DataChannel
 
@@ -116,7 +115,7 @@ Mensagem wire versão 1:
 }
 ```
 
-O receptor valida canal, UUID da mensagem, tamanho, conteúdo e timestamp. O campo `author` continua no wire por compatibilidade, porém o `ChatController` não confia nele para a identidade exibida: a mensagem é associada ao `remotePeerId` real do DataChannel e ao `peer.profile` observado para aquele peer.
+O receptor valida canal, UUID da mensagem, tamanho, conteúdo, timestamp e assinatura ECDSA. O campo `author` da versão 1 permanece apenas para compatibilidade; sessões autenticadas utilizam a versão 2 assinada e a identidade já confiada localmente.
 
 O transporte rejeita payloads acima de 64 KiB. O chat usa limite menor na validação e mensagens de até 4.000 caracteres. Quando `RTCDataChannel.bufferedAmount` ultrapassa o limite local de segurança, novas mensagens deixam de ser enfileiradas e o envio retorna falha ao chamador.
 
@@ -198,7 +197,7 @@ Isso reduz exposição acidental da chave, embora qualquer código executado com
 ## Limitações deliberadas
 
 - sem peer online não existe entrega P2P remota;
-- Presence não é uma identidade de conta autenticada criptograficamente;
-- o chat ainda não assina cada mensagem com a identidade persistente;
-- conhecer/derivar um tópico Realtime não é o mesmo que passar por autorização de membership do backend;
+- Presence não é uma identidade de conta; a autorização acontece depois, pelo DataChannel;
+- sem o dono online, novos snapshots de membership não podem ser emitidos;
+- conhecer um tópico Realtime permite tentar negociar, mas a mídia de grupo continua bloqueada até a prova ECDSA;
 - Mesh é adequado a grupos pequenos; para grupos maiores seria necessário considerar SFU/arquitetura diferente.

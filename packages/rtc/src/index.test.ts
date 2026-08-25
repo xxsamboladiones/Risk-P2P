@@ -5,6 +5,7 @@ class FakePeerConnection {
   static instances: FakePeerConnection[] = [];
   static addedIce: RTCIceCandidateInit[] = [];
   static dataChannels: FakeDataChannel[] = [];
+  static addedTracks: MediaStreamTrack[] = [];
   connectionState: RTCPeerConnectionState = "new";
   iceConnectionState: RTCIceConnectionState = "new";
   signalingState: RTCSignalingState = "stable";
@@ -28,7 +29,7 @@ class FakePeerConnection {
     this.signalingState = description.type === "offer" ? "have-remote-offer" : "stable";
   }
   async addIceCandidate(candidate: RTCIceCandidateInit): Promise<void> { FakePeerConnection.addedIce.push(candidate); }
-  addTrack(): RTCRtpSender { return {} as RTCRtpSender; }
+  addTrack(track: MediaStreamTrack): RTCRtpSender { FakePeerConnection.addedTracks.push(track); return {} as RTCRtpSender; }
   removeTrack(): void {}
   getSenders(): RTCRtpSender[] { return []; }
   getTransceivers(): RTCRtpTransceiver[] { return []; }
@@ -92,6 +93,7 @@ describe("MeshWebRTCTransport", () => {
     FakePeerConnection.instances = [];
     FakePeerConnection.addedIce = [];
     FakePeerConnection.dataChannels = [];
+    FakePeerConnection.addedTracks = [];
     vi.stubGlobal("RTCPeerConnection", FakePeerConnection);
   });
   afterEach(() => vi.unstubAllGlobals());
@@ -142,6 +144,18 @@ describe("MeshWebRTCTransport", () => {
     await transport.publishTrack(track, stream);
 
     expect(callbacks.sendOffer).toHaveBeenCalledTimes(2);
+  });
+
+  it("não publica mídia antes da autorização criptográfica do peer", async () => {
+    const peerId = "00000000-0000-4000-8000-000000000002";
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], events());
+    transport.requireMediaAuthorization();
+    const track = { id: "microphone", kind: "audio" } as MediaStreamTrack;
+    await transport.publishTrack(track, { id: "local" } as MediaStream);
+    await transport.connect(peerId, false);
+    expect(FakePeerConnection.addedTracks).toHaveLength(0);
+    await transport.authorizePeerMedia(peerId);
+    expect(FakePeerConnection.addedTracks).toEqual([track]);
   });
 
   it("preserva renegociação pendente se a câmera/tela ligar enquanto uma offer está em voo", async () => {

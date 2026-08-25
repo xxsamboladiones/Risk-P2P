@@ -5,6 +5,8 @@ import { api } from "./api";
 import { openConfiguredMicrophone } from "./services/audio/microphone";
 import { createRnnoiseMicrophone, type RnnoiseMicrophone } from "./services/audio/rnnoise";
 import { loadVoiceVideoSettings, type VoiceVideoSettings } from "./services/audio/settings";
+import { validAvatarDataUrl } from "./services/offline/profile";
+import { getOrCreateLocalIdentity, publicIdentity, type LocalIdentity, type PublicPeerIdentity } from "./services/offline/social-storage";
 import { SupabaseSignalingProvider } from "./services/supabase/signaling";
 import type { SignalingDiagnostics, SignalingProvider } from "./services/signaling/types";
 
@@ -28,6 +30,44 @@ type MicrophoneSession = {
   rnnoise?: RnnoiseMicrophone;
 };
 
+type CallProfileMessage = {
+  version: 1;
+  type: "call.profile";
+  payload: { displayName: string; avatar?: string };
+};
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlToArrayBuffer(value: string): ArrayBuffer {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+  const binary = atob(normalized);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0)).buffer;
+}
+
+type CallAuthMessage =
+  | { version: 1; type: "call.auth.challenge"; identityPeerId: string; nonce: string; timestamp: number }
+  | { version: 1; type: "call.auth.proof"; identity: PublicPeerIdentity; nonce: string; timestamp: number; signature: string };
+
+export type CallJoinOptions = { identity?: LocalIdentity; trustedPeers?: PublicPeerIdentity[] };
+
+export function parseCallProfileMessage(value: string): CallProfileMessage | null {
+  if (new TextEncoder().encode(value).byteLength > 64 * 1024) return null;
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { return null; }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const envelope = parsed as Record<string, unknown>;
+  if (envelope.version !== 1 || envelope.type !== "call.profile" || !envelope.payload || typeof envelope.payload !== "object" || Array.isArray(envelope.payload)) return null;
+  const payload = envelope.payload as Record<string, unknown>;
+  const displayName = typeof payload.displayName === "string" ? payload.displayName.trim() : "";
+  if (displayName.length < 2 || displayName.length > 80) return null;
+  if (payload.avatar !== undefined && !validAvatarDataUrl(payload.avatar)) return null;
+  return { version: 1, type: "call.profile", payload: { displayName, avatar: payload.avatar as string | undefined } };
+}
+
 function placeholderParticipant(peerId: string): Participant {
   return {
     peerId,
@@ -36,6 +76,13 @@ function placeholderParticipant(peerId: string): Participant {
     streams: {},
     connection: "new",
   };
+}
+
+function hasTurnServer(iceServers: RTCIceServer[]): boolean {
+  return iceServers.some(({ urls }) => {
+    const values = typeof urls === "string" ? [urls] : urls;
+    return values.some((url) => /^turns?:/i.test(url));
+  });
 }
 
 async function createMicrophoneSession(settings: VoiceVideoSettings): Promise<MicrophoneSession> {
@@ -219,13 +266,21 @@ export class CallController {
   private roomId?: string;
   private peerId?: string;
   private displayName = "Participante";
+  private avatar?: string;
   private state: PeerState = { microphone: true, camera: false, screenShare: false };
   private signalingUnsubscribers: Array<() => void> = [];
   private lifecycleId = 0;
+  private turnAvailable = false;
+  private connectionFailureMessage?: string;
+  private identity?: LocalIdentity;
+  private readonly trustedPeers = new Map<string, PublicPeerIdentity>();
+  private readonly authChallenges = new Map<string, string>();
+  private readonly authTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private mediaAuthenticationRequired = false;
 
   constructor(private readonly createSignaling: () => SignalingProvider = () => new SupabaseSignalingProvider()) {}
 
-  async join(token: string, roomId: string, iceServers: RTCIceServer[]): Promise<MediaStream> {
+  async join(token: string, roomId: string, iceServers: RTCIceServer[], options: CallJoinOptions = {}): Promise<MediaStream> {
     if (this.roomId) await this.leave(this.roomId);
     const lifecycle = ++this.lifecycleId;
     const voiceSettings = loadVoiceVideoSettings();
@@ -237,6 +292,19 @@ export class CallController {
     this.rnnoiseMicrophone = undefined;
     this.cameraTrack = undefined;
     this.screenStream = undefined;
+    this.turnAvailable = hasTurnServer(iceServers);
+    this.connectionFailureMessage = undefined;
+    this.identity = undefined;
+    this.trustedPeers.clear();
+    this.authChallenges.clear();
+    this.authTimers.forEach((timer) => clearTimeout(timer));
+    this.authTimers.clear();
+    this.mediaAuthenticationRequired = false;
+    this.identity = options.identity;
+    this.trustedPeers.clear();
+    options.trustedPeers?.forEach((peer) => this.trustedPeers.set(peer.peerId, peer));
+    this.mediaAuthenticationRequired = Boolean(options.identity && options.trustedPeers?.length);
+    this.authChallenges.clear();
     this.state = { microphone: true, camera: false, screenShare: false };
     const store = useCallStore.getState();
     store.setError(null);
@@ -259,8 +327,32 @@ export class CallController {
         const store = useCallStore.getState();
         const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
         store.upsert({ ...participant, connection });
+        if (connection === "failed") {
+          this.connectionFailureMessage = this.turnAvailable
+            ? "A conexão WebRTC falhou mesmo com TURN configurado. Verifique o servidor TURN e as portas 3478 e 49160–49200."
+            : "A conexão WebRTC foi bloqueada pela rede. Este pacote está usando somente STUN; configure um servidor TURN para chamadas entre NAT/CGNAT ou firewalls restritivos.";
+          store.setError(this.connectionFailureMessage);
+        } else if (connection === "connected" && store.error === this.connectionFailureMessage) {
+          store.setError(null);
+          this.connectionFailureMessage = undefined;
+        }
+      },
+      onDataMessage: (remotePeerId, data) => {
+        if (this.mediaAuthenticationRequired && this.handleAuthMessage(remotePeerId, data)) return;
+        const message = parseCallProfileMessage(data);
+        if (!message || this.mediaAuthenticationRequired) return;
+        const store = useCallStore.getState();
+        const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
+        store.upsert({ ...participant, displayName: message.payload.displayName, avatar: message.payload.avatar });
+      },
+      onDataState: (remotePeerId, state) => {
+        if (state === "open") {
+          if (this.mediaAuthenticationRequired) void this.sendAuthChallenge(remotePeerId);
+          else this.sendProfile(remotePeerId);
+        }
       },
     });
+    if (this.mediaAuthenticationRequired) transport.requireMediaAuthorization();
     this.transport = transport;
     this.bindSignaling(signaling, roomId, this.peerId);
 
@@ -268,6 +360,8 @@ export class CallController {
       const profile = await api.me(token);
       if (!this.isActive(lifecycle)) throw new DOMException("Entrada na chamada cancelada.", "AbortError");
       this.displayName = profile.displayName;
+      this.avatar = profile.avatar;
+      this.identity ??= await getOrCreateLocalIdentity(profile.displayName);
 
       const microphoneSession = await createMicrophoneSession(voiceSettings);
       if (!this.isActive(lifecycle)) {
@@ -285,7 +379,7 @@ export class CallController {
       this.updateLocalPreview();
       await signaling.connect(roomId, this.peerId);
       if (!this.isActive(lifecycle)) throw new DOMException("Entrada na chamada cancelada.", "AbortError");
-      await Promise.all([signaling.sendPeerState(this.state), signaling.sendPeerProfile(this.displayName)]);
+      await signaling.sendPeerState(this.state);
       return this.local;
     } catch (error) {
       if (this.isActive(lifecycle)) await this.cleanup();
@@ -529,6 +623,75 @@ export class CallController {
 
   async leave(_roomId: string): Promise<void> { await this.cleanup(); }
 
+  updateProfile(displayName: string, avatar?: string): void {
+    const normalized = displayName.trim();
+    if (normalized.length < 2 || normalized.length > 80) return;
+    if (avatar !== undefined && !validAvatarDataUrl(avatar)) return;
+    this.displayName = normalized;
+    this.avatar = avatar;
+    this.sendProfile();
+  }
+
+  private async sendAuthChallenge(remotePeerId: string): Promise<void> {
+    if (!this.identity || !this.transport) return;
+    const nonce = crypto.randomUUID();
+    this.authChallenges.set(remotePeerId, nonce);
+    const prior = this.authTimers.get(remotePeerId); if (prior) clearTimeout(prior);
+    this.authTimers.set(remotePeerId, setTimeout(() => {
+      this.authTimers.delete(remotePeerId);
+      if (!this.authChallenges.delete(remotePeerId)) return;
+      useCallStore.getState().remove(remotePeerId);
+      void this.transport?.disconnect(remotePeerId);
+    }, 12_000));
+    const message: CallAuthMessage = { version: 1, type: "call.auth.challenge", identityPeerId: this.identity.peerId, nonce, timestamp: Date.now() };
+    this.transport.sendData(JSON.stringify(message), remotePeerId);
+  }
+
+  private handleAuthMessage(remotePeerId: string, raw: string): boolean {
+    let value: unknown;
+    try { value = JSON.parse(raw); } catch { return false; }
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const message = value as Partial<CallAuthMessage>;
+    if (message.version !== 1 || typeof message.type !== "string" || !message.type.startsWith("call.auth.")) return false;
+    if (Math.abs(Date.now() - Number(message.timestamp)) > 30_000) return true;
+    if (message.type === "call.auth.challenge") void this.respondAuthChallenge(remotePeerId, message);
+    if (message.type === "call.auth.proof") void this.acceptAuthProof(remotePeerId, message);
+    return true;
+  }
+
+  private async respondAuthChallenge(remotePeerId: string, message: Partial<Extract<CallAuthMessage, { type: "call.auth.challenge" }>>): Promise<void> {
+    if (!this.identity || !this.transport || typeof message.nonce !== "string" || !this.peerId || !this.roomId) return;
+    const publicProfile = publicIdentity(this.identity);
+    const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, this.identity.privateKey, new TextEncoder().encode(this.authCanonical(remotePeerId, message.nonce, publicProfile)));
+    const proof: CallAuthMessage = { version: 1, type: "call.auth.proof", identity: publicProfile, nonce: message.nonce, timestamp: Date.now(), signature: bytesToBase64Url(new Uint8Array(signature)) };
+    this.transport.sendData(JSON.stringify(proof), remotePeerId);
+  }
+
+  private async acceptAuthProof(remotePeerId: string, message: Partial<Extract<CallAuthMessage, { type: "call.auth.proof" }>>): Promise<void> {
+    const expectedNonce = this.authChallenges.get(remotePeerId);
+    const identity = message.identity;
+    if (!expectedNonce || message.nonce !== expectedNonce || !identity || typeof message.signature !== "string") return;
+    if (!/^[A-Za-z0-9_-]{8,128}$/.test(identity.peerId) || identity.displayName.trim().length < 2 || identity.displayName.length > 80 || (identity.avatar !== undefined && !validAvatarDataUrl(identity.avatar))) return;
+    const trusted = this.trustedPeers.get(identity.peerId);
+    if (!trusted || JSON.stringify(trusted.publicKey) !== JSON.stringify(identity.publicKey)) return;
+    try {
+      const key = await crypto.subtle.importKey("jwk", trusted.publicKey, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+      const valid = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, base64UrlToArrayBuffer(message.signature), new TextEncoder().encode(this.authCanonical(remotePeerId, expectedNonce, identity)));
+      if (!valid) return;
+      this.authChallenges.delete(remotePeerId);
+      const timer = this.authTimers.get(remotePeerId); if (timer) clearTimeout(timer);
+      this.authTimers.delete(remotePeerId);
+      const participant = useCallStore.getState().participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
+      useCallStore.getState().upsert({ ...participant, displayName: identity.displayName, avatar: identity.avatar });
+      await this.transport?.authorizePeerMedia(remotePeerId);
+    } catch { /* prova externa inválida */ }
+  }
+
+  private authCanonical(remotePeerId: string, nonce: string, identity: PublicPeerIdentity): string {
+    const peers = [this.peerId ?? "", remotePeerId].sort().join(":");
+    return JSON.stringify({ protocol: "risk-call-auth-v1", roomId: this.roomId ?? "", peers, nonce, identity });
+  }
+
   getDiagnostics(): CallDiagnostics {
     return {
       signaling: this.signaling?.getDiagnostics() ?? null,
@@ -616,10 +779,12 @@ export class CallController {
         store.upsert({ ...participant, connection: participant.connection ?? "new" });
         void this.transport?.connect(peer.peerId, peerId < peer.peerId).catch((error) => store.setError(String(error)));
         void signaling.sendPeerState(this.state).catch((error) => store.setError(String(error)));
-        void signaling.sendPeerProfile(this.displayName).catch((error) => store.setError(String(error)));
       }),
       signaling.onPeerLeft((remotePeerId) => {
         useCallStore.getState().remove(remotePeerId);
+        this.authChallenges.delete(remotePeerId);
+        const timer = this.authTimers.get(remotePeerId); if (timer) clearTimeout(timer);
+        this.authTimers.delete(remotePeerId);
         void this.transport?.disconnect(remotePeerId);
       }),
       signaling.onOffer((message) => {
@@ -636,11 +801,6 @@ export class CallController {
         const participant = store.participants[message.fromPeerId] ?? placeholderParticipant(message.fromPeerId);
         const state = reconcileRemoteMediaState(participant.streams, message.payload.state);
         store.upsert({ ...participant, state });
-      }),
-      signaling.onPeerProfile((message) => {
-        const store = useCallStore.getState();
-        const participant = store.participants[message.fromPeerId] ?? placeholderParticipant(message.fromPeerId);
-        store.upsert({ ...participant, displayName: message.payload.displayName });
       }),
       signaling.onStatusChange((status) => {
         if (status === "error") useCallStore.getState().setError("Falha no signaling Supabase Realtime.");
@@ -704,6 +864,15 @@ export class CallController {
     this.roomId = undefined;
     this.peerId = undefined;
     this.displayName = "Participante";
+    this.avatar = undefined;
+    this.turnAvailable = false;
+    this.connectionFailureMessage = undefined;
+    this.identity = undefined;
+    this.trustedPeers.clear();
+    this.authChallenges.clear();
+    this.authTimers.forEach((timer) => clearTimeout(timer));
+    this.authTimers.clear();
+    this.mediaAuthenticationRequired = false;
     this.state = { microphone: true, camera: false, screenShare: false };
 
     unsubscribers.forEach((unsubscribe) => unsubscribe());
@@ -722,5 +891,21 @@ export class CallController {
     await rnnoiseMicrophone?.stop().catch(() => undefined);
     await screenCleanup;
     await desktopAudioCleanup;
+  }
+
+  async getLiveDiagnostics(): Promise<CallDiagnostics> {
+    return {
+      signaling: this.signaling?.getDiagnostics() ?? null,
+      peerConnections: await this.transport?.collectDiagnostics() ?? [],
+    };
+  }
+
+  private sendProfile(targetPeerId?: string): void {
+    const message: CallProfileMessage = {
+      version: 1,
+      type: "call.profile",
+      payload: { displayName: this.displayName, avatar: this.avatar },
+    };
+    this.transport?.sendData(JSON.stringify(message), targetPeerId);
   }
 }

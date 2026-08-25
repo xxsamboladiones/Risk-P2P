@@ -3,6 +3,7 @@ import type { PeerState } from "@risk/protocol";
 
 type ReconcileRemoteMediaState = typeof import("./call")["reconcileRemoteMediaState"];
 let reconcileRemoteMediaState: ReconcileRemoteMediaState;
+let parseCallProfileMessage: typeof import("./call")["parseCallProfileMessage"];
 
 function fakeStream(id: string, video = true): MediaStream {
   return {
@@ -19,7 +20,7 @@ beforeAll(async () => {
     removeItem: (key: string) => { values.delete(key); },
     clear: () => { values.clear(); },
   });
-  ({ reconcileRemoteMediaState } = await import("./call"));
+  ({ reconcileRemoteMediaState, parseCallProfileMessage } = await import("./call"));
 });
 
 afterAll(() => vi.unstubAllGlobals());
@@ -56,5 +57,27 @@ describe("reconcileRemoteMediaState", () => {
     );
     expect(result.cameraStreamId).toBe(camera.id);
     expect(result.screenStreamId).toBe(screen.id);
+  });
+});
+
+describe("perfil da chamada via DataChannel", () => {
+  it("aceita nome e avatar de imagem com envelope válido", () => {
+    const avatar = "data:image/png;base64,AA==";
+    expect(parseCallProfileMessage(JSON.stringify({
+      version: 1,
+      type: "call.profile",
+      payload: { displayName: "Maria", avatar },
+    }))).toEqual({ version: 1, type: "call.profile", payload: { displayName: "Maria", avatar } });
+  });
+
+  it("recusa URLs externas, SVG e payload excessivo", () => {
+    for (const avatar of ["https://example.com/avatar.png", "data:image/svg+xml;base64,PHN2Zz4="]) {
+      expect(parseCallProfileMessage(JSON.stringify({ version: 1, type: "call.profile", payload: { displayName: "Maria", avatar } }))).toBeNull();
+    }
+    expect(parseCallProfileMessage(JSON.stringify({
+      version: 1,
+      type: "call.profile",
+      payload: { displayName: "Maria", avatar: `data:image/png;base64,${"A".repeat(70_000)}` },
+    }))).toBeNull();
   });
 });

@@ -68,7 +68,7 @@ Supabase é rendezvous/signaling efêmero:
 
 A sala é derivada antes de virar tópico Realtime. O provider rejeita mensagens próprias, mensagens destinadas a outro peer, mensagens duplicadas, antigas ou de peers que não estejam presentes no canal.
 
-Presence ainda usa identidade efêmera escolhida pelo cliente. O protocolo de convites possui identidade ECDSA permanente, mas signaling geral e chat ainda podem ser endurecidos com handshake/assinaturas ligadas à identidade P2P durável.
+Presence usa apenas identidade efêmera de transporte. Chats e chamadas de grupo executam um desafio ECDSA pelo DataChannel; na chamada, nenhuma track é anexada ao peer antes de sua identidade permanente corresponder ao roster local do grupo.
 
 ## WebRTC
 
@@ -82,12 +82,18 @@ O transporte implementa:
 - backpressure simples de DataChannel;
 - limpeza de tracks, peer connections e callbacks;
 - diagnóstico sem expor SDP ou credenciais completas.
+- autorização de mídia por peer;
+- ICE restart após desconexão prolongada;
+- bitrate de vídeo adaptado à quantidade de peers;
+- métricas locais de RTT, jitter, perda e bitrate.
 
 ## Chat P2P
 
 O chat negocia um DataChannel ordenado usando o mesmo modelo de signaling. Mensagens trafegam diretamente pelo WebRTC.
 
-O nome recebido não é confiado cegamente ao campo `author`; o cliente o associa ao peer conectado. Ainda falta ligar cada sessão de chat à identidade criptográfica permanente para uma garantia mais forte contra impersonação.
+Mensagens versão 2 são assinadas pela identidade ECDSA permanente. Antes de aceitar conteúdo ou histórico, os peers concluem um desafio bilateral e conferem a chave pública com a lista local de membros/amigos. Até oito canais locais podem manter sessões leves em segundo plano para não lidas e notificações.
+
+Snapshots de membership são aceitos apenas quando assinados pelo dono do grupo e quando possuem uma versão superior à versão local. Somente o dono pode gerar convites de entrada nesta versão.
 
 ## Convites P2P
 

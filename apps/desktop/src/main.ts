@@ -1,7 +1,7 @@
 import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, net, protocol, session } from "electron";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { constants as fsConstants, readFileSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, readFileSync } from "node:fs";
 import { access, mkdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -16,6 +16,24 @@ if (process.platform === "linux") {
 function shouldUseLinuxSoftwareRendering(): boolean {
   if (process.platform !== "linux" || process.env.RISK_FORCE_GPU === "1") return false;
   if (process.env.RISK_DISABLE_GPU === "1") return true;
+
+  // Algumas imagens Linux/VMware anunciam um driver GBM que existe, mas que o
+  // sandbox do processo GPU não consegue ler. Nesse caso o Chromium insiste no
+  // caminho de hardware, falha antes de renderizar a janela e deixa a tela preta.
+  const gbmDrivers = [
+    "/usr/lib/gbm/dri_gbm.so",
+    "/usr/lib/x86_64-linux-gnu/gbm/dri_gbm.so",
+  ];
+  const hasUnreadableGbmDriver = gbmDrivers.some((file) => {
+    if (!existsSync(file)) return false;
+    try {
+      accessSync(file, fsConstants.R_OK);
+      return false;
+    } catch {
+      return true;
+    }
+  });
+  if (hasUnreadableGbmDriver) return true;
 
   const identityFiles = [
     "/sys/class/dmi/id/sys_vendor",
@@ -47,7 +65,7 @@ if (shouldUseLinuxSoftwareRendering()) {
   // WebRTC e captura de tela, apenas com menor desempenho gráfico.
   app.disableHardwareAcceleration();
   app.commandLine.appendSwitch("disable-features", "VaapiVideoDecoder,VaapiVideoEncoder");
-  console.info("[desktop] Máquina virtual Linux detectada; usando renderização por software.");
+  console.info("[desktop] GPU Linux incompatível ou inacessível; usando renderização por software.");
 }
 
 app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");

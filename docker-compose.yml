@@ -1,5 +1,6 @@
 services:
   postgres:
+    profiles: ["legacy-server"]
     image: postgres:17-alpine
     environment: { POSTGRES_USER: risk, POSTGRES_PASSWORD: risk_dev, POSTGRES_DB: risk }
     ports: ["5432:5432"]
@@ -7,6 +8,7 @@ services:
     healthcheck: { test: ["CMD-SHELL", "pg_isready -U risk"], interval: 5s, timeout: 3s, retries: 10 }
 
   coturn:
+    profiles: ["relay"]
     image: coturn/coturn:4.6-alpine
     ports:
       - "3478:3478/tcp"
@@ -16,6 +18,7 @@ services:
     command: ["-c", "/etc/coturn/turnserver.conf", "--static-auth-secret=${TURN_SECRET:?Defina TURN_SECRET no arquivo .env}"]
 
   backend:
+    profiles: ["legacy-server"]
     image: rust:1.88-bookworm
     working_dir: /app/server
     command: cargo run

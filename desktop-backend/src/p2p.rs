@@ -1,4 +1,4 @@
-mod attachments;
+pub(crate) mod attachments;
 mod screen_audio;
 
 use super::{bearer, internal, ApiError, AppState};
@@ -31,6 +31,8 @@ struct P2pGroup {
     channels: Value,
     members: Value,
     joined_at: i64,
+    owner_peer_id: String,
+    membership_version: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -138,15 +140,25 @@ async fn list_groups(
     headers: HeaderMap,
 ) -> Result<Json<Vec<P2pGroup>>, ApiError> {
     let owner = bearer(&headers, &state)?;
-    let rows = sqlx::query_as::<_, (String, String, Option<String>, String, String, i64)>(
-        "SELECT group_id,name,avatar,channels_json,members_json,joined_at FROM p2p_groups WHERE owner_user_id=? ORDER BY joined_at",
+    let rows = sqlx::query_as::<_, (String, String, Option<String>, String, String, i64, String, i64)>(
+        "SELECT group_id,name,avatar,channels_json,members_json,joined_at,owner_peer_id,membership_version FROM p2p_groups WHERE owner_user_id=? ORDER BY joined_at",
     )
     .bind(owner)
     .fetch_all(&state.db)
     .await
     .map_err(internal)?;
     let mut result = Vec::with_capacity(rows.len());
-    for (group_id, name, avatar, channels_json, members_json, joined_at) in rows {
+    for (
+        group_id,
+        name,
+        avatar,
+        channels_json,
+        members_json,
+        joined_at,
+        owner_peer_id,
+        membership_version,
+    ) in rows
+    {
         let channels = serde_json::from_str(&channels_json)
             .map_err(|error| ApiError::Internal(error.into()))?;
         let members = serde_json::from_str(&members_json)
@@ -158,6 +170,8 @@ async fn list_groups(
             channels,
             members,
             joined_at,
+            owner_peer_id,
+            membership_version,
         });
     }
     Ok(Json(result))
@@ -181,7 +195,12 @@ async fn save_group(
         .members
         .as_array()
         .ok_or_else(|| ApiError::Bad("Membros P2P inválidos".into()))?;
-    if channels.len() > 100 || members.len() > 256 || group.joined_at <= 0 {
+    if channels.len() > 100
+        || members.len() > 256
+        || group.joined_at <= 0
+        || !valid_id(&group.owner_peer_id)
+        || group.membership_version < 1
+    {
         return Err(ApiError::Bad(
             "Metadados do grupo P2P excedem os limites".into(),
         ));
@@ -191,7 +210,7 @@ async fn save_group(
     let members_json =
         serde_json::to_string(&group.members).map_err(|error| ApiError::Internal(error.into()))?;
     sqlx::query(
-        "INSERT INTO p2p_groups(owner_user_id,group_id,name,avatar,channels_json,members_json,joined_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(owner_user_id,group_id) DO UPDATE SET name=excluded.name,avatar=excluded.avatar,channels_json=excluded.channels_json,members_json=excluded.members_json,joined_at=excluded.joined_at",
+        "INSERT INTO p2p_groups(owner_user_id,group_id,name,avatar,channels_json,members_json,joined_at,owner_peer_id,membership_version) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(owner_user_id,group_id) DO UPDATE SET name=excluded.name,avatar=excluded.avatar,channels_json=excluded.channels_json,members_json=excluded.members_json,joined_at=excluded.joined_at,owner_peer_id=excluded.owner_peer_id,membership_version=excluded.membership_version",
     )
     .bind(owner)
     .bind(&group.group_id)
@@ -200,6 +219,8 @@ async fn save_group(
     .bind(channels_json)
     .bind(members_json)
     .bind(group.joined_at)
+    .bind(&group.owner_peer_id)
+    .bind(group.membership_version)
     .execute(&state.db)
     .await
     .map_err(internal)?;

@@ -1,7 +1,7 @@
 import http from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { defineConfig, type Plugin } from "vite";
+import { defineConfig, loadEnv, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 
 const envDir = fileURLToPath(new URL("../../", import.meta.url));
@@ -109,12 +109,25 @@ function devBackendProxy(): Plugin {
   };
 }
 
-export default defineConfig(({ command }) => {
+export default defineConfig(({ command, mode }) => {
   const devApiUrl = process.env.RISK_DEV_API_URL?.trim() || DEV_API_PREFIX;
+  const env = loadEnv(mode, envDir, "VITE_");
+  const realtimeSources: string[] = [];
+  try {
+    const url = new URL(env.VITE_SUPABASE_URL ?? "");
+    realtimeSources.push(url.origin, `${url.protocol === "https:" ? "wss:" : "ws:"}//${url.host}`);
+  } catch { /* validação de configuração apresenta o erro amigável no app */ }
+  const connectSources = ["'self'", "http://127.0.0.1:*", ...(command === "serve" ? ["http://localhost:*", "ws://127.0.0.1:*", "ws://localhost:*"] : []), ...realtimeSources].join(" ");
   return {
     base: "./",
     envDir,
-    plugins: [react(), devBackendProxy()],
+    // Em desenvolvimento o Vite injeta CSS em <style>. Um nonce permite esses
+    // estilos sem enfraquecer a CSP com style-src 'unsafe-inline'. O runtime do
+    // Vite lê o mesmo nonce da meta csp-nonce gerada automaticamente.
+    html: { cspNonce: "risk-vite-style" },
+    plugins: [react(), devBackendProxy(), { name: "risk-csp", transformIndexHtml: (html) => html
+      .replace("__RISK_CONNECT_SRC__", connectSources)
+      .replace("__RISK_STYLE_SRC__", command === "serve" ? "'self' 'nonce-risk-vite-style'" : "'self'") }],
     // Durante `vite serve`, o navegador usa o proxy local por padrão mesmo que um
     // .env antigo ainda contenha VITE_API_URL=http://localhost:8080. Para testar
     // deliberadamente outra API em desenvolvimento, use RISK_DEV_API_URL.
@@ -122,5 +135,19 @@ export default defineConfig(({ command }) => {
       ? { "import.meta.env.VITE_API_URL": JSON.stringify(devApiUrl) }
       : undefined,
     server: { port: 5173 },
+    build: {
+      rollupOptions: {
+        output: {
+          manualChunks(id) {
+            if (!id.includes("node_modules")) return undefined;
+            if (id.includes("@supabase")) return "vendor-supabase";
+            if (id.includes("react") || id.includes("zustand")) return "vendor-react";
+            if (id.includes("lucide-react")) return "vendor-icons";
+            if (id.includes("noise-suppressor")) return "vendor-audio";
+            return "vendor";
+          },
+        },
+      },
+    },
   };
 });

@@ -28,16 +28,8 @@ export function GroupInvitePanel({
   preferredGroupChannels?: LocalGroupChannel[];
   onComplete?(): void;
 }) {
-  const preferredMetadata = useMemo<PublicGroupMetadata | undefined>(() => {
-    if (!preferredGroupId || !preferredGroupName) return undefined;
-    return {
-      groupId: preferredGroupId,
-      name: preferredGroupName,
-      channels: preferredGroupChannels ?? [],
-    };
-  }, [preferredGroupChannels, preferredGroupId, preferredGroupName]);
-
   const [groups, setGroups] = useState<LocalGroup[]>([]);
+  const preferredMetadata = useMemo<PublicGroupMetadata | undefined>(() => groups.find((group) => group.groupId === preferredGroupId), [groups, preferredGroupId]);
   const [selectedId, setSelectedId] = useState(preferredGroupId ?? "");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -48,21 +40,19 @@ export function GroupInvitePanel({
     void (async () => {
       setLoading(true);
       setError("");
+      const currentIdentity = await getOrCreateLocalIdentity(displayName);
       let localGroups = await loadLocalGroups();
 
       if (preferredGroupId) {
         const existing = localGroups.find((group) => group.groupId === preferredGroupId);
         if (!existing) {
-          let metadata = preferredMetadata;
+          let metadata: PublicGroupMetadata | undefined = existing;
           if (!metadata) {
             const communities = await api.communities(token);
             const community = communities.find((group) => group.id === preferredGroupId);
             if (!community) throw new Error("Grupo selecionado não foi encontrado.");
-            metadata = {
-              groupId: preferredGroupId,
-              name: community.name,
-              channels: await api.channels(token, preferredGroupId).catch(() => []),
-            };
+            const identity = await getOrCreateLocalIdentity(displayName);
+            metadata = { groupId: preferredGroupId, name: preferredGroupName ?? community.name, channels: preferredGroupChannels ?? await api.channels(token, preferredGroupId).catch(() => []), ownerPeerId: identity.peerId, membershipVersion: 1 };
           }
 
           try {
@@ -72,6 +62,8 @@ export function GroupInvitePanel({
               metadata.name,
               publicIdentity(identity),
               metadata.channels,
+              metadata.ownerPeerId,
+              metadata.membershipVersion,
             );
             localGroups = await loadLocalGroups();
             window.dispatchEvent(new Event("risk:social-updated"));
@@ -82,9 +74,10 @@ export function GroupInvitePanel({
       }
 
       if (!alive) return;
+      const ownedGroups = initialMode === "create" ? localGroups.filter((group) => group.ownerPeerId === currentIdentity.peerId) : localGroups;
       const available = preferredGroupId
-        ? localGroups.filter((group) => group.groupId === preferredGroupId)
-        : localGroups;
+        ? ownedGroups.filter((group) => group.groupId === preferredGroupId)
+        : ownedGroups;
       setGroups(available);
       setSelectedId((current) => {
         if (preferredGroupId) return preferredGroupId;
@@ -102,7 +95,7 @@ export function GroupInvitePanel({
     return () => {
       alive = false;
     };
-  }, [displayName, preferredGroupId, preferredMetadata, token]);
+  }, [displayName, initialMode, preferredGroupChannels, preferredGroupId, preferredGroupName, token]);
 
   const selected = groups.find((group) => group.groupId === selectedId);
   const metadata: PublicGroupMetadata | undefined = selected
@@ -111,6 +104,8 @@ export function GroupInvitePanel({
         name: selected.name,
         avatar: selected.avatar,
         channels: selected.channels,
+        ownerPeerId: selected.ownerPeerId,
+        membershipVersion: selected.membershipVersion,
       }
     : preferredMetadata && selectedId === preferredMetadata.groupId
       ? preferredMetadata

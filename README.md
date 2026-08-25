@@ -88,6 +88,8 @@ O protocolo inclui:
 - previews de mídia;
 - armazenamento local de anexos.
 
+O desktop aplica por padrão uma quota total de 50 GiB para anexos e remove transferências temporárias abandonadas há mais de sete dias. A quota pode ser ajustada com `RISK_ATTACHMENT_QUOTA_BYTES`.
+
 ## Chamadas
 
 O transporte atual usa WebRTC Mesh e limita cada cliente a cinco peers remotos, totalizando até **seis participantes por chamada**.
@@ -106,6 +108,9 @@ A interface de chamada suporta:
 - tela cheia;
 - zoom com a roda do mouse no modo tela cheia;
 - alternância entre chamada e chat sem encerrar a conexão.
+- autenticação ECDSA dos membros antes de publicar mídia;
+- indicador local de qualidade baseado em RTT, jitter e perda;
+- bitrate adaptado automaticamente ao tamanho da chamada.
 
 ## Componentes
 
@@ -115,7 +120,7 @@ apps/desktop       Electron Main + preload
 packages/rtc       WebRTC, mídia, DataChannels e file transfer
 packages/protocol  Tipos e mensagens compartilhadas
 desktop-backend    Backend local Rust/Axum + SQLite
-server             Backend PostgreSQL legado/experimental
+server             Backend PostgreSQL legado isolado (somente migração)
 infrastructure     Coturn, Docker e infraestrutura auxiliar
 ```
 
@@ -143,6 +148,7 @@ Copie `.env.example` para `.env` e configure pelo menos:
 VITE_SUPABASE_URL=https://seu-projeto.supabase.co
 VITE_SUPABASE_ANON_KEY=sua-chave-publica
 VITE_DEBUG_SIGNALING=false
+VITE_ENABLE_LEGACY_SERVER=false
 ```
 
 Configuração pública de ICE também pode ser definida por build:
@@ -241,8 +247,10 @@ pnpm typecheck
 pnpm test
 ```
 
-A CI valida TypeScript, testes Web/P2P, build Web, Electron e o código Rust dos backends.
+A CI valida TypeScript, testes Web/P2P, build Web, duas instâncias empacotadas do Electron e o sidecar Rust.
 O backend desktop também é verificado no Windows para cobrir os caminhos específicos de captura de áudio desse sistema.
+
+Tags `v*` executam o workflow de release para gerar NSIS, AppImage, DEB e `SHA256SUMS.txt`. Para assinar o Windows, configure `CSC_LINK` e `CSC_KEY_PASSWORD` como secrets do repositório. O servidor PostgreSQL antigo só é ativado explicitamente com `VITE_ENABLE_LEGACY_SERVER=true` e o profile Docker `legacy-server`.
 
 ## Destaques da versão Alpha atual
 

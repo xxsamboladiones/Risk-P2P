@@ -116,6 +116,10 @@ export type PeerConnectionDiagnostics = {
   pendingIceCandidates: number;
   dataChannelState: RTCDataChannelState | "unavailable";
   transferDataChannelState: RTCDataChannelState | "unavailable";
+  roundTripTimeMs?: number;
+  packetsLost?: number;
+  jitterMs?: number;
+  outboundBitrateKbps?: number;
 };
 
 export interface CallTransport {
@@ -151,6 +155,10 @@ const TRANSFER_LOW_WATER_MARK_BYTES = 1 * 1024 * 1024;
 export class MeshWebRTCTransport implements CallTransport {
   private readonly peers = new Map<string, PeerEntry>();
   private readonly localTracks = new Map<string, { track: MediaStreamTrack; stream: MediaStream }>();
+  private readonly mediaAuthorizedPeers = new Set<string>();
+  private readonly disconnectedTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private mediaAuthorizationRequired = false;
+  private readonly previousOutboundBytes = new Map<string, { bytes: number; timestamp: number }>();
 
   constructor(
     private readonly localPeerId: string,
@@ -171,6 +179,22 @@ export class MeshWebRTCTransport implements CallTransport {
       entry.needsNegotiation = true;
       await this.negotiateIfNeeded(peerId, entry);
     }
+  }
+
+  requireMediaAuthorization(): void {
+    if (this.peers.size > 0) throw new Error("A autorização de mídia precisa ser ativada antes de conectar peers.");
+    this.mediaAuthorizationRequired = true;
+  }
+
+  async authorizePeerMedia(peerId: string): Promise<void> {
+    this.mediaAuthorizedPeers.add(peerId);
+    const entry = this.requirePeer(peerId);
+    for (const { track, stream } of this.localTracks.values()) {
+      if (!entry.pc.getSenders().some((sender) => sender.track?.id === track.id)) entry.pc.addTrack(track, stream);
+    }
+    entry.needsNegotiation = true;
+    await this.negotiateIfNeeded(peerId, entry);
+    await this.applyAdaptiveVideoParameters();
   }
 
   async acceptOffer(peerId: string, description: RTCSessionDescriptionInit): Promise<void> {
@@ -197,12 +221,14 @@ export class MeshWebRTCTransport implements CallTransport {
     this.localTracks.set(track.id, { track, stream });
     const negotiations: Promise<void>[] = [];
     for (const [peerId, entry] of this.peers) {
+      if (this.mediaAuthorizationRequired && !this.mediaAuthorizedPeers.has(peerId)) continue;
       if (entry.pc.getSenders().some((sender) => sender.track?.id === track.id)) continue;
       entry.pc.addTrack(track, stream);
       entry.needsNegotiation = true;
       negotiations.push(this.negotiateIfNeeded(peerId, entry));
     }
     await Promise.all(negotiations);
+    await this.applyAdaptiveVideoParameters();
   }
 
   async unpublishTrack(track: MediaStreamTrack): Promise<void> {
@@ -335,6 +361,11 @@ export class MeshWebRTCTransport implements CallTransport {
       entry.transferDataChannel?.close();
       entry.pc.close();
       this.peers.delete(id);
+      this.mediaAuthorizedPeers.delete(id);
+      this.previousOutboundBytes.delete(id);
+      const timer = this.disconnectedTimers.get(id);
+      if (timer) clearTimeout(timer);
+      this.disconnectedTimers.delete(id);
     });
   }
 
@@ -347,6 +378,31 @@ export class MeshWebRTCTransport implements CallTransport {
       pendingIceCandidates: entry.pendingIceCandidates.length,
       dataChannelState: entry.dataChannel?.readyState ?? "unavailable",
       transferDataChannelState: entry.transferDataChannel?.readyState ?? "unavailable",
+    }));
+  }
+
+  async collectDiagnostics(): Promise<PeerConnectionDiagnostics[]> {
+    return Promise.all([...this.peers].map(async ([peerId, entry]) => {
+      const base = this.getDiagnostics().find((item) => item.peerId === peerId)!;
+      const reports = await entry.pc.getStats();
+      let roundTripTimeMs: number | undefined;
+      let packetsLost: number | undefined;
+      let jitterMs: number | undefined;
+      let outboundBitrateKbps: number | undefined;
+      reports.forEach((report) => {
+        if (report.type === "candidate-pair" && report.state === "succeeded" && typeof report.currentRoundTripTime === "number") roundTripTimeMs = Math.round(report.currentRoundTripTime * 1000);
+        if (report.type === "inbound-rtp" && !report.isRemote) {
+          if (typeof report.packetsLost === "number") packetsLost = (packetsLost ?? 0) + report.packetsLost;
+          if (typeof report.jitter === "number") jitterMs = Math.max(jitterMs ?? 0, Math.round(report.jitter * 1000));
+        }
+        if (report.type === "outbound-rtp" && report.kind === "video" && typeof report.bytesSent === "number") {
+          const now = Number(report.timestamp);
+          const previous = this.previousOutboundBytes.get(peerId);
+          if (previous && now > previous.timestamp) outboundBitrateKbps = Math.max(0, Math.round(((report.bytesSent - previous.bytes) * 8) / (now - previous.timestamp)));
+          this.previousOutboundBytes.set(peerId, { bytes: report.bytesSent, timestamp: now });
+        }
+      });
+      return { ...base, roundTripTimeMs, packetsLost, jitterMs, outboundBitrateKbps };
     }));
   }
 
@@ -367,7 +423,7 @@ export class MeshWebRTCTransport implements CallTransport {
       pendingIceCandidates: [],
     };
     this.peers.set(peerId, entry);
-    this.localTracks.forEach(({ track, stream }) => pc.addTrack(track, stream));
+    if (!this.mediaAuthorizationRequired || this.mediaAuthorizedPeers.has(peerId)) this.localTracks.forEach(({ track, stream }) => pc.addTrack(track, stream));
     pc.onicecandidate = ({ candidate }) => {
       if (candidate) void Promise.resolve(this.events.sendIce(peerId, candidate.toJSON() as IceCandidatePayload)).catch((error) => logger.warn("ICE signaling failed", { peerId, error: String(error) }));
     };
@@ -391,11 +447,35 @@ export class MeshWebRTCTransport implements CallTransport {
     };
     pc.onconnectionstatechange = () => {
       this.events.onConnectionState(peerId, pc.connectionState);
+      const priorTimer = this.disconnectedTimers.get(peerId);
+      if (pc.connectionState === "connected" && priorTimer) {
+        clearTimeout(priorTimer);
+        this.disconnectedTimers.delete(peerId);
+      }
+      if (pc.connectionState === "disconnected" && !priorTimer && this.localPeerId < peerId) {
+        const timer = setTimeout(() => {
+          this.disconnectedTimers.delete(peerId);
+          if (pc.connectionState === "disconnected") void this.restartIce(peerId).catch((error) => logger.warn("ICE restart after disconnect failed", { peerId, error: String(error) }));
+        }, 8_000);
+        this.disconnectedTimers.set(peerId, timer);
+      }
       if (pc.connectionState === "failed" && this.localPeerId < peerId) {
         void this.restartIce(peerId).catch((error) => logger.warn("ICE restart failed", { peerId, error: String(error) }));
       }
     };
     return entry;
+  }
+
+  private async applyAdaptiveVideoParameters(): Promise<void> {
+    const activePeers = Math.max(1, this.mediaAuthorizationRequired ? this.mediaAuthorizedPeers.size : this.peers.size);
+    const maxBitrate = activePeers <= 1 ? 2_500_000 : activePeers <= 3 ? 1_200_000 : 700_000;
+    await Promise.all([...this.peers.values()].flatMap(({ pc }) => pc.getSenders().filter((sender) => sender.track?.kind === "video").map(async (sender) => {
+      const parameters = sender.getParameters();
+      parameters.encodings = parameters.encodings?.length ? parameters.encodings : [{}];
+      parameters.encodings[0]!.maxBitrate = maxBitrate;
+      parameters.degradationPreference = "maintain-framerate";
+      await sender.setParameters(parameters).catch(() => undefined);
+    })));
   }
 
   private bindControlDataChannel(peerId: string, entry: PeerEntry, channel: RTCDataChannel): void {

@@ -1,12 +1,11 @@
 import type { RealtimeChannel, SupabaseClient } from "@supabase/supabase-js";
 import type { PeerState } from "@risk/protocol";
 import { getSupabaseRealtimeClient } from "./client";
-import { isValidPeer, parseAnswer, parseIceCandidate, parseOffer, parsePeerProfile, parsePeerState } from "../signaling/validation";
+import { isValidPeer, parseAnswer, parseIceCandidate, parseOffer, parsePeerState } from "../signaling/validation";
 import type {
   AnswerMessage,
   IceCandidateMessage,
   OfferMessage,
-  PeerProfileMessage,
   PeerStateMessage,
   SignalingDiagnostics,
   SignalingEnvelope,
@@ -23,7 +22,6 @@ type CallbackMap = {
   answer: (message: AnswerMessage) => void;
   ice: (message: IceCandidateMessage) => void;
   peerState: (message: PeerStateMessage) => void;
-  peerProfile: (message: PeerProfileMessage) => void;
   status: (status: SignalingStatus) => void;
 };
 
@@ -36,7 +34,7 @@ const CLIENT_VERSION = "risk-web-1";
 export class SupabaseSignalingProvider implements SignalingProvider {
   private readonly callbacks: CallbackSets = {
     peerJoined: new Set(), peerLeft: new Set(), offer: new Set(), answer: new Set(),
-    ice: new Set(), peerState: new Set(), peerProfile: new Set(), status: new Set(),
+    ice: new Set(), peerState: new Set(), status: new Set(),
   };
   private readonly presencePeers = new Map<string, SignalingPeer>();
   private readonly processedMessageIds = new Map<string, number>();
@@ -48,6 +46,9 @@ export class SupabaseSignalingProvider implements SignalingProvider {
   private status: SignalingStatus = "disconnected";
   private channelStatus = "CLOSED";
   private disconnecting = false;
+  private channelName?: string;
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
+  private reconnectAttempts = 0;
 
   async connect(roomId: string, peerId: string, namespace: SignalingNamespace = "room"): Promise<void> {
     if (this.channel) await this.disconnect();
@@ -56,22 +57,27 @@ export class SupabaseSignalingProvider implements SignalingProvider {
     this.client = getSupabaseRealtimeClient();
     this.roomId = await secureRoomId(`${namespace}:${roomId}`);
     this.peerId = peerId;
-    const channelName = `risk:${namespace}:${this.roomId.slice(0, 32)}`;
-    this.channel = this.client.channel(channelName, {
+    this.channelName = `risk:${namespace}:${this.roomId.slice(0, 32)}`;
+    this.channel = this.client.channel(this.channelName, {
       config: { presence: { key: peerId }, broadcast: { self: false, ack: true } },
     });
     this.registerChannelListeners(this.channel);
+    const activeChannel = this.channel;
     await new Promise<void>((resolve, reject) => {
       let settled = false;
       const timeout = window.setTimeout(() => {
         if (!settled) { settled = true; this.setStatus("error"); reject(new Error("Tempo esgotado ao conectar ao Supabase Realtime.")); }
       }, 15_000);
-      this.channel!.subscribe(async (status) => {
+      activeChannel.subscribe(async (status) => {
+        if (this.channel !== activeChannel || this.disconnecting) return;
         this.channelStatus = status;
         if (status === "SUBSCRIBED") {
+          if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+          this.reconnectTimer = undefined;
+          this.reconnectAttempts = 0;
           this.setStatus("connected");
           try {
-            await this.channel!.track({ peerId, joinedAt: Date.now(), clientVersion: CLIENT_VERSION });
+            await activeChannel.track({ peerId, joinedAt: Date.now(), clientVersion: CLIENT_VERSION });
             this.reconcilePresence();
             if (!settled) { settled = true; window.clearTimeout(timeout); resolve(); }
           } catch (error) {
@@ -79,9 +85,11 @@ export class SupabaseSignalingProvider implements SignalingProvider {
           }
         } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
           this.setStatus(settled ? "reconnecting" : "error");
+          if (settled) this.scheduleReconnect();
           if (!settled) { settled = true; window.clearTimeout(timeout); reject(new Error(`Falha no canal Supabase Realtime: ${status}`)); }
         } else if (status === "CLOSED" && !this.disconnecting) {
-          this.setStatus("disconnected");
+          this.setStatus(settled ? "reconnecting" : "disconnected");
+          if (settled) this.scheduleReconnect();
         }
       });
     });
@@ -89,6 +97,9 @@ export class SupabaseSignalingProvider implements SignalingProvider {
 
   async disconnect(): Promise<void> {
     this.disconnecting = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    this.reconnectAttempts = 0;
     const channel = this.channel;
     this.channel = undefined;
     if (channel) {
@@ -102,6 +113,7 @@ export class SupabaseSignalingProvider implements SignalingProvider {
     this.roomId = undefined;
     this.peerId = undefined;
     this.channelStatus = "CLOSED";
+    this.channelName = undefined;
     this.setStatus("disconnected");
     this.disconnecting = false;
   }
@@ -116,7 +128,6 @@ export class SupabaseSignalingProvider implements SignalingProvider {
     return this.broadcast("webrtc.ice-candidate", targetPeerId, { candidate });
   }
   sendPeerState(state: PeerState): Promise<void> { return this.broadcast("peer.state", undefined, { state }); }
-  sendPeerProfile(displayName: string): Promise<void> { return this.broadcast("peer.profile", undefined, { displayName: displayName.trim() }); }
 
   onPeerJoined(callback: CallbackMap["peerJoined"]): () => void { return this.addCallback("peerJoined", callback); }
   onPeerLeft(callback: CallbackMap["peerLeft"]): () => void { return this.addCallback("peerLeft", callback); }
@@ -124,7 +135,6 @@ export class SupabaseSignalingProvider implements SignalingProvider {
   onAnswer(callback: CallbackMap["answer"]): () => void { return this.addCallback("answer", callback); }
   onIceCandidate(callback: CallbackMap["ice"]): () => void { return this.addCallback("ice", callback); }
   onPeerState(callback: CallbackMap["peerState"]): () => void { return this.addCallback("peerState", callback); }
-  onPeerProfile(callback: CallbackMap["peerProfile"]): () => void { return this.addCallback("peerProfile", callback); }
   onStatusChange(callback: CallbackMap["status"]): () => void { return this.addCallback("status", callback); }
 
   getDiagnostics(): SignalingDiagnostics {
@@ -141,8 +151,41 @@ export class SupabaseSignalingProvider implements SignalingProvider {
       .on("broadcast", { event: "webrtc.offer" }, ({ payload }) => this.receive("offer", parseOffer(payload)))
       .on("broadcast", { event: "webrtc.answer" }, ({ payload }) => this.receive("answer", parseAnswer(payload)))
       .on("broadcast", { event: "webrtc.ice-candidate" }, ({ payload }) => this.receive("ice", parseIceCandidate(payload)))
-      .on("broadcast", { event: "peer.state" }, ({ payload }) => this.receive("peerState", parsePeerState(payload)))
-      .on("broadcast", { event: "peer.profile" }, ({ payload }) => this.receive("peerProfile", parsePeerProfile(payload)));
+      .on("broadcast", { event: "peer.state" }, ({ payload }) => this.receive("peerState", parsePeerState(payload)));
+  }
+
+  private scheduleReconnect(): void {
+    if (this.disconnecting || this.reconnectTimer || !this.client || !this.channelName || !this.peerId) return;
+    const delay = Math.min(30_000, 1_000 * 2 ** Math.min(this.reconnectAttempts, 5));
+    this.reconnectAttempts += 1;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      void this.reopenChannel();
+    }, delay);
+  }
+
+  private async reopenChannel(): Promise<void> {
+    if (this.disconnecting || !this.client || !this.channelName || !this.peerId) return;
+    const previous = this.channel;
+    if (previous) await this.client.removeChannel(previous).catch(() => undefined);
+    const channel = this.client.channel(this.channelName, { config: { presence: { key: this.peerId }, broadcast: { self: false, ack: true } } });
+    this.channel = channel;
+    this.registerChannelListeners(channel);
+    channel.subscribe(async (status) => {
+      if (channel !== this.channel || this.disconnecting) return;
+      this.channelStatus = status;
+      if (status === "SUBSCRIBED") {
+        try {
+          await channel.track({ peerId: this.peerId!, joinedAt: Date.now(), clientVersion: CLIENT_VERSION });
+          this.reconnectAttempts = 0;
+          this.reconcilePresence();
+          this.setStatus("connected");
+        } catch { this.scheduleReconnect(); }
+      } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+        this.setStatus("reconnecting");
+        this.scheduleReconnect();
+      }
+    });
   }
 
   private reconcilePresence(): void {
@@ -164,13 +207,13 @@ export class SupabaseSignalingProvider implements SignalingProvider {
     }
   }
 
-  private receive<Key extends "offer" | "answer" | "ice" | "peerState" | "peerProfile">(key: Key, message: Parameters<CallbackMap[Key]>[0] | null): void {
+  private receive<Key extends "offer" | "answer" | "ice" | "peerState">(key: Key, message: Parameters<CallbackMap[Key]>[0] | null): void {
     if (!message || !this.acceptMessage(message)) return;
     this.log(`${key} received`, message.fromPeerId);
     this.emit(key, message);
   }
 
-  private acceptMessage(message: OfferMessage | AnswerMessage | IceCandidateMessage | PeerStateMessage | PeerProfileMessage): boolean {
+  private acceptMessage(message: OfferMessage | AnswerMessage | IceCandidateMessage | PeerStateMessage): boolean {
     if (!this.peerId || !this.roomId || message.roomId !== this.roomId || message.fromPeerId === this.peerId) return false;
     if (message.targetPeerId !== undefined && message.targetPeerId !== this.peerId) return false;
 

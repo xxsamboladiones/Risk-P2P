@@ -1,4 +1,5 @@
 import type { LocalIdentity, PublicGroupMetadata, PublicPeerIdentity } from "../offline/social-storage";
+import { validAvatarDataUrl } from "../offline/profile";
 
 export type InviteProtocolType = "friend.request" | "friend.accept" | "friend.reject" | "group.join.request" | "group.join.accept" | "group.join.reject" | "invite.ack" | "invite.busy";
 export type SignedInviteMessage = {
@@ -47,15 +48,16 @@ function isMessage(value: unknown): value is SignedInviteMessage {
   return item.version === 1 && types.includes(type) && validId(item.requestId) &&
     typeof item.timestamp === "number" && Number.isFinite(item.timestamp) && typeof item.signature === "string" && item.signature.length < 512 &&
     Boolean(identity && validId(identity.peerId) && typeof identity.displayName === "string" && identity.displayName.length >= 1 && identity.displayName.length <= 80 &&
-      identity.publicKey && typeof identity.publicKey === "object") &&
+      identity.publicKey && typeof identity.publicKey === "object" &&
+      (identity.avatar === undefined || validAvatarDataUrl(identity.avatar))) &&
     (item.reason === undefined || (typeof item.reason === "string" && item.reason.length <= 200)) &&
-    (type !== "group.join.accept" || isGroup(item.group));
+    (type !== "group.join.accept" || (isGroup(item.group) && (item.group as PublicGroupMetadata).ownerPeerId === identity?.peerId));
 }
 
 function isGroup(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   const group = value as Record<string, unknown>;
-  if (!validId(group.groupId) || typeof group.name !== "string" || group.name.length < 1 || group.name.length > 80 || !Array.isArray(group.channels) || group.channels.length > 100) return false;
+  if (!validId(group.groupId) || !validId(group.ownerPeerId) || !Number.isSafeInteger(group.membershipVersion) || Number(group.membershipVersion) < 1 || typeof group.name !== "string" || group.name.length < 1 || group.name.length > 80 || !Array.isArray(group.channels) || group.channels.length > 100) return false;
   return group.channels.every((value) => {
     if (!value || typeof value !== "object") return false;
     const channel = value as Record<string, unknown>;

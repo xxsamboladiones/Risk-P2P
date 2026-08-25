@@ -209,11 +209,12 @@ function SocialHome() {
   useEffect(() => {
     if (!currentUser) return;
     let alive = true;
+    const reservedChannelIds = roomId && callContext?.textChannelId ? [callContext.textChannelId] : [];
     void Promise.all([loadLocalGroups(), api.turnCredentials(token)])
-      .then(([groups, { iceServers }]) => { if (alive) return backgroundChats.sync(groups, currentUser.displayName, iceServers, activeChannel?.id); })
+      .then(([groups, { iceServers }]) => { if (alive) return backgroundChats.sync(groups, currentUser.displayName, iceServers, activeChannel?.id, reservedChannelIds); })
       .catch(() => undefined);
     return () => { alive = false; };
-  }, [activeChannel?.id, currentUser, communities, token]);
+  }, [activeChannel?.id, callContext?.textChannelId, currentUser, communities, roomId, token]);
 
   async function loadSocial() {
     const [social, groups, localFriends, localGroups] = await Promise.all([
@@ -388,6 +389,13 @@ function SocialHome() {
           }
         : {});
       const textChannel = availableChannels.find((item) => item.kind === "text") ?? null;
+      if (textChannel) {
+        await backgroundChats.release(textChannel.id);
+        if (!activeFriend && activeChannel?.id === textChannel.id) {
+          await chat.disconnect().catch(() => undefined);
+          setChatStatus("disconnected");
+        }
+      }
       setCallContext({
         groupId: community?.id ?? "",
         groupName: community?.name ?? "Grupo",
@@ -425,6 +433,9 @@ function SocialHome() {
         return;
       }
       if (!activeChannel || activeChannel.kind !== "text") return;
+      if (roomId && callContext?.textChannelId === activeChannel.id) {
+        throw new Error("Este canal já pertence ao chat automático da chamada enquanto você estiver na sala de voz.");
+      }
       const [identity, groups] = await Promise.all([
         getOrCreateLocalIdentity(currentUser.displayName),
         loadLocalGroups(),
@@ -582,7 +593,7 @@ function SocialHome() {
     try {
       if (roomId) await call.leave(roomId);
       await voiceActivities.disconnect();
-      await Promise.all([chat.disconnect(), callChat.disconnect()]);
+      await Promise.all([chat.disconnect(), callChat.disconnect(), backgroundChats.disconnect()]);
       await api.logout();
     }
     catch { /* logout local continua mesmo se a API estiver indisponível */ }

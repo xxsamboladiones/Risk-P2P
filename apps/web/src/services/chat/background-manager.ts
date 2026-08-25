@@ -19,9 +19,24 @@ export class BackgroundChatManager {
     this.listener?.(new Map(this.unread));
   }
 
-  async sync(groups: LocalGroup[], displayName: string, iceServers: RTCIceServer[], activeChannelId?: string): Promise<void> {
+  async release(channelId: string): Promise<void> {
+    const controller = this.sessions.get(channelId);
+    if (!controller) return;
+    this.sessions.delete(channelId);
+    await controller.disconnect();
+  }
+
+  async sync(
+    groups: LocalGroup[],
+    displayName: string,
+    iceServers: RTCIceServer[],
+    activeChannelId?: string,
+    reservedChannelIds: readonly string[] = [],
+  ): Promise<void> {
+    const excluded = new Set<string>(reservedChannelIds);
+    if (activeChannelId) excluded.add(activeChannelId);
     const desired = groups.flatMap((group) => group.channels.filter((channel) => channel.kind === "text").map((channel) => channel.id))
-      .filter((channelId) => channelId !== activeChannelId)
+      .filter((channelId) => !excluded.has(channelId))
       .slice(0, MAX_BACKGROUND_CHANNELS);
     await Promise.all([...this.sessions].filter(([channelId]) => !desired.includes(channelId)).map(async ([channelId, controller]) => {
       this.sessions.delete(channelId);

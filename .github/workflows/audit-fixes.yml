@@ -32,6 +32,19 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Apply audit fixes
         run: python3 scripts/apply-audit-fixes.py
+      - name: Complete attachment storage test mock
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('apps/web/src/services/attachments/attachment-service.test.ts')
+          text = path.read_text(encoding='utf-8')
+          old = '      finalize: async () => ({ contentHash: attachmentId }),\n'
+          new = old + '      discard: async () => undefined,\n'
+          if new not in text:
+              if old not in text:
+                  raise SystemExit('attachment storage mock marker not found')
+              path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
       - name: Format Rust
         run: cargo fmt --manifest-path desktop-backend/Cargo.toml
       - name: Validate diff

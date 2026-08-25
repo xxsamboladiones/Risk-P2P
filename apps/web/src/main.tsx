@@ -271,7 +271,7 @@ function SocialHome() {
       .then((channelId) => { if (alive) setPrivateChannelId(channelId); })
       .catch((cause) => { if (alive) setError(cause instanceof Error ? cause.message : "Falha ao preparar conversa privada"); });
     return () => { alive = false; };
-  }, [activeFriend, currentUser]);
+  }, [activeFriend?.id, activeFriend?.local, currentUser?.displayName]);
 
   useEffect(() => {
     let alive = true;
@@ -314,8 +314,9 @@ function SocialHome() {
     return () => { alive = false; };
   }, [selectedCommunity, token]);
 
+  const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
+
   useEffect(() => {
-    const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
     if (!conversationId) { setMessages([]); setHasOlderMessages(false); setAttachments([]); setAttachmentProgress({}); return; }
     let alive = true;
     const offMessage = chat.onMessage((message) => {
@@ -357,7 +358,7 @@ function SocialHome() {
       setChatStatus("disconnected");
       setAttachmentProgress({});
     };
-  }, [activeChannel, activeFriend, privateChannelId]);
+  }, [conversationId]);
 
   useEffect(() => setMessageSearch(""), [activeChannel?.id, activeFriend?.id]);
 
@@ -459,7 +460,6 @@ function SocialHome() {
   async function submitMessage(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!activeFriend && !activeChannel) return;
-    const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
     if (!conversationId || !currentUser) return;
     const input = event.currentTarget.elements.namedItem("message") as HTMLInputElement;
     const content = input.value.trim();
@@ -473,7 +473,6 @@ function SocialHome() {
   }
 
   async function loadOlderMessages(): Promise<void> {
-    const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
     const before = messages[0]?.createdAt;
     if (!conversationId || !before || loadingOlderMessages) return;
     setLoadingOlderMessages(true);
@@ -827,7 +826,11 @@ function upsertAttachment(current: ChatAttachmentRecord[], record: ChatAttachmen
   const index = current.findIndex((item) => item.attachmentId === record.attachmentId);
   if (index < 0) return [...current, record].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   const existing = current[index]!;
-  const replacement = attachmentStateWeight(record.state) >= attachmentStateWeight(existing.state) ? record : existing;
+  const preferred = attachmentStateWeight(record.state) >= attachmentStateWeight(existing.state) ? record : existing;
+  const replacement: ChatAttachmentRecord = {
+    ...preferred,
+    sourcePersisted: preferred.sourcePersisted === true || existing.sourcePersisted === true || record.sourcePersisted === true,
+  };
   const next = [...current];
   next[index] = replacement;
   return next.sort((left, right) => left.createdAt.localeCompare(right.createdAt));

@@ -142,7 +142,7 @@ export function inferAttachmentMimeType(mimeType: string, filename = ""): string
   const normalized = mimeType.trim().toLowerCase();
   if (normalized && normalized !== "application/octet-stream") return normalized;
   const extension = filename.toLowerCase().split(".").pop() ?? "";
-  return MIME_BY_EXTENSION[extension] ?? normalized || "application/octet-stream";
+  return MIME_BY_EXTENSION[extension] ?? (normalized || "application/octet-stream");
 }
 
 export function classifyAttachment(mimeType: string, filename = ""): AttachmentKind {

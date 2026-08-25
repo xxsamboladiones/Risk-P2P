@@ -3,8 +3,10 @@ import { IndexedDbAttachmentStorage, type StoredAttachmentRecord } from "./index
 
 export type DesktopAttachmentBackendConfig = { baseUrl: string; token: string };
 
+type DesktopAttachmentBackendResolver = () => Promise<DesktopAttachmentBackendConfig>;
+
 export class DesktopAttachmentStorage extends IndexedDbAttachmentStorage {
-  constructor(private readonly config: DesktopAttachmentBackendConfig) { super(); }
+  constructor(private readonly resolveConfig: DesktopAttachmentBackendResolver) { super(); }
 
   override async prepare(transferId: string, manifest: AttachmentManifest): Promise<void> {
     await super.prepare(transferId, manifest);
@@ -65,7 +67,9 @@ export class DesktopAttachmentStorage extends IndexedDbAttachmentStorage {
     if (typeof result.contentHash !== "string" || result.contentHash.toLowerCase() !== manifest.contentHash.toLowerCase()) {
       throw new Error("Cópia persistente do anexo falhou na verificação SHA-256.");
     }
-    return record;
+    const persisted = { ...record, sourcePersisted: true, updatedAt: new Date().toISOString() };
+    await this.saveRecord(persisted);
+    return persisted;
   }
 
   override async getBlob(attachmentId: string, manifest?: AttachmentManifest): Promise<Blob> {
@@ -92,9 +96,11 @@ export class DesktopAttachmentStorage extends IndexedDbAttachmentStorage {
   }
 
   private async request(path: string, init: RequestInit = {}): Promise<Response> {
+    const config = await this.resolveConfig();
     const headers = new Headers(init.headers);
-    headers.set("x-risk-desktop-token", this.config.token);
-    const response = await fetch(`${this.config.baseUrl}${path}`, { ...init, headers });
+    headers.set("x-risk-desktop-token", config.token);
+    const baseUrl = config.baseUrl.replace(/\/$/, "");
+    const response = await fetch(`${baseUrl}${path}`, { ...init, headers });
     if (!response.ok) {
       let message = `Backend local retornou HTTP ${response.status}.`;
       try {
@@ -105,15 +111,15 @@ export class DesktopAttachmentStorage extends IndexedDbAttachmentStorage {
     }
     return response;
   }
+
 }
 
 export async function createAttachmentStorage(): Promise<IndexedDbAttachmentStorage> {
   const bridge = window.desktop;
   if (!bridge?.getBackendConfig) return new IndexedDbAttachmentStorage();
-  try {
-    return new DesktopAttachmentStorage(await bridge.getBackendConfig());
-  } catch (error) {
-    console.warn("Backend Rust de anexos indisponível; usando IndexedDB.", error);
-    return new IndexedDbAttachmentStorage();
-  }
+  return new DesktopAttachmentStorage(async () => {
+    const config = await bridge.getBackendConfig();
+    return { baseUrl: config.baseUrl.replace(/\/$/, ""), token: config.token };
+  });
+
 }

@@ -29,6 +29,7 @@ use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLaye
 use uuid::Uuid;
 
 pub(crate) const MAX_ATTACHMENT_CHUNK_BYTES: usize = 256 * 1024;
+const MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 const LOCAL_TOKEN_HEADER: &str = "x-risk-desktop-token";
 const ACCESS_TOKEN_TTL_SECONDS: i64 = 12 * 60 * 60;
@@ -192,10 +193,10 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .merge(protected)
-        // O endpoint binário de anexos aceita chunks de até 256 KiB. O limite
-        // global precisa permitir o mesmo tamanho; os handlers JSON continuam
-        // aplicando suas próprias validações de campos e comprimentos.
-        .layer(RequestBodyLimitLayer::new(MAX_ATTACHMENT_CHUNK_BYTES))
+        // O limite HTTP global também precisa comportar o snapshot JSON completo
+        // de grupos. Chunks de anexos continuam limitados a 256 KiB dentro do
+        // próprio handler `write_chunk`, antes de serem gravados em disco.
+        .layer(RequestBodyLimitLayer::new(MAX_HTTP_BODY_BYTES))
         .layer(
             CorsLayer::new()
                 .allow_origin(web_origin.parse::<HeaderValue>()?)

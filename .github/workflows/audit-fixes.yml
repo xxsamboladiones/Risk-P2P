@@ -1,0 +1,10 @@
+name: Audit fixes (retired)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  retired:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Temporary audit workflow retired."

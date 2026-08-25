@@ -17,7 +17,6 @@ export type DesktopBackendStatus = {
   message: string;
 };
 
-const FULLSCREEN_STYLE_ID = "risk-native-stream-fullscreen-style";
 const MIN_FULLSCREEN_ZOOM = 0.5;
 const MAX_FULLSCREEN_ZOOM = 5;
 const FULLSCREEN_ZOOM_FACTOR = 1.12;
@@ -29,147 +28,6 @@ let swallowFullscreenClickUntil = 0;
 let fullscreenTransition: Promise<void> = Promise.resolve();
 let htmlFullscreenFallback = false;
 
-function installNativeStreamFullscreenStyle(): void {
-  if (document.getElementById(FULLSCREEN_STYLE_ID)) return;
-  const style = document.createElement("style");
-  style.id = FULLSCREEN_STYLE_ID;
-  style.textContent = `
-html.risk-native-stream-fullscreen,
-body.risk-native-stream-fullscreen {
-  position: fixed !important;
-  inset: 0 !important;
-  width: 100vw !important;
-  height: 100vh !important;
-  margin: 0 !important;
-  padding: 0 !important;
-  overflow: hidden !important;
-  overscroll-behavior: none !important;
-  scrollbar-width: none !important;
-  background: #000 !important;
-}
-html.risk-native-stream-fullscreen::-webkit-scrollbar,
-body.risk-native-stream-fullscreen::-webkit-scrollbar,
-html.risk-native-stream-fullscreen #root::-webkit-scrollbar,
-.call-workspace[data-risk-native-fullscreen-active="true"]::-webkit-scrollbar,
-.call-workspace[data-risk-native-fullscreen-active="true"] *::-webkit-scrollbar {
-  width: 0 !important;
-  height: 0 !important;
-  display: none !important;
-}
-html.risk-native-stream-fullscreen #root {
-  position: fixed !important;
-  inset: 0 !important;
-  width: 100vw !important;
-  height: 100vh !important;
-  overflow: hidden !important;
-  scrollbar-width: none !important;
-  background: #000 !important;
-}
-.call-workspace[data-risk-native-fullscreen-active="true"] {
-  position: fixed !important;
-  inset: 0 !important;
-  z-index: 2147483000 !important;
-  width: 100vw !important;
-  height: 100vh !important;
-  min-width: 0 !important;
-  min-height: 0 !important;
-  margin: 0 !important;
-  padding: 0 !important;
-  overflow: hidden !important;
-  scrollbar-width: none !important;
-  background: #000 !important;
-}
-.call-workspace[data-risk-native-fullscreen-active="true"] > header,
-.call-workspace[data-risk-native-fullscreen-active="true"] > footer,
-.call-workspace[data-risk-native-fullscreen-active="true"] > .call-chat-view,
-.call-workspace[data-risk-native-fullscreen-active="true"] > .global-error {
-  display: none !important;
-}
-.call-workspace[data-risk-native-fullscreen-active="true"] > .call-view {
-  display: block !important;
-  position: fixed !important;
-  inset: 0 !important;
-  width: 100vw !important;
-  height: 100vh !important;
-  min-width: 0 !important;
-  min-height: 0 !important;
-  overflow: hidden !important;
-  background: #000 !important;
-}
-.call-workspace[data-risk-native-fullscreen-active="true"] > .call-view > .stage {
-  display: block !important;
-  position: fixed !important;
-  inset: 0 !important;
-  width: 100vw !important;
-  height: 100vh !important;
-  min-width: 0 !important;
-  min-height: 0 !important;
-  margin: 0 !important;
-  padding: 0 !important;
-  overflow: hidden !important;
-  background: #000 !important;
-}
-.call-workspace[data-risk-native-fullscreen-active="true"] .stage > * {
-  display: none !important;
-}
-.call-workspace[data-risk-native-fullscreen-active="true"] .stage > [data-risk-native-fullscreen="true"] {
-  display: block !important;
-  position: fixed !important;
-  inset: 0 !important;
-  z-index: 2147483001 !important;
-  width: 100vw !important;
-  height: 100vh !important;
-  min-width: 0 !important;
-  min-height: 0 !important;
-  max-width: none !important;
-  max-height: none !important;
-  margin: 0 !important;
-  padding: 0 !important;
-  border: 0 !important;
-  border-radius: 0 !important;
-  overflow: hidden !important;
-  scrollbar-width: none !important;
-  background: #000 !important;
-  grid-column: auto !important;
-  grid-row: auto !important;
-}
-.call-workspace[data-risk-native-fullscreen-active="true"] [data-risk-native-fullscreen="true"] video {
-  position: fixed !important;
-  inset: 0 !important;
-  width: 100vw !important;
-  height: 100vh !important;
-  min-width: 100vw !important;
-  min-height: 100vh !important;
-  max-width: none !important;
-  max-height: none !important;
-  object-fit: contain !important;
-  background: #000 !important;
-  transform: scale(var(--risk-fullscreen-zoom, 1)) !important;
-  transform-origin: var(--risk-fullscreen-origin-x, 50%) var(--risk-fullscreen-origin-y, 50%) !important;
-  transition: transform 70ms ease-out !important;
-  will-change: transform;
-}
-.call-workspace[data-risk-native-fullscreen-active="true"] [data-risk-native-fullscreen="true"] .tile-label,
-.call-workspace[data-risk-native-fullscreen-active="true"] [data-risk-native-fullscreen="true"] .source-switch,
-.call-workspace[data-risk-native-fullscreen-active="true"] [data-risk-native-fullscreen="true"] .volume-panel {
-  display: none !important;
-}
-.call-workspace[data-risk-native-fullscreen-active="true"] [data-risk-native-fullscreen="true"] .tile-fullscreen {
-  position: fixed !important;
-  top: 16px !important;
-  right: 16px !important;
-  bottom: auto !important;
-  left: auto !important;
-  z-index: 2147483002 !important;
-  opacity: 0 !important;
-  transition: opacity .15s ease !important;
-}
-.call-workspace[data-risk-native-fullscreen-active="true"] [data-risk-native-fullscreen="true"]:hover .tile-fullscreen {
-  opacity: .9 !important;
-}
-`;
-  document.head.appendChild(style);
-}
 
 function closestFromEventTarget(target: EventTarget | null, selector: string): HTMLElement | null {
   if (!target) return null;
@@ -291,8 +149,6 @@ function suppressEvent(event: Event): void {
 }
 
 function installNativeStreamFullscreenController(): void {
-  installNativeStreamFullscreenStyle();
-
   // Começa no pointerdown e engole o click posterior. Assim o requestFullscreen()
   // legado do React nunca concorre com o fullscreen nativo da BrowserWindow.
   // A busca por closest() é deliberadamente duck-typed: o preload roda em um

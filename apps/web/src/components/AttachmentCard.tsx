@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { classifyAttachment, inferAttachmentMimeType } from "@risk/protocol/attachments";
 import {
   Archive,
   Download,
@@ -30,49 +31,63 @@ export type AttachmentCardProps = {
 export function AttachmentCard(props: AttachmentCardProps) {
   const { record, progress, connected } = props;
   const { manifest } = record;
-  const canPreview = record.state === "completed" || record.direction === "outgoing";
+  const resolvedKind = classifyAttachment(manifest.mimeType, manifest.filename);
+  const previewMimeType = inferAttachmentMimeType(manifest.mimeType, manifest.filename);
+  const locallyAvailable = record.direction === "outgoing" ? record.sourcePersisted === true : record.state === "completed";
+  const canPreview = locallyAvailable && ["image", "video", "audio"].includes(resolvedKind);
   const [previewUrl, setPreviewUrl] = useState<string>();
   const [previewError, setPreviewError] = useState("");
 
   useEffect(() => {
     let active = true;
     let objectUrl: string | undefined;
-    if (!canPreview || !["image", "video", "audio"].includes(manifest.kind)) {
+    setPreviewError("");
+    if (!canPreview) {
       setPreviewUrl(undefined);
       return () => undefined;
     }
     void props.loadBlob(record)
       .then((blob) => {
         if (!active) return;
-        objectUrl = URL.createObjectURL(blob);
+        const previewBlob = blob.type === previewMimeType ? blob : blob.slice(0, blob.size, previewMimeType);
+        objectUrl = URL.createObjectURL(previewBlob);
         setPreviewUrl(objectUrl);
-        setPreviewError("");
       })
-      .catch((error) => { if (active) setPreviewError(error instanceof Error ? error.message : "Preview indisponível"); });
+      .catch((error) => {
+        if (!active) return;
+        setPreviewUrl(undefined);
+        setPreviewError(error instanceof Error ? error.message : "Preview indisponível");
+      });
     return () => {
       active = false;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [record.attachmentId, record.state, record.direction, canPreview]);
+  }, [record.attachmentId, record.state, record.direction, record.sourcePersisted, canPreview, previewMimeType]);
+
+  const previewFailed = () => {
+    setPreviewError(resolvedKind === "image"
+      ? "Não foi possível decodificar a pré-visualização desta imagem."
+      : "Não foi possível reproduzir a pré-visualização deste arquivo.");
+  };
 
   const percent = progress?.progressPercent ?? (record.totalBytes > 0 ? (record.bytesTransferred / record.totalBytes) * 100 : 0);
   const speed = progress?.speedBytesPerSecond ?? 0;
   const eta = progress?.etaSeconds;
   const activeTransfer = ["accepted", "queued", "transferring", "verifying"].includes(record.state);
-  const downloadable = record.state === "completed" || record.direction === "outgoing";
+  const downloadable = locallyAvailable;
 
-  return <article className={`attachment-card kind-${manifest.kind} state-${record.state}`}>
-    {manifest.kind === "image" && previewUrl && <img className="attachment-image" src={previewUrl} alt={manifest.filename}/>} 
-    {manifest.kind === "video" && previewUrl && <video className="attachment-media" src={previewUrl} controls preload="metadata"/>}
-    {manifest.kind === "audio" && previewUrl && <audio className="attachment-audio" src={previewUrl} controls preload="metadata"/>}
+  return <div className={`attachment-card kind-${resolvedKind} state-${record.state}`}>
+    {resolvedKind === "image" && previewUrl && !previewError && <img className="attachment-image" src={previewUrl} alt={manifest.filename} onLoad={() => setPreviewError("")} onError={previewFailed}/>} 
+    {resolvedKind === "video" && previewUrl && !previewError && <video className="attachment-media" src={previewUrl} controls preload="metadata" onLoadedMetadata={() => setPreviewError("")} onError={previewFailed}/>} 
+    {resolvedKind === "audio" && previewUrl && !previewError && <audio className="attachment-audio" src={previewUrl} controls preload="metadata" onLoadedMetadata={() => setPreviewError("")} onError={previewFailed}/>} 
     {previewError && <small className="attachment-preview-error">{previewError}</small>}
 
     <div className="attachment-info">
-      <div className="attachment-kind">{kindIcon(manifest.kind)}</div>
+      <div className="attachment-kind">{kindIcon(resolvedKind)}</div>
       <div className="attachment-copy">
         <strong title={manifest.filename}>{manifest.filename}</strong>
-        <span>{formatBytes(manifest.size)} · {kindLabel(manifest.kind)}</span>
-        {manifest.kind === "executable" && <em className="attachment-warning"><FileWarning size={14}/> Executável recebido. O Risk nunca abre este arquivo automaticamente.</em>}
+        <span>{formatBytes(manifest.size)} · {kindLabel(resolvedKind)}</span>
+        {resolvedKind === "executable" && <em className="attachment-warning"><FileWarning size={14}/> Executável recebido. O Risk nunca abre este arquivo automaticamente.</em>}
       </div>
     </div>
 
@@ -91,7 +106,7 @@ export function AttachmentCard(props: AttachmentCardProps) {
       {activeTransfer && <button className="danger" onClick={() => void props.onCancel(record)}><X size={15}/> Cancelar</button>}
       {downloadable && <button onClick={() => void props.onDownload(record)}><Download size={15}/> Salvar arquivo</button>}
     </div>
-  </article>;
+  </div>;
 }
 
 function kindIcon(kind: ChatAttachmentRecord["manifest"]["kind"]) {

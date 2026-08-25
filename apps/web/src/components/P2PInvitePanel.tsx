@@ -42,6 +42,12 @@ export function P2PInvitePanel({ type, token, displayName, group, initialMode = 
       window.clearInterval(timer);
       const current = service.current;
       service.current = undefined;
+      // Depois de accepted/rejected o InviteService ainda mantém o DataChannel
+      // vivo por alguns instantes para garantir a entrega do invite.ack. Entrar
+      // no grupo desmonta este painel imediatamente; não podemos cancelar essa
+      // finalização ou o criador interpreta o fechamento como desconexão.
+      const finalStatus = current?.state?.status;
+      if (finalStatus === "accepted" || finalStatus === "rejected") return;
       void current?.cancel(false);
     };
   }, []);
@@ -51,6 +57,10 @@ export function P2PInvitePanel({ type, token, displayName, group, initialMode = 
     const key = `${state.type}:${state.code}`;
     if (completedInvite.current === key) return;
     completedInvite.current = key;
+    // O InviteService persiste o novo vínculo antes de publicar o estado
+    // `accepted`. Notificamos o restante da aplicação somente depois disso para
+    // que sidebar, chat e chamada recarreguem imediatamente a nova membership.
+    window.dispatchEvent(new Event("risk:social-updated"));
     onComplete?.();
   }, [state?.code, state?.status, state?.type, onComplete]);
 

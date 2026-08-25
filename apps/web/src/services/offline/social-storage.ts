@@ -116,6 +116,7 @@ export function resetSocialStorageRuntime(): void {
 const DEV_BACKEND_PROXY = "/__risk-api";
 const MAX_GROUP_MEMBERS = 48;
 const MAX_GROUP_REVOCATIONS = 48;
+const MAX_GROUP_SYNC_WIRE_BYTES = 60 * 1024;
 
 export async function loadLocalIdentity(): Promise<LocalIdentity | null> {
   const database = await openRiskDatabase();
@@ -199,7 +200,43 @@ export async function loadLocalGroups(): Promise<LocalGroup[]> {
     desktopRequest(config, "/p2p/groups", { method: "POST", body: JSON.stringify(group) }).then(() => undefined));
 }
 
+export function assertLocalGroupSyncBudget(group: LocalGroup): void {
+  const members = (group.members ?? []).map(({ avatar: _avatar, ...member }) => member);
+  const removedMembers = (group.removedMembers ?? []).map(({ avatar: _avatar, ...member }) => member);
+  const projection = {
+    version: 2,
+    type: "chat.members.snapshot",
+    channelId: "00000000-0000-4000-8000-000000000000",
+    groupId: group.groupId,
+    senderPeerId: group.manifestActorPeerId ?? group.ownerPeerId,
+    ownerPeerId: group.ownerPeerId,
+    membershipVersion: group.membershipVersion,
+    manifestVersion: group.manifestVersion,
+    manifestActorPeerId: group.manifestActorPeerId ?? group.ownerPeerId,
+    manifestOperationId: group.manifestOperationId ?? `legacy-${group.manifestVersion}`,
+    administratorEpoch: group.administratorEpoch ?? 1,
+    administratorGrants: group.administratorGrants ?? [],
+    name: group.name,
+    avatar: group.avatar,
+    channels: group.channels,
+    administratorPeerIds: group.administratorPeerIds ?? [],
+    removedPeerIds: group.removedPeerIds ?? [],
+    removedMembers,
+    revocations: group.revocations ?? [],
+    rendezvousVersion: group.rendezvousVersion ?? 1,
+    rendezvousSecret: group.rendezvousSecret ?? group.groupId,
+    members,
+    timestamp: Date.now(),
+    signature: "A".repeat(86),
+  };
+  const bytes = new TextEncoder().encode(JSON.stringify(projection)).byteLength;
+  if (bytes > MAX_GROUP_SYNC_WIRE_BYTES) {
+    throw new Error("Este grupo excedeu o orçamento seguro de sincronização P2P. Reduza a imagem do grupo, a quantidade de canais ou identidades/revogações antigas antes de continuar.");
+  }
+}
+
 export async function saveLocalGroup(group: LocalGroup): Promise<void> {
+  assertLocalGroupSyncBudget(group);
   const config = await desktopConfig();
   if (!config) {
     await putInStore(OFFLINE_STORES.groups, group);

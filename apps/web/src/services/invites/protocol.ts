@@ -7,14 +7,28 @@ export type SignedInviteMessage = {
   identity: PublicPeerIdentity; group?: PublicGroupMetadata; reason?: string; signature: string;
 };
 
-const MAX_MESSAGE_BYTES = 48 * 1024;
+// O DataChannel de controle do MeshWebRTCTransport aceita até 64 KiB. O parser
+// precisa aceitar exatamente a mesma faixa para nunca descartar silenciosamente
+// uma mensagem que o transporte acabou de entregar com sucesso.
+export const MAX_INVITE_MESSAGE_BYTES = 64 * 1024;
 const MAX_CLOCK_SKEW_MS = 2 * 60_000;
 
 export async function createSignedInviteMessage(
   identity: LocalIdentity,
   message: Omit<SignedInviteMessage, "version" | "identity" | "signature">,
 ): Promise<SignedInviteMessage> {
-  const unsigned = { version: 1 as const, ...message, identity: publicIdentity(identity) };
+  const groupAccept = message.type === "group.join.accept" && message.group;
+  const normalizedMessage = groupAccept
+    ? { ...message, group: compactGroupInviteMetadata(message.group!) }
+    : message;
+  // No aceite de grupo, os avatares dos peers são dados redundantes: o avatar do
+  // grupo continua no manifesto e os perfis são reconciliados depois pelo canal
+  // P2P. Removê-los evita que dois avatares de 32 KiB estourem o frame de controle.
+  const unsigned = {
+    version: 1 as const,
+    ...normalizedMessage,
+    identity: publicIdentity(identity, !groupAccept),
+  };
   const signature = await crypto.subtle.sign(
     { name: "ECDSA", hash: "SHA-256" }, identity.privateKey, new TextEncoder().encode(canonical(unsigned)),
   );
@@ -22,7 +36,7 @@ export async function createSignedInviteMessage(
 }
 
 export async function parseAndVerifyInviteMessage(raw: string, now = Date.now()): Promise<SignedInviteMessage | null> {
-  if (new TextEncoder().encode(raw).byteLength > MAX_MESSAGE_BYTES) return null;
+  if (new TextEncoder().encode(raw).byteLength > MAX_INVITE_MESSAGE_BYTES) return null;
   let value: unknown;
   try { value = JSON.parse(raw); } catch { return null; }
   if (!isMessage(value) || Math.abs(now - value.timestamp) > MAX_CLOCK_SKEW_MS) return null;
@@ -47,8 +61,26 @@ export async function parseAndVerifyInviteMessage(raw: string, now = Date.now())
   } catch { return null; }
 }
 
-function publicIdentity(identity: LocalIdentity): PublicPeerIdentity {
-  return { peerId: identity.peerId, publicKey: identity.publicKey, displayName: identity.displayName, avatar: identity.avatar };
+function compactGroupInviteMetadata(group: PublicGroupMetadata): PublicGroupMetadata {
+  return {
+    ...group,
+    // Avatares antigos ou fora do formato atual não podem invalidar todo o
+    // handshake. O manifesto chega sem a imagem e ela pode ser reconciliada
+    // posteriormente; avatares válidos do próprio grupo continuam preservados.
+    avatar: group.avatar && validAvatarDataUrl(group.avatar) ? group.avatar : undefined,
+    ownerIdentity: group.ownerIdentity ? withoutAvatar(group.ownerIdentity) : undefined,
+    removedMembers: (group.removedMembers ?? []).map(withoutAvatar),
+  };
+}
+
+function withoutAvatar(identity: PublicPeerIdentity): PublicPeerIdentity {
+  const { avatar: _avatar, ...rest } = identity;
+  return rest;
+}
+
+function publicIdentity(identity: LocalIdentity, includeAvatar = true): PublicPeerIdentity {
+  const base = { peerId: identity.peerId, publicKey: identity.publicKey, displayName: identity.displayName };
+  return includeAvatar && identity.avatar ? { ...base, avatar: identity.avatar } : base;
 }
 
 function isMessage(value: unknown): value is SignedInviteMessage {

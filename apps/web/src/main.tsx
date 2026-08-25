@@ -209,11 +209,12 @@ function SocialHome() {
   useEffect(() => {
     if (!currentUser) return;
     let alive = true;
+    const reservedChannelIds = roomId && callContext?.textChannelId ? [callContext.textChannelId] : [];
     void Promise.all([loadLocalGroups(), api.turnCredentials(token)])
-      .then(([groups, { iceServers }]) => { if (alive) return backgroundChats.sync(groups, currentUser.displayName, iceServers, activeChannel?.id); })
+      .then(([groups, { iceServers }]) => { if (alive) return backgroundChats.sync(groups, currentUser.displayName, iceServers, activeChannel?.id, reservedChannelIds); })
       .catch(() => undefined);
     return () => { alive = false; };
-  }, [activeChannel?.id, currentUser, communities, token]);
+  }, [activeChannel?.id, callContext?.textChannelId, currentUser, communities, roomId, token]);
 
   async function loadSocial() {
     const [social, groups, localFriends, localGroups] = await Promise.all([
@@ -270,7 +271,7 @@ function SocialHome() {
       .then((channelId) => { if (alive) setPrivateChannelId(channelId); })
       .catch((cause) => { if (alive) setError(cause instanceof Error ? cause.message : "Falha ao preparar conversa privada"); });
     return () => { alive = false; };
-  }, [activeFriend, currentUser]);
+  }, [activeFriend?.id, activeFriend?.local, currentUser?.displayName]);
 
   useEffect(() => {
     let alive = true;
@@ -313,32 +314,51 @@ function SocialHome() {
     return () => { alive = false; };
   }, [selectedCommunity, token]);
 
+  const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
+
+  const isPrivateConversation = Boolean(activeFriend);
+  const privateSession = isPrivateConversation && privateChannelId ? backgroundChats.privateSession(privateChannelId) : undefined;
+  const activeConversationChat = isPrivateConversation ? (privateSession?.controller ?? chat) : chat;
+
   useEffect(() => {
-    const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
-    if (!conversationId) { setMessages([]); setHasOlderMessages(false); setAttachments([]); setAttachmentProgress({}); return; }
+    if (!conversationId) {
+      setMessages([]);
+      setHasOlderMessages(false);
+      setAttachments([]);
+      setAttachmentProgress({});
+      setChatStatus("disconnected");
+      return;
+    }
+    const session = isPrivateConversation ? backgroundChats.privateSession(conversationId) : undefined;
+    const controller = isPrivateConversation ? session?.controller : chat;
+    const historyController = controller ?? chat;
+    if (isPrivateConversation) {
+      backgroundChats.clear(conversationId);
+      setChatStatus(session?.status ?? "disconnected");
+    }
     let alive = true;
-    const offMessage = chat.onMessage((message) => {
-      if (!alive) return;
+    const offMessage = controller?.onMessage((message) => {
+      if (!alive || message.channelId !== conversationId) return;
       setMessages((current) => {
         if (current.some((item) => item.id === message.id)) return current;
         return [...current, message].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
       });
     });
-    const offStatus = chat.onStatus((status) => {
+    const offStatus = controller?.onStatus((status) => {
       if (!alive) return;
       setChatStatus(status);
       if (status === "incompatible") setError(incompatiblePeerMessage());
     });
-    const offAttachment = chat.onAttachment((record) => {
+    const offAttachment = controller?.onAttachment((record) => {
       if (!alive || record.channelId !== conversationId) return;
       setAttachments((current) => upsertAttachment(current, record));
     });
-    const offProgress = chat.onAttachmentProgress((progress) => {
+    const offProgress = controller?.onAttachmentProgress((progress) => {
       if (!alive || progress.record.channelId !== conversationId) return;
       setAttachmentProgress((current) => ({ ...current, [progress.record.attachmentId]: progress }));
       setAttachments((current) => upsertAttachment(current, progress.record));
     });
-    void Promise.all([chat.history(conversationId), chat.attachmentHistory(conversationId)])
+    void Promise.all([historyController.history(conversationId), historyController.attachmentHistory(conversationId)])
       .then(([chatItems, attachmentItems]) => {
         if (!alive) return;
         setMessages([...chatItems].sort((a, b) => a.createdAt.localeCompare(b.createdAt)));
@@ -348,15 +368,15 @@ function SocialHome() {
       .catch((cause) => setError(cause instanceof Error ? cause.message : "Falha no histórico local"));
     return () => {
       alive = false;
-      offMessage();
-      offStatus();
-      offAttachment();
-      offProgress();
-      void chat.disconnect();
+      offMessage?.();
+      offStatus?.();
+      offAttachment?.();
+      offProgress?.();
+      if (!isPrivateConversation) void chat.disconnect();
       setChatStatus("disconnected");
       setAttachmentProgress({});
     };
-  }, [activeChannel, activeFriend, privateChannelId]);
+  }, [conversationId, privateSession?.controller, isPrivateConversation]);
 
   useEffect(() => setMessageSearch(""), [activeChannel?.id, activeFriend?.id]);
 
@@ -388,6 +408,13 @@ function SocialHome() {
           }
         : {});
       const textChannel = availableChannels.find((item) => item.kind === "text") ?? null;
+      if (textChannel) {
+        await backgroundChats.release(textChannel.id);
+        if (!activeFriend && activeChannel?.id === textChannel.id) {
+          await chat.disconnect().catch(() => undefined);
+          setChatStatus("disconnected");
+        }
+      }
       setCallContext({
         groupId: community?.id ?? "",
         groupName: community?.name ?? "Grupo",
@@ -416,15 +443,19 @@ function SocialHome() {
         ]);
         const friend = localFriends.find((item) => item.peerId === activeFriend.id);
         if (!friend) throw new Error("Este amigo não possui identidade P2P local.");
-        await chat.connect(privateChannelId, currentUser.displayName, iceServers, {
+        await backgroundChats.connectPrivate(privateChannelId, currentUser.displayName, iceServers, {
           identity,
           trustedPeers: [friend],
           namespace: "friend",
           maxRemotePeers: 1,
         });
+        setChatStatus(backgroundChats.privateSession(privateChannelId)?.status ?? "connected");
         return;
       }
       if (!activeChannel || activeChannel.kind !== "text") return;
+      if (roomId && callContext?.textChannelId === activeChannel.id) {
+        throw new Error("Este canal já pertence ao chat automático da chamada enquanto você estiver na sala de voz.");
+      }
       const [identity, groups] = await Promise.all([
         getOrCreateLocalIdentity(currentUser.displayName),
         loadLocalGroups(),
@@ -445,29 +476,38 @@ function SocialHome() {
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Falha ao conectar o chat"); }
   }
 
+  async function disconnectPrivateChat() {
+    if (!privateChannelId) return;
+    try {
+      await backgroundChats.disconnectPrivate(privateChannelId);
+      setChatStatus("disconnected");
+      setAttachmentProgress({});
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Falha ao desconectar o chat privado");
+    }
+  }
+
   async function submitMessage(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!activeFriend && !activeChannel) return;
-    const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
     if (!conversationId || !currentUser) return;
     const input = event.currentTarget.elements.namedItem("message") as HTMLInputElement;
     const content = input.value.trim();
     if (!content) return;
     try {
       if (chatStatus === "disconnected" || chatStatus === "error" || chatStatus === "incompatible") await chat.queue(conversationId, content, currentUser.displayName);
-      else await chat.send(content);
+      else await activeConversationChat.send(content);
       input.value = "";
     }
     catch (cause) { setError(cause instanceof Error ? cause.message : "Falha ao enviar mensagem"); }
   }
 
   async function loadOlderMessages(): Promise<void> {
-    const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
     const before = messages[0]?.createdAt;
     if (!conversationId || !before || loadingOlderMessages) return;
     setLoadingOlderMessages(true);
     try {
-      const older = await chat.history(conversationId, { before, limit: 100 });
+      const older = await activeConversationChat.history(conversationId, { before, limit: 100 });
       setHasOlderMessages(older.length === 100);
       setMessages((current) => {
         const known = new Set(current.map((message) => message.id));
@@ -481,7 +521,7 @@ function SocialHome() {
 
   async function sendFiles(files: File[]) {
     try {
-      for (const file of files) await chat.sendAttachment(file);
+      for (const file of files) await activeConversationChat.sendAttachment(file);
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Falha ao enviar arquivo"); }
   }
 
@@ -545,10 +585,10 @@ function SocialHome() {
           const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
           throw failure?.reason ?? new Error("Não foi possível desfazer a amizade.");
         }
-        if (activeFriend?.id === target.friend.id) {
-          await chat.disconnect().catch(() => undefined);
-          setActiveFriend(null);
-        }
+        const identity = await getOrCreateLocalIdentity(currentUser?.displayName ?? "Participante");
+        const privateId = await privateConversationId(identity.peerId, target.friend.id);
+        await backgroundChats.disconnectPrivate(privateId).catch(() => undefined);
+        if (activeFriend?.id === target.friend.id) setActiveFriend(null);
       } else {
         const results = await Promise.allSettled([
           deleteLocalGroup(target.group.id),
@@ -582,7 +622,7 @@ function SocialHome() {
     try {
       if (roomId) await call.leave(roomId);
       await voiceActivities.disconnect();
-      await Promise.all([chat.disconnect(), callChat.disconnect()]);
+      await Promise.all([chat.disconnect(), callChat.disconnect(), backgroundChats.disconnect()]);
       await api.logout();
     }
     catch { /* logout local continua mesmo se a API estiver indisponível */ }
@@ -645,12 +685,12 @@ function SocialHome() {
     attachments={attachments}
     progress={attachmentProgress}
     connected={chatStatus === "ready"}
-    loadBlob={(record) => chat.attachmentBlob(record)}
-    onDownload={(record) => attachmentAction((item) => chat.downloadAttachment(item), record)}
-    onRequest={(record) => attachmentAction((item) => chat.requestAttachment(item), record)}
-    onPause={(record) => attachmentAction((item) => chat.pauseAttachment(item), record)}
-    onResume={(record) => attachmentAction((item) => chat.resumeAttachment(item), record)}
-    onCancel={(record) => attachmentAction((item) => chat.cancelAttachment(item), record)}
+    loadBlob={(record) => activeConversationChat.attachmentBlob(record)}
+    onDownload={(record) => attachmentAction((item) => activeConversationChat.downloadAttachment(item), record)}
+    onRequest={(record) => attachmentAction((item) => activeConversationChat.requestAttachment(item), record)}
+    onPause={(record) => attachmentAction((item) => activeConversationChat.pauseAttachment(item), record)}
+    onResume={(record) => attachmentAction((item) => activeConversationChat.resumeAttachment(item), record)}
+    onCancel={(record) => attachmentAction((item) => activeConversationChat.cancelAttachment(item), record)}
   />;
 
   return <>
@@ -714,7 +754,7 @@ function SocialHome() {
       <section className="content-panel">
         {error && <div className="global-error" onClick={() => setError("")}>{error}</div>}
         {activeFriend ? <>
-          <header className="content-header"><MessageCircle/><strong>{activeFriend.displayName}</strong><span>Mensagem direta P2P</span><input className="message-search" value={messageSearch} onChange={(event) => setMessageSearch(event.target.value)} placeholder="Buscar"/><button className={`chat-connect ${chatStatus}`} disabled={!privateChannelId || chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat privado conectado" : chatStatus === "connected" ? "Aguardando amigo…" : chatStatus === "connecting" ? "Conectando…" : chatStatus === "incompatible" ? "Versão incompatível" : "Conectar P2P"}</button></header>
+          <header className="content-header"><MessageCircle/><strong>{activeFriend.displayName}</strong><span>Mensagem direta P2P</span><input className="message-search" value={messageSearch} onChange={(event) => setMessageSearch(event.target.value)} placeholder="Buscar"/><button className={`chat-connect ${chatStatus}`} disabled={!privateChannelId || chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat privado conectado" : chatStatus === "connected" ? "Aguardando amigo…" : chatStatus === "connecting" ? "Conectando…" : chatStatus === "incompatible" ? "Versão incompatível" : "Conectar P2P"}</button>{(chatStatus === "connected" || chatStatus === "ready") && <button className="chat-disconnect" onClick={() => void disconnectPrivateChat()} title="Desconectar somente este chat privado"><PhoneOff size={16}/>Desconectar P2P</button>}</header>
           <div className="messages">
             {hasOlderMessages && <button className="load-older-messages" disabled={loadingOlderMessages} onClick={() => void loadOlderMessages()}>{loadingOlderMessages ? "Carregando…" : "Carregar mensagens anteriores"}</button>}
             {timeline}
@@ -816,7 +856,11 @@ function upsertAttachment(current: ChatAttachmentRecord[], record: ChatAttachmen
   const index = current.findIndex((item) => item.attachmentId === record.attachmentId);
   if (index < 0) return [...current, record].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   const existing = current[index]!;
-  const replacement = attachmentStateWeight(record.state) >= attachmentStateWeight(existing.state) ? record : existing;
+  const preferred = attachmentStateWeight(record.state) >= attachmentStateWeight(existing.state) ? record : existing;
+  const replacement: ChatAttachmentRecord = {
+    ...preferred,
+    sourcePersisted: preferred.sourcePersisted === true || existing.sourcePersisted === true || record.sourcePersisted === true,
+  };
   const next = [...current];
   next[index] = replacement;
   return next.sort((left, right) => left.createdAt.localeCompare(right.createdAt));

@@ -139,7 +139,13 @@ export class AttachmentService extends EventTarget {
           await this.storage.persistOutgoingSource(transferId, this.channelId, peerId, file, manifest);
           persistedSource = true;
         } catch (error) {
-          await this.storage.registerOutgoing(transferId, this.channelId, peerId, manifest);
+          const fallback = await this.storage.registerOutgoing(transferId, this.channelId, peerId, manifest);
+          await this.storage.saveRecord({
+            ...fallback,
+            sourcePersisted: false,
+            lastError: "A transferência foi iniciada, mas a cópia offline local não pôde ser preservada.",
+            updatedAt: new Date().toISOString(),
+          });
           console.warn("Não foi possível manter uma cópia offline completa do anexo enviado.", error);
         }
       } else {
@@ -158,7 +164,7 @@ export class AttachmentService extends EventTarget {
     const capabilities = this.peerCapabilities.get(record.peerId);
     if (!capabilities?.has("file-transfer-v1")) throw new Error("O peer conectado não oferece transferência de arquivos nesta versão.");
     await this.sendControl(record.peerId, { type: "file.request", attachmentId: record.attachmentId });
-    const updated = { ...record, state: "waiting" as const, updatedAt: new Date().toISOString() };
+    const updated = { ...record, state: "waiting" as const, lastError: undefined, updatedAt: new Date().toISOString() };
     await this.storage.saveRecord(updated);
     this.emitRecord(updated);
   }
@@ -200,9 +206,13 @@ export class AttachmentService extends EventTarget {
   }
 
   async download(record: StoredAttachmentRecord): Promise<void> {
-    if (record.state !== "completed" && record.direction !== "outgoing") {
-      await this.requestDownload(record);
-      return;
+    const locallyAvailable = record.direction === "outgoing" ? record.sourcePersisted === true : record.state === "completed";
+    if (!locallyAvailable) {
+      if (record.direction === "incoming") {
+        await this.requestDownload(record);
+        return;
+      }
+      throw new Error("A cópia local deste anexo enviado não está mais disponível. Envie o arquivo novamente.");
     }
     const blob = await this.getBlob(record);
     const url = URL.createObjectURL(blob);
@@ -249,6 +259,11 @@ export class AttachmentService extends EventTarget {
     }
     if (message.type === "file.request") { await this.serveRequestedAttachment(peerId, message.attachmentId); return; }
 
+    if (message.type === "file.error" && message.transferId.startsWith("request:")) {
+      await this.markRequestedAttachmentError(peerId, message.transferId.slice("request:".length), message.message);
+      return;
+    }
+
     const transferId = "transferId" in message ? message.transferId : undefined;
     const outgoing = transferId ? this.outgoing.get(transferId) : undefined;
     if (outgoing) {
@@ -280,16 +295,32 @@ export class AttachmentService extends EventTarget {
       await this.sendControl(peerId, { type: "file.error", transferId: `request:${attachmentId}`, code: "transfer_unavailable", message: "O canal de transferência ainda não está disponível.", retryable: true });
       return;
     }
-    const record = await this.storage.findCompletedByAttachmentId(attachmentId);
+    const record = await this.storage.findAnyByAttachmentId(attachmentId);
     if (!record || record.channelId !== this.channelId) {
       await this.sendControl(peerId, { type: "file.error", transferId: `request:${attachmentId}`, code: "attachment_unavailable", message: "Este peer não possui mais o arquivo solicitado.", retryable: false });
       return;
     }
-    const source = this.sourceByAttachment.get(attachmentId) ?? await this.storage.getBlob(attachmentId, record.manifest);
-    this.sourceByAttachment.set(attachmentId, source as TransferSource);
-    const transferId = await this.sender.offer(peerId, source as TransferSource, record.manifest);
+    let source = this.sourceByAttachment.get(attachmentId);
+    if (!source) {
+      try {
+        source = await this.storage.getBlob(attachmentId, record.manifest) as TransferSource;
+      } catch {
+        await this.sendControl(peerId, { type: "file.error", transferId: `request:${attachmentId}`, code: "attachment_unavailable", message: "Este peer não possui mais uma cópia local íntegra do arquivo solicitado.", retryable: false });
+        return;
+      }
+    }
+    this.sourceByAttachment.set(attachmentId, source);
+    const transferId = await this.sender.offer(peerId, source, record.manifest);
     this.outgoing.set(transferId, { peerId, attachmentId });
     await this.storage.registerOutgoing(transferId, this.channelId, peerId, record.manifest);
+  }
+
+  private async markRequestedAttachmentError(peerId: string, attachmentId: string, message: string): Promise<void> {
+    const record = await this.storage.findAnyByAttachmentId(attachmentId);
+    if (!record || record.channelId !== this.channelId || record.peerId !== peerId || record.state === "completed") return;
+    const updated = { ...record, state: "failed" as const, lastError: message, updatedAt: new Date().toISOString() };
+    await this.storage.saveRecord(updated);
+    this.emitRecord(updated);
   }
 
   private async sendSyncHello(peerId: string): Promise<void> {
@@ -362,7 +393,11 @@ export class AttachmentService extends EventTarget {
 
   private async sendSyncItems(peerId: string, requestId: string, ids: string[]): Promise<void> {
     const records = await this.storage.listChannel(this.channelId);
-    const available = records.filter((record) => ids.includes(record.attachmentId) && (record.direction === "outgoing" || record.state === "completed"));
+    const available = records.filter((record) => ids.includes(record.attachmentId) && (
+      this.sourceByAttachment.has(record.attachmentId)
+      || (record.direction === "incoming" && record.state === "completed")
+      || (record.direction === "outgoing" && record.sourcePersisted === true)
+    ));
     for (let offset = 0; offset < available.length; offset += MAX_SYNC_ITEMS_PER_MESSAGE) {
       await this.sendControl(peerId, {
         version: RISK_SYNC_PROTOCOL_VERSION,
@@ -407,7 +442,10 @@ export class AttachmentService extends EventTarget {
     const records = await this.storage.listChannel(this.channelId);
     const unique = new Map<string, StoredAttachmentRecord>();
     for (const record of records) {
-      if (record.direction !== "outgoing" && record.state !== "completed") continue;
+      const available = this.sourceByAttachment.has(record.attachmentId)
+        || (record.direction === "incoming" && record.state === "completed")
+        || (record.direction === "outgoing" && record.sourcePersisted === true);
+      if (!available) continue;
       if (!unique.has(record.attachmentId)) unique.set(record.attachmentId, record);
     }
     return [...unique.values()].map(descriptorFor).sort((left, right) => left.id.localeCompare(right.id));

@@ -391,6 +391,23 @@ export class CallController {
           this.connectionFailureMessage = undefined;
         }
       },
+      onPeerReset: (remotePeerId) => {
+        this.authenticatedPeers.delete(remotePeerId);
+        this.remoteIdentityPeerIds.delete(remotePeerId);
+        this.pendingPeerStates.delete(remotePeerId);
+        this.authChallenges.delete(remotePeerId);
+        const timer = this.authTimers.get(remotePeerId); if (timer) clearTimeout(timer);
+        this.authTimers.delete(remotePeerId);
+        const store = useCallStore.getState();
+        const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
+        Object.values(participant.streams ?? {}).forEach((stream) => stream.getTracks().forEach((track) => { track.enabled = false; }));
+        // Preserva nome/avatar autenticados na UI durante a recuperação, mas o
+        // transporte bloqueia mídia até uma nova prova ECDSA pelo DataChannel.
+        store.upsert({ ...participant, streams: {}, connection: "connecting" });
+      },
+      onNegotiationError: (remotePeerId, error) => {
+        useCallStore.getState().setError(`Falha ao negociar mídia com ${remotePeerId.slice(0, 8)}: ${error instanceof Error ? error.message : String(error)}`);
+      },
       onDataMessage: (remotePeerId, data) => {
         if (this.mediaAuthenticationRequired) {
           if (this.handleAuthMessage(remotePeerId, data)) return;
@@ -728,41 +745,53 @@ export class CallController {
   }
 
   private async respondAuthChallenge(remotePeerId: string, message: Partial<Extract<CallAuthMessage, { type: "call.auth.challenge" }>>): Promise<void> {
-    if (!this.identity || !this.transport || typeof message.nonce !== "string" || !this.peerId || !this.roomId) return;
-    const publicProfile = publicIdentity(this.identity);
-    const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, this.identity.privateKey, new TextEncoder().encode(this.authCanonical(remotePeerId, message.nonce, publicProfile)));
+    const lifecycle = this.lifecycleId;
+    const identity = this.identity;
+    const transport = this.transport;
+    const localPeerId = this.peerId;
+    const roomId = this.roomId;
+    if (!identity || !transport || typeof message.nonce !== "string" || !localPeerId || !roomId) return;
+    const publicProfile = publicIdentity(identity);
+    const canonical = this.authCanonical(remotePeerId, message.nonce, publicProfile);
+    const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, identity.privateKey, new TextEncoder().encode(canonical));
+    if (!this.isActive(lifecycle) || this.transport !== transport || this.identity !== identity || this.peerId !== localPeerId || this.roomId !== roomId) return;
     const proof: CallAuthMessage = { version: 1, type: "call.auth.proof", identity: publicProfile, nonce: message.nonce, timestamp: Date.now(), capabilities: LOCAL_RISK_CAPABILITIES, signature: bytesToBase64Url(new Uint8Array(signature)) };
-    this.transport.sendData(JSON.stringify(proof), remotePeerId);
+    transport.sendData(JSON.stringify(proof), remotePeerId);
   }
 
   private async acceptAuthProof(remotePeerId: string, message: Partial<Extract<CallAuthMessage, { type: "call.auth.proof" }>>): Promise<void> {
+    const lifecycle = this.lifecycleId;
+    const transport = this.transport;
+    const identity = this.identity;
     const expectedNonce = this.authChallenges.get(remotePeerId);
-    const identity = message.identity;
-    if (!expectedNonce || message.nonce !== expectedNonce || !identity || typeof message.signature !== "string" || !validRiskPeerCapabilities(message.capabilities) || !compatibleCallPeer(message.capabilities)) return;
-    if (identity.peerId !== remotePeerId || !/^[A-Za-z0-9_-]{8,128}$/.test(identity.peerId) || identity.displayName.trim().length < 2 || identity.displayName.length > 80 || (identity.avatar !== undefined && !validAvatarDataUrl(identity.avatar))) return;
-    const trusted = this.trustedPeers.get(identity.peerId) ?? this.revokedPeers.get(identity.peerId);
-    if (!trusted || JSON.stringify(trusted.publicKey) !== JSON.stringify(identity.publicKey)) return;
+    const remoteIdentity = message.identity;
+    if (!transport || !identity || !expectedNonce || message.nonce !== expectedNonce || !remoteIdentity || typeof message.signature !== "string" || !validRiskPeerCapabilities(message.capabilities) || !compatibleCallPeer(message.capabilities)) return;
+    if (remoteIdentity.peerId !== remotePeerId || !/^[A-Za-z0-9_-]{8,128}$/.test(remoteIdentity.peerId) || remoteIdentity.displayName.trim().length < 2 || remoteIdentity.displayName.length > 80 || (remoteIdentity.avatar !== undefined && !validAvatarDataUrl(remoteIdentity.avatar))) return;
+    const trusted = this.trustedPeers.get(remoteIdentity.peerId) ?? this.revokedPeers.get(remoteIdentity.peerId);
+    if (!trusted || JSON.stringify(trusted.publicKey) !== JSON.stringify(remoteIdentity.publicKey)) return;
     try {
       const key = await crypto.subtle.importKey("jwk", trusted.publicKey, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
-      const valid = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, base64UrlToArrayBuffer(message.signature), new TextEncoder().encode(this.authCanonical(remotePeerId, expectedNonce, identity, message.capabilities)));
-      if (!valid) return;
+      const canonical = this.authCanonical(remotePeerId, expectedNonce, remoteIdentity, message.capabilities);
+      const valid = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, base64UrlToArrayBuffer(message.signature), new TextEncoder().encode(canonical));
+      if (!valid || !this.isActive(lifecycle) || this.transport !== transport || this.identity !== identity || this.authChallenges.get(remotePeerId) !== expectedNonce) return;
       this.authChallenges.delete(remotePeerId);
       const timer = this.authTimers.get(remotePeerId); if (timer) clearTimeout(timer);
       this.authTimers.delete(remotePeerId);
-      this.remoteIdentityPeerIds.set(remotePeerId, identity.peerId);
+      this.remoteIdentityPeerIds.set(remotePeerId, remoteIdentity.peerId);
       this.authenticatedPeers.add(remotePeerId);
-      if (this.revokedPeers.has(identity.peerId)) {
+      if (this.revokedPeers.has(remoteIdentity.peerId)) {
         this.pendingRevokedPeers.delete(remotePeerId);
         this.revocationOnlyPeers.add(remotePeerId);
-        this.transport?.revokePeerMedia(remotePeerId);
+        transport.revokePeerMedia(remotePeerId);
         useCallStore.getState().remove(remotePeerId);
         this.pendingPeerStates.delete(remotePeerId);
-        await this.sendCallRevocations(remotePeerId, identity.peerId);
+        await this.sendCallRevocations(remotePeerId, remoteIdentity.peerId);
         return;
       }
       const participant = useCallStore.getState().participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
-      useCallStore.getState().upsert({ ...participant, displayName: identity.displayName, avatar: identity.avatar });
-      await this.transport?.authorizePeerMedia(remotePeerId);
+      useCallStore.getState().upsert({ ...participant, displayName: remoteIdentity.displayName, avatar: remoteIdentity.avatar });
+      await transport.authorizePeerMedia(remotePeerId);
+      if (!this.isActive(lifecycle) || this.transport !== transport) return;
       const pendingState = this.pendingPeerStates.get(remotePeerId);
       if (pendingState) {
         this.pendingPeerStates.delete(remotePeerId);
@@ -772,15 +801,19 @@ export class CallController {
   }
 
   private async handleGroupRevocationMessage(remotePeerId: string, raw: string): Promise<void> {
-    if (!this.groupId || !this.identity) return;
+    const lifecycle = this.lifecycleId;
+    const groupId = this.groupId;
+    const identity = this.identity;
+    if (!groupId || !identity) return;
     if (new TextEncoder().encode(raw).byteLength > 64 * 1024) return;
     let value: unknown;
     try { value = JSON.parse(raw); } catch { return; }
     if (!value || typeof value !== "object" || Array.isArray(value)) return;
     const message = value as Partial<CallGroupRevocationMessage>;
     if (message.version !== 1 || message.type !== "call.group.revocation" || !validGroupRevocationCertificate(message.certificate)) return;
-    if (message.certificate.groupId !== this.groupId || !(await applyGroupRevocationCertificate(message.certificate))) return;
-    if (message.certificate.targetPeerId === this.identity.peerId) {
+    if (message.certificate.groupId !== groupId || !(await applyGroupRevocationCertificate(message.certificate))) return;
+    if (!this.isActive(lifecycle) || this.groupId !== groupId || this.identity !== identity) return;
+    if (message.certificate.targetPeerId === identity.peerId) {
       await this.cleanup();
       return;
     }
@@ -796,16 +829,19 @@ export class CallController {
   }
 
   private async refreshGroupSecurity(): Promise<void> {
-    if (!this.groupId) return;
-    const group = (await loadLocalGroups()).find((item) => item.groupId === this.groupId);
-    if (!group) return;
+    const lifecycle = this.lifecycleId;
+    const groupId = this.groupId;
+    if (!groupId) return;
+    const group = (await loadLocalGroups()).find((item) => item.groupId === groupId);
+    if (!group || !this.isActive(lifecycle) || this.groupId !== groupId) return;
     this.trustedPeers.clear();
     this.revokedPeers.clear();
     (group.members ?? []).forEach((peer) => this.trustedPeers.set(peer.peerId, peer));
     (group.removedMembers ?? []).forEach((peer) => this.revokedPeers.set(peer.peerId, peer));
     this.revocations = (group.revocations ?? []).filter(validGroupRevocationCertificate);
 
-    for (const [remotePeerId, identityPeerId] of this.remoteIdentityPeerIds) {
+    for (const [remotePeerId, identityPeerId] of [...this.remoteIdentityPeerIds]) {
+      if (!this.isActive(lifecycle)) return;
       if (this.revokedPeers.has(identityPeerId)) {
         this.revocationOnlyPeers.add(remotePeerId);
         this.pendingPeerStates.delete(remotePeerId);
@@ -820,10 +856,14 @@ export class CallController {
         await this.transport?.disconnect(remotePeerId);
       }
     }
+    if (!this.isActive(lifecycle)) return;
     const nextRendezvousId = this.roomId ? groupRendezvousId(group, "voice", this.roomId) : undefined;
-    if (nextRendezvousId && this.rendezvousId && nextRendezvousId !== this.rendezvousId && this.signaling && this.peerId) {
+    const signaling = this.signaling;
+    const peerId = this.peerId;
+    if (nextRendezvousId && this.rendezvousId && nextRendezvousId !== this.rendezvousId && signaling && peerId) {
       this.rendezvousId = nextRendezvousId;
-      await this.signaling.connect(nextRendezvousId, this.peerId);
+      await signaling.connect(nextRendezvousId, peerId);
+      if (!this.isActive(lifecycle) || this.signaling !== signaling) return;
     }
   }
 

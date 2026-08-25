@@ -76,7 +76,7 @@ export function AttachmentCard(props: AttachmentCardProps) {
   const activeTransfer = ["accepted", "queued", "transferring", "verifying"].includes(record.state);
   const downloadable = locallyAvailable;
 
-  return <article className={`attachment-card kind-${resolvedKind} state-${record.state}`}>
+  return <div className={`attachment-card kind-${resolvedKind} state-${record.state}`}>
     {resolvedKind === "image" && previewUrl && !previewError && <img className="attachment-image" src={previewUrl} alt={manifest.filename} onLoad={() => setPreviewError("")} onError={previewFailed}/>} 
     {resolvedKind === "video" && previewUrl && !previewError && <video className="attachment-media" src={previewUrl} controls preload="metadata" onLoadedMetadata={() => setPreviewError("")} onError={previewFailed}/>} 
     {resolvedKind === "audio" && previewUrl && !previewError && <audio className="attachment-audio" src={previewUrl} controls preload="metadata" onLoadedMetadata={() => setPreviewError("")} onError={previewFailed}/>} 
@@ -106,7 +106,7 @@ export function AttachmentCard(props: AttachmentCardProps) {
       {activeTransfer && <button className="danger" onClick={() => void props.onCancel(record)}><X size={15}/> Cancelar</button>}
       {downloadable && <button onClick={() => void props.onDownload(record)}><Download size={15}/> Salvar arquivo</button>}
     </div>
-  </article>;
+  </div>;
 }
 
 function kindIcon(kind: ChatAttachmentRecord["manifest"]["kind"]) {

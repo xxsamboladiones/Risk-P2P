@@ -1,10 +1,236 @@
-name: Audit fixes (retired)
+name: Apply signaling reconnect hotfix
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - hotfix/long-call-signaling-reconnect
+
+permissions:
+  contents: write
 
 jobs:
-  retired:
+  apply:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Temporary audit workflow retired."
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 10.15.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - name: Apply signaling reconnect tolerance
+        shell: python
+        run: |
+          from pathlib import Path
+
+          signaling_path = Path("apps/web/src/services/supabase/signaling.ts")
+          source = signaling_path.read_text(encoding="utf-8")
+
+          source = source.replace(
+            'type RateWindow = { startedAt: number; count: number };\n',
+            'type RateWindow = { startedAt: number; count: number };\n'
+            'type ConnectionWaiter = { resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };\n',
+            1,
+          )
+          source = source.replace(
+            'const SESSION_TIMESTAMP_TOLERANCE_MS = 1_500;\n',
+            'const SESSION_TIMESTAMP_TOLERANCE_MS = 1_500;\nconst SIGNALING_RECONNECT_SEND_TIMEOUT_MS = 20_000;\n',
+            1,
+          )
+          source = source.replace(
+            '  private readonly peerDepartedAt = new Map<string, number>();\n',
+            '  private readonly peerDepartedAt = new Map<string, number>();\n  private readonly connectionWaiters = new Set<ConnectionWaiter>();\n',
+            1,
+          )
+          source = source.replace(
+            '    this.reconnectAttempts = 0;\n    this.peerLeaveTimers.forEach((timer) => clearTimeout(timer));\n',
+            '    this.reconnectAttempts = 0;\n    this.rejectConnectionWaiters(new Error("Signaling Realtime foi desconectado."));\n    this.peerLeaveTimers.forEach((timer) => clearTimeout(timer));\n',
+            1,
+          )
+
+          old_broadcast = '''  private async broadcast<Type extends string, Payload>(type: Type, targetPeerId: string | undefined, payload: Payload): Promise<void> {
+    if (!this.channel || !this.roomId || !this.peerId || this.status !== "connected") throw new Error("Signaling Realtime não está conectado.");
+    const envelope: SignalingEnvelope<Type, Payload> = {
+      version: 1, roomId: this.roomId, fromPeerId: this.peerId, targetPeerId,
+      messageId: crypto.randomUUID(), timestamp: Date.now(), type, payload,
+    };
+    const result = await this.channel.send({ type: "broadcast", event: type, payload: envelope });
+    if (result !== "ok") throw new Error(`Falha ao enviar ${type} pelo Supabase Realtime.`);
+  }
+'''
+          new_broadcast = '''  private async broadcast<Type extends string, Payload>(type: Type, targetPeerId: string | undefined, payload: Payload): Promise<void> {
+    if (!this.roomId || !this.peerId || this.disconnecting) throw new Error("Signaling Realtime não está conectado.");
+    if (!this.channel || this.status !== "connected") await this.waitForConnected();
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const channel = this.channel;
+      const roomId = this.roomId;
+      const peerId = this.peerId;
+      if (!channel || !roomId || !peerId || this.status !== "connected") {
+        await this.waitForConnected();
+        continue;
+      }
+      const envelope: SignalingEnvelope<Type, Payload> = {
+        version: 1, roomId, fromPeerId: peerId, targetPeerId,
+        messageId: crypto.randomUUID(), timestamp: Date.now(), type, payload,
+      };
+      try {
+        const result = await channel.send({ type: "broadcast", event: type, payload: envelope });
+        if (result === "ok") return;
+      } catch {
+        // Uma queda curta do websocket não deve transformar uma call WebRTC já
+        // estabelecida em erro fatal. Reabrimos o canal e tentamos uma vez mais.
+      }
+      if (attempt === 0 && !this.disconnecting) {
+        this.setStatus("reconnecting");
+        this.scheduleReconnect();
+        await this.waitForConnected();
+      }
+    }
+    throw new Error(`Falha ao enviar ${type} pelo Supabase Realtime após reconectar.`);
+  }
+
+  private waitForConnected(timeoutMs = SIGNALING_RECONNECT_SEND_TIMEOUT_MS): Promise<void> {
+    if (this.channel && this.status === "connected") return Promise.resolve();
+    if (this.disconnecting || !this.client || !this.channelName || !this.peerId || !this.roomId) {
+      return Promise.reject(new Error("Signaling Realtime não está conectado."));
+    }
+    this.scheduleReconnect();
+    return new Promise<void>((resolve, reject) => {
+      const waiter = {} as ConnectionWaiter;
+      waiter.resolve = () => {
+        clearTimeout(waiter.timer);
+        this.connectionWaiters.delete(waiter);
+        resolve();
+      };
+      waiter.reject = (error) => {
+        clearTimeout(waiter.timer);
+        this.connectionWaiters.delete(waiter);
+        reject(error);
+      };
+      waiter.timer = setTimeout(() => {
+        waiter.reject(new Error("Tempo esgotado ao reconectar ao Supabase Realtime."));
+      }, timeoutMs);
+      this.connectionWaiters.add(waiter);
+    });
+  }
+
+  private resolveConnectionWaiters(): void {
+    [...this.connectionWaiters].forEach((waiter) => waiter.resolve());
+  }
+
+  private rejectConnectionWaiters(error: Error): void {
+    [...this.connectionWaiters].forEach((waiter) => waiter.reject(error));
+  }
+'''
+          if old_broadcast not in source:
+            raise SystemExit("broadcast anchor not found")
+          source = source.replace(old_broadcast, new_broadcast, 1)
+
+          old_status = '  private setStatus(status: SignalingStatus): void { if (this.status === status) return; this.status = status; this.log(status); this.emit("status", status); }\n'
+          new_status = '''  private setStatus(status: SignalingStatus): void {
+    if (this.status === status) return;
+    this.status = status;
+    if (status === "connected") this.resolveConnectionWaiters();
+    this.log(status);
+    this.emit("status", status);
+  }
+'''
+          if old_status not in source:
+            raise SystemExit("setStatus anchor not found")
+          source = source.replace(old_status, new_status, 1)
+          signaling_path.write_text(source, encoding="utf-8")
+
+          call_path = Path("apps/web/src/call.ts")
+          call = call_path.read_text(encoding="utf-8")
+          call = call.replace(
+            '  private connectionFailureMessage?: string;\n',
+            '  private connectionFailureMessage?: string;\n  private signalingFailureMessage?: string;\n',
+            1,
+          )
+          call = call.replace(
+            '    this.connectionFailureMessage = undefined;\n    this.identity = undefined;\n',
+            '    this.connectionFailureMessage = undefined;\n    this.signalingFailureMessage = undefined;\n    this.identity = undefined;\n',
+            1,
+          )
+          old_status_handler = '''      signaling.onStatusChange((status) => {
+        if (status === "error") useCallStore.getState().setError("Falha no signaling Supabase Realtime.");
+      }),'''
+          new_status_handler = '''      signaling.onStatusChange((status) => {
+        const store = useCallStore.getState();
+        if (status === "error") {
+          this.signalingFailureMessage = "Falha no signaling Supabase Realtime.";
+          store.setError(this.signalingFailureMessage);
+          return;
+        }
+        if (status === "connected") {
+          const current = store.error;
+          const transient = current === this.signalingFailureMessage
+            || current === "Signaling Realtime não está conectado."
+            || current === "Error: Signaling Realtime não está conectado."
+            || current === "Tempo esgotado ao reconectar ao Supabase Realtime.";
+          if (transient) store.setError(null);
+          this.signalingFailureMessage = undefined;
+        }
+      }),'''
+          if old_status_handler not in call:
+            raise SystemExit("call signaling status anchor not found")
+          call = call.replace(old_status_handler, new_status_handler, 1)
+          cleanup_anchor = '    this.connectionFailureMessage = undefined;\n    this.identity = undefined;\n'
+          # The first occurrence belongs to join and was replaced above. Replace the
+          # remaining cleanup occurrence if still present.
+          if cleanup_anchor in call:
+            call = call.replace(cleanup_anchor, '    this.connectionFailureMessage = undefined;\n    this.signalingFailureMessage = undefined;\n    this.identity = undefined;\n', 1)
+          call_path.write_text(call, encoding="utf-8")
+
+          test_path = Path("apps/web/src/services/supabase/signaling-reconnect.test.ts")
+          test_path.write_text('''import { afterEach, describe, expect, it, vi } from "vitest";
+import { SupabaseSignalingProvider } from "./signaling";
+
+function internals(provider: SupabaseSignalingProvider): Record<string, any> {
+  return provider as unknown as Record<string, any>;
+}
+
+describe("SupabaseSignalingProvider reconnect sends", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("aguarda reconnect antes de enviar peer.state em vez de falhar imediatamente", async () => {
+    const provider = new SupabaseSignalingProvider();
+    const state = internals(provider);
+    const send = vi.fn(async () => "ok");
+    state.roomId = "room-test";
+    state.peerId = "peer-test";
+    state.channelName = "risk:room:test";
+    state.client = { channel: vi.fn(), removeChannel: vi.fn(async () => undefined) };
+    state.status = "reconnecting";
+
+    const pending = provider.sendPeerState({ microphone: true, camera: false, screenShare: false });
+    await Promise.resolve();
+    expect(send).not.toHaveBeenCalled();
+
+    if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = undefined;
+    state.channel = { send };
+    state.setStatus("connected");
+
+    await expect(pending).resolves.toBeUndefined();
+    expect(send).toHaveBeenCalledOnce();
+  });
+});
+''', encoding="utf-8")
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build:web
+      - name: Commit validated signaling reconnect fix
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add apps/web/src/call.ts apps/web/src/services/supabase/signaling.ts apps/web/src/services/supabase/signaling-reconnect.test.ts
+          git commit -m "fix(call): tolerate transient signaling reconnects"
+          git push

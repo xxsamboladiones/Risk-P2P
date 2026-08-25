@@ -1,4 +1,4 @@
-name: Apply private chat and preview stability fix
+name: Apply persistent private chat session fix
 
 on:
   push:
@@ -18,78 +18,91 @@ jobs:
         with: { version: 10.15.0 }
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: pnpm }
-      - name: Patch stable conversation ownership
+      - name: Keep private chat session alive across navigation
         shell: python
         run: |
           from pathlib import Path
-          import re
+
+          chat = Path("apps/web/src/chat.ts")
+          source = chat.read_text(encoding="utf-8")
+
+          old = '  private channelId?: string;\n  private groupId?: string;'
+          new = '  private channelId?: string;\n  private targetChannelId?: string;\n  private groupId?: string;'
+          if old not in source:
+              raise SystemExit("chat target field anchor not found")
+          source = source.replace(old, new, 1)
+
+          old = '  history(channelId: string, options?: MessagePageOptions): Promise<LocalChatMessage[]> { return loadLocalMessages(channelId, options); }\n\n  async attachmentHistory'
+          new = '  history(channelId: string, options?: MessagePageOptions): Promise<LocalChatMessage[]> { return loadLocalMessages(channelId, options); }\n\n  connectionSnapshot(): { channelId?: string; status: ChatConnectionStatus } {\n    return { channelId: this.targetChannelId ?? this.channelId, status: this.status };\n  }\n\n  async attachmentHistory'
+          if old not in source:
+              raise SystemExit("chat snapshot anchor not found")
+          source = source.replace(old, new, 1)
+
+          old = '    await this.disconnect();\n    this.setStatus("connecting");\n    const sessionToken = {};'
+          new = '    await this.disconnect();\n    this.targetChannelId = channelId;\n    this.setStatus("connecting");\n    const sessionToken = {};'
+          if old not in source:
+              raise SystemExit("chat connect target anchor not found")
+          source = source.replace(old, new, 1)
+
+          old = '    this.attachmentService = undefined;\n    this.channelId = undefined;\n    this.groupId = undefined;'
+          new = '    this.attachmentService = undefined;\n    this.channelId = undefined;\n    this.targetChannelId = undefined;\n    this.groupId = undefined;'
+          if old not in source:
+              raise SystemExit("chat disconnect target anchor not found")
+          source = source.replace(old, new, 1)
+          chat.write_text(source, encoding="utf-8")
 
           main = Path("apps/web/src/main.tsx")
           source = main.read_text(encoding="utf-8")
-          expression = 'activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null'
 
-          pattern = re.compile(
-              r'  useEffect\(\(\) => \{\n\s+const conversationId = activeFriend \? privateChannelId : activeChannel\?\.kind === "text" \? activeChannel\.id : null;\n\s+if \(!conversationId\) \{ setMessages\(\[\]\); setHasOlderMessages\(false\); setAttachments\(\[\]\); setAttachmentProgress\(\{\}\); return; \}'
-          )
-          replacement = (
-              f'  const conversationId = {expression};\n\n'
-              '  useEffect(() => {\n'
-              '    if (!conversationId) { setMessages([]); setHasOlderMessages(false); setAttachments([]); setAttachmentProgress({}); return; }'
-          )
-          source, count = pattern.subn(replacement, source, count=1)
-          if count != 1:
-              raise SystemExit(f"conversation effect replacement count={count}")
-
-          source, count = re.subn(
-              r'  \}, \[activeChannel, activeFriend, privateChannelId\]\);',
-              '  }, [conversationId]);',
-              source,
-              count=1,
-          )
-          if count != 1:
-              raise SystemExit(f"conversation dependency replacement count={count}")
-
-          source, count = re.subn(
-              r'  \}, \[activeFriend, currentUser\]\);',
-              '  }, [activeFriend?.id, activeFriend?.local, currentUser?.displayName]);',
-              source,
-              count=1,
-          )
-          if count != 1:
-              raise SystemExit(f"private id dependency replacement count={count}")
-
-          duplicate = f'    const conversationId = {expression};\n'
-          if source.count(duplicate) != 2:
-              raise SystemExit(f"conversation duplicate count={source.count(duplicate)}")
-          source = source.replace(duplicate, '', 2)
-
-          old = (
-              '  const existing = current[index]!;\n'
-              '  const replacement = attachmentStateWeight(record.state) >= attachmentStateWeight(existing.state) ? record : existing;\n'
-              '  const next = [...current];\n'
-              '  next[index] = replacement;'
-          )
-          new = (
-              '  const existing = current[index]!;\n'
-              '  const preferred = attachmentStateWeight(record.state) >= attachmentStateWeight(existing.state) ? record : existing;\n'
-              '  const replacement: ChatAttachmentRecord = {\n'
-              '    ...preferred,\n'
-              '    sourcePersisted: preferred.sourcePersisted === true || existing.sourcePersisted === true || record.sourcePersisted === true,\n'
-              '  };\n'
-              '  const next = [...current];\n'
-              '  next[index] = replacement;'
-          )
+          old = '''  useEffect(() => {
+    if (!conversationId) { setMessages([]); setHasOlderMessages(false); setAttachments([]); setAttachmentProgress({}); return; }
+    let alive = true;
+    const offMessage = chat.onMessage((message) => {
+      if (!alive) return;'''
+          new = '''  useEffect(() => {
+    if (!conversationId) { setMessages([]); setHasOlderMessages(false); setAttachments([]); setAttachmentProgress({}); return; }
+    const connection = chat.connectionSnapshot();
+    if (connection.channelId && connection.channelId !== conversationId) {
+      void chat.disconnect();
+      setChatStatus("disconnected");
+    } else {
+      setChatStatus(connection.channelId === conversationId ? connection.status : "disconnected");
+    }
+    let alive = true;
+    const offMessage = chat.onMessage((message) => {
+      if (!alive || message.channelId !== conversationId) return;'''
           if old not in source:
-              raise SystemExit("attachment dedupe anchor not found")
-          main.write_text(source.replace(old, new, 1), encoding="utf-8")
+              raise SystemExit("main conversation start anchor not found")
+          source = source.replace(old, new, 1)
 
-          protocol = Path("packages/protocol/src/attachments.ts")
-          source = protocol.read_text(encoding="utf-8")
-          old = '  return MIME_BY_EXTENSION[extension] ?? normalized || "application/octet-stream";'
-          new = '  return MIME_BY_EXTENSION[extension] ?? (normalized || "application/octet-stream");'
+          old = '''    const offStatus = chat.onStatus((status) => {
+      if (!alive) return;
+      setChatStatus(status);
+      if (status === "incompatible") setError(incompatiblePeerMessage());
+    });'''
+          new = '''    const offStatus = chat.onStatus((status) => {
+      if (!alive) return;
+      const current = chat.connectionSnapshot();
+      const scopedStatus = current.channelId === conversationId ? status : "disconnected";
+      setChatStatus(scopedStatus);
+      if (scopedStatus === "incompatible") setError(incompatiblePeerMessage());
+    });'''
           if old not in source:
-              raise SystemExit("MIME fallback anchor not found")
-          protocol.write_text(source.replace(old, new, 1), encoding="utf-8")
+              raise SystemExit("main scoped status anchor not found")
+          source = source.replace(old, new, 1)
+
+          old = '''      offAttachment();
+      offProgress();
+      void chat.disconnect();
+      setChatStatus("disconnected");
+      setAttachmentProgress({});'''
+          new = '''      offAttachment();
+      offProgress();
+      setAttachmentProgress({});'''
+          if old not in source:
+              raise SystemExit("main cleanup anchor not found")
+          source = source.replace(old, new, 1)
+          main.write_text(source, encoding="utf-8")
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
@@ -103,6 +116,6 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add apps/web/src/main.tsx packages/protocol/src/attachments.ts
-          git commit -m "fix(chat): keep private P2P alive during calls"
+          git add apps/web/src/chat.ts apps/web/src/main.tsx
+          git commit -m "fix(chat): preserve private P2P session across navigation"
           git push

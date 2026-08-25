@@ -316,31 +316,49 @@ function SocialHome() {
 
   const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
 
+  const isPrivateConversation = Boolean(activeFriend);
+  const privateSession = isPrivateConversation && privateChannelId ? backgroundChats.privateSession(privateChannelId) : undefined;
+  const activeConversationChat = isPrivateConversation ? (privateSession?.controller ?? chat) : chat;
+
   useEffect(() => {
-    if (!conversationId) { setMessages([]); setHasOlderMessages(false); setAttachments([]); setAttachmentProgress({}); return; }
+    if (!conversationId) {
+      setMessages([]);
+      setHasOlderMessages(false);
+      setAttachments([]);
+      setAttachmentProgress({});
+      setChatStatus("disconnected");
+      return;
+    }
+    const session = isPrivateConversation ? backgroundChats.privateSession(conversationId) : undefined;
+    const controller = isPrivateConversation ? session?.controller : chat;
+    const historyController = controller ?? chat;
+    if (isPrivateConversation) {
+      backgroundChats.clear(conversationId);
+      setChatStatus(session?.status ?? "disconnected");
+    }
     let alive = true;
-    const offMessage = chat.onMessage((message) => {
-      if (!alive) return;
+    const offMessage = controller?.onMessage((message) => {
+      if (!alive || message.channelId !== conversationId) return;
       setMessages((current) => {
         if (current.some((item) => item.id === message.id)) return current;
         return [...current, message].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
       });
     });
-    const offStatus = chat.onStatus((status) => {
+    const offStatus = controller?.onStatus((status) => {
       if (!alive) return;
       setChatStatus(status);
       if (status === "incompatible") setError(incompatiblePeerMessage());
     });
-    const offAttachment = chat.onAttachment((record) => {
+    const offAttachment = controller?.onAttachment((record) => {
       if (!alive || record.channelId !== conversationId) return;
       setAttachments((current) => upsertAttachment(current, record));
     });
-    const offProgress = chat.onAttachmentProgress((progress) => {
+    const offProgress = controller?.onAttachmentProgress((progress) => {
       if (!alive || progress.record.channelId !== conversationId) return;
       setAttachmentProgress((current) => ({ ...current, [progress.record.attachmentId]: progress }));
       setAttachments((current) => upsertAttachment(current, progress.record));
     });
-    void Promise.all([chat.history(conversationId), chat.attachmentHistory(conversationId)])
+    void Promise.all([historyController.history(conversationId), historyController.attachmentHistory(conversationId)])
       .then(([chatItems, attachmentItems]) => {
         if (!alive) return;
         setMessages([...chatItems].sort((a, b) => a.createdAt.localeCompare(b.createdAt)));
@@ -350,15 +368,15 @@ function SocialHome() {
       .catch((cause) => setError(cause instanceof Error ? cause.message : "Falha no histórico local"));
     return () => {
       alive = false;
-      offMessage();
-      offStatus();
-      offAttachment();
-      offProgress();
-      void chat.disconnect();
+      offMessage?.();
+      offStatus?.();
+      offAttachment?.();
+      offProgress?.();
+      if (!isPrivateConversation) void chat.disconnect();
       setChatStatus("disconnected");
       setAttachmentProgress({});
     };
-  }, [conversationId]);
+  }, [conversationId, privateSession?.controller, isPrivateConversation]);
 
   useEffect(() => setMessageSearch(""), [activeChannel?.id, activeFriend?.id]);
 
@@ -425,12 +443,13 @@ function SocialHome() {
         ]);
         const friend = localFriends.find((item) => item.peerId === activeFriend.id);
         if (!friend) throw new Error("Este amigo não possui identidade P2P local.");
-        await chat.connect(privateChannelId, currentUser.displayName, iceServers, {
+        await backgroundChats.connectPrivate(privateChannelId, currentUser.displayName, iceServers, {
           identity,
           trustedPeers: [friend],
           namespace: "friend",
           maxRemotePeers: 1,
         });
+        setChatStatus(backgroundChats.privateSession(privateChannelId)?.status ?? "connected");
         return;
       }
       if (!activeChannel || activeChannel.kind !== "text") return;
@@ -466,7 +485,7 @@ function SocialHome() {
     if (!content) return;
     try {
       if (chatStatus === "disconnected" || chatStatus === "error" || chatStatus === "incompatible") await chat.queue(conversationId, content, currentUser.displayName);
-      else await chat.send(content);
+      else await activeConversationChat.send(content);
       input.value = "";
     }
     catch (cause) { setError(cause instanceof Error ? cause.message : "Falha ao enviar mensagem"); }
@@ -477,7 +496,7 @@ function SocialHome() {
     if (!conversationId || !before || loadingOlderMessages) return;
     setLoadingOlderMessages(true);
     try {
-      const older = await chat.history(conversationId, { before, limit: 100 });
+      const older = await activeConversationChat.history(conversationId, { before, limit: 100 });
       setHasOlderMessages(older.length === 100);
       setMessages((current) => {
         const known = new Set(current.map((message) => message.id));
@@ -491,7 +510,7 @@ function SocialHome() {
 
   async function sendFiles(files: File[]) {
     try {
-      for (const file of files) await chat.sendAttachment(file);
+      for (const file of files) await activeConversationChat.sendAttachment(file);
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Falha ao enviar arquivo"); }
   }
 
@@ -555,10 +574,10 @@ function SocialHome() {
           const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
           throw failure?.reason ?? new Error("Não foi possível desfazer a amizade.");
         }
-        if (activeFriend?.id === target.friend.id) {
-          await chat.disconnect().catch(() => undefined);
-          setActiveFriend(null);
-        }
+        const identity = await getOrCreateLocalIdentity(currentUser?.displayName ?? "Participante");
+        const privateId = await privateConversationId(identity.peerId, target.friend.id);
+        await backgroundChats.disconnectPrivate(privateId).catch(() => undefined);
+        if (activeFriend?.id === target.friend.id) setActiveFriend(null);
       } else {
         const results = await Promise.allSettled([
           deleteLocalGroup(target.group.id),
@@ -655,12 +674,12 @@ function SocialHome() {
     attachments={attachments}
     progress={attachmentProgress}
     connected={chatStatus === "ready"}
-    loadBlob={(record) => chat.attachmentBlob(record)}
-    onDownload={(record) => attachmentAction((item) => chat.downloadAttachment(item), record)}
-    onRequest={(record) => attachmentAction((item) => chat.requestAttachment(item), record)}
-    onPause={(record) => attachmentAction((item) => chat.pauseAttachment(item), record)}
-    onResume={(record) => attachmentAction((item) => chat.resumeAttachment(item), record)}
-    onCancel={(record) => attachmentAction((item) => chat.cancelAttachment(item), record)}
+    loadBlob={(record) => activeConversationChat.attachmentBlob(record)}
+    onDownload={(record) => attachmentAction((item) => activeConversationChat.downloadAttachment(item), record)}
+    onRequest={(record) => attachmentAction((item) => activeConversationChat.requestAttachment(item), record)}
+    onPause={(record) => attachmentAction((item) => activeConversationChat.pauseAttachment(item), record)}
+    onResume={(record) => attachmentAction((item) => activeConversationChat.resumeAttachment(item), record)}
+    onCancel={(record) => attachmentAction((item) => activeConversationChat.cancelAttachment(item), record)}
   />;
 
   return <>

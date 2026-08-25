@@ -10,7 +10,20 @@ const runtime = vi.hoisted(() => ({
     closed: boolean;
   }>(),
   messages: [] as Array<{ id: string; content: string }>,
+  appliedRevocations: [] as string[],
 }));
+
+vi.mock("./services/offline/social-storage", async () => {
+  const actual = await vi.importActual<typeof import("./services/offline/social-storage")>("./services/offline/social-storage");
+  return {
+    ...actual,
+    loadLocalGroups: vi.fn(async () => []),
+    applyGroupRevocationCertificate: vi.fn(async (certificate: { targetPeerId: string }) => {
+      runtime.appliedRevocations.push(certificate.targetPeerId);
+      return true;
+    }),
+  };
+});
 
 vi.mock("@risk/rtc", () => ({
   MeshWebRTCTransport: class FakeMeshWebRTCTransport {
@@ -110,6 +123,7 @@ describe("ciclo de conexão do ChatController", () => {
   beforeEach(() => {
     runtime.transports.clear();
     runtime.messages.length = 0;
+    runtime.appliedRevocations.length = 0;
   });
 
   afterEach(() => {
@@ -170,5 +184,78 @@ describe("ciclo de conexão do ChatController", () => {
     expect(runtime.messages).toHaveLength(2);
 
     await Promise.all([first.disconnect(), second.disconnect()]);
+  });
+
+  it("recusa um peer de versão antiga antes de autenticar o DataChannel", async () => {
+    const hub = new InMemorySignalingHub();
+    const currentIdentity = await identity("Atual");
+    const oldIdentity = await identity("Antigo");
+    const current = new ChatController(() => new InMemorySignalingProvider(hub));
+    const old = new ChatController(() => new InMemorySignalingProvider(hub, "0.1.0"));
+    const statuses: ChatConnectionStatus[] = [];
+    current.onStatus((status) => statuses.push(status));
+
+    await current.connect("canal-versao", currentIdentity.displayName, [], {
+      identity: currentIdentity,
+      trustedPeers: [publicIdentity(oldIdentity)],
+      namespace: "friend",
+    });
+    await old.connect("canal-versao", oldIdentity.displayName, [], {
+      identity: oldIdentity,
+      trustedPeers: [publicIdentity(currentIdentity)],
+      namespace: "friend",
+    });
+
+    await vi.waitFor(() => expect(statuses.at(-1)).toBe("incompatible"));
+    expect(runtime.messages).toEqual([]);
+    await Promise.all([current.disconnect(), old.disconnect()]);
+  });
+
+  it("entrega a revogação ao removido sem liberar mensagens, histórico ou anexos", async () => {
+    const hub = new InMemorySignalingHub();
+    const member = await identity("Membro ativo");
+    const removed = await identity("Membro removido");
+    const groupId = "group_revocation_12345678";
+    const certificate = {
+      version: 1 as const,
+      groupId,
+      targetPeerId: removed.peerId,
+      targetPublicKey: removed.publicKey,
+      issuerPeerId: member.peerId,
+      membershipVersion: 2,
+      administratorEpoch: 1,
+      messageId: crypto.randomUUID(),
+      timestamp: Date.now(),
+      signature: "A".repeat(86),
+    };
+    const activeChat = new ChatController(() => new InMemorySignalingProvider(hub));
+    const removedChat = new ChatController(() => new InMemorySignalingProvider(hub));
+    const removedStatuses: ChatConnectionStatus[] = [];
+    const received: string[] = [];
+    removedChat.onStatus((status) => removedStatuses.push(status));
+    removedChat.onMessage((message) => received.push(message.content));
+
+    await activeChat.connect("channel_revocation_12345678", member.displayName, [], {
+      identity: member,
+      trustedPeers: [],
+      revokedPeers: [publicIdentity(removed)],
+      revocations: [certificate],
+      groupId,
+      requireIdentityAuthentication: true,
+    });
+    await removedChat.connect("channel_revocation_12345678", removed.displayName, [], {
+      identity: removed,
+      trustedPeers: [publicIdentity(member)],
+      groupId,
+      requireIdentityAuthentication: true,
+    });
+
+    await vi.waitFor(() => expect(runtime.appliedRevocations).toEqual([removed.peerId]));
+    await vi.waitFor(() => expect(removedStatuses.at(-1)).toBe("disconnected"));
+    await activeChat.send("mensagem posterior à remoção");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(received).toEqual([]);
+    expect(runtime.messages.filter((message) => message.content === "mensagem posterior à remoção")).toHaveLength(1);
+    await activeChat.disconnect();
   });
 });

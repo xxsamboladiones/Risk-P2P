@@ -18,8 +18,10 @@ use tokio::{
 use tokio_util::io::ReaderStream;
 
 const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+const DEFAULT_ATTACHMENT_QUOTA_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+const STALE_TRANSFER_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AttachmentDiskManifest {
     attachment_id: String,
@@ -50,6 +52,24 @@ async fn prepare(
     validate_transfer_id(&transfer_id)?;
     validate_manifest(&manifest)?;
     let directory = transfer_dir(&transfer_id)?;
+    if fs::try_exists(&directory).await.map_err(internal)? {
+        if read_transfer_manifest(&transfer_id).await? != manifest {
+            return Err(ApiError::Bad(
+                "O manifesto não corresponde à transferência já iniciada".into(),
+            ));
+        }
+    } else {
+        let quota = env::var("RISK_ATTACHMENT_QUOTA_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_ATTACHMENT_QUOTA_BYTES);
+        let used = directory_size(&attachment_root()?).await?;
+        if used.saturating_add(manifest.size) > quota {
+            return Err(ApiError::Bad(
+                "O armazenamento de anexos atingiu a quota configurada".into(),
+            ));
+        }
+    }
     fs::create_dir_all(&directory).await.map_err(internal)?;
     let encoded = serde_json::to_vec(&manifest).map_err(internal)?;
     fs::write(directory.join("manifest.json"), encoded)
@@ -298,6 +318,49 @@ fn content_dir(attachment_id: &str) -> Result<PathBuf, ApiError> {
 
 fn internal(error: impl Into<anyhow::Error>) -> ApiError {
     ApiError::Internal(error.into())
+}
+
+async fn directory_size(root: &std::path::Path) -> Result<u64, ApiError> {
+    if !fs::try_exists(root).await.map_err(internal)? {
+        return Ok(0);
+    }
+    let mut pending = vec![root.to_path_buf()];
+    let mut total = 0_u64;
+    while let Some(directory) = pending.pop() {
+        let mut entries = fs::read_dir(directory).await.map_err(internal)?;
+        while let Some(entry) = entries.next_entry().await.map_err(internal)? {
+            let metadata = entry.metadata().await.map_err(internal)?;
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    Ok(total)
+}
+
+pub(crate) async fn cleanup_stale_transfers() {
+    let Ok(root) = attachment_root().map(|path| path.join("transfers")) else {
+        return;
+    };
+    let Ok(mut entries) = fs::read_dir(root).await else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(metadata) = entry.metadata().await else {
+            continue;
+        };
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age.as_secs() > STALE_TRANSFER_AGE_SECS);
+        if metadata.is_dir() && stale {
+            let _ = fs::remove_dir_all(entry.path()).await;
+        }
+    }
 }
 
 #[cfg(test)]

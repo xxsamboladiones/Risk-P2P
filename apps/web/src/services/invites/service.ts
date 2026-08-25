@@ -402,9 +402,13 @@ export class InviteService {
       if (this.snapshot.type === "friend") {
         await saveLocalFriend({ ...message.identity, addedAt: this.dependencies.now() });
       } else if (message.group) {
+        const ownerIdentity = message.group.ownerIdentity ?? (message.identity.peerId === message.group.ownerPeerId ? message.identity : undefined);
+        if (!ownerIdentity) throw new Error("A identidade do proprietário não veio no convite.");
+        const members = [ownerIdentity, message.identity, publicIdentity(this.identity)]
+          .filter((member, index, all) => all.findIndex((candidate) => candidate.peerId === member.peerId) === index);
         await saveLocalGroup({
           ...message.group,
-          members: [message.identity, publicIdentity(this.identity)],
+          members,
           joinedAt: this.dependencies.now(),
         });
       } else {

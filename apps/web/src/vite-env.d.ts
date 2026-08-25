@@ -6,6 +6,7 @@ interface ImportMetaEnv {
   readonly VITE_SUPABASE_ANON_KEY?: string;
   readonly VITE_DEBUG_SIGNALING?: string;
   readonly VITE_ICE_SERVERS_JSON?: string;
+  readonly VITE_RISK_APP_VERSION?: string;
 }
 
 interface ImportMeta {
@@ -24,6 +25,11 @@ type RiskDesktopBackendConfig = {
   token: string;
 };
 
+type RiskDesktopBackendStatus = {
+  state: "restarting" | "recovered" | "failed";
+  message: string;
+};
+
 interface Window {
   desktop?: {
     listScreenSources(): Promise<RiskDesktopSource[]>;
@@ -31,5 +37,6 @@ interface Window {
     selectScreenSource(sourceId: string): Promise<void>;
     setWindowFullscreen(enabled: boolean): Promise<{ fullscreen: boolean }>;
     getBackendConfig(): Promise<RiskDesktopBackendConfig>;
+    onBackendStatus(callback: (status: RiskDesktopBackendStatus) => void): () => void;
   };
 }

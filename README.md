@@ -2,7 +2,7 @@
 
 **Risk** é um aplicativo desktop de comunicação P2P com chamadas de voz e vídeo, compartilhamento de tela, chat, grupos e transferência de arquivos usando WebRTC.
 
-> **Versão atual: Alpha 0.1.3**
+> **Versão atual: Alpha 0.2.0**
 >
 > O projeto ainda está em fase Alpha. Recursos, protocolo e persistência podem mudar entre versões.
 
@@ -16,10 +16,20 @@
 - envio P2P de arquivos e anexos pelo DataChannel;
 - previews de imagens, vídeos e áudios;
 - grupos com canais de texto e voz;
+- personalização local do nome e da imagem dos grupos, sincronizada por WebRTC;
 - criação, edição e exclusão de canais locais;
 - amizades e convites P2P por código;
 - armazenamento local no desktop com Rust + SQLite;
 - aplicativo Electron para Windows e Linux.
+- manifesto versionado de grupos com remoções propagadas entre os membros;
+- cargos locais de proprietário/administrador, gerenciamento de membros e revogação assinada via WebRTC;
+- certificados de remoção retransmissíveis, sem liberar chat, histórico, anexos ou mídia ao peer removido;
+- autorização bilateral antes de renderizar ou reproduzir qualquer mídia remota de grupo;
+- entrega de mensagens P2P com caixa de saída local, confirmação e reenvio;
+- perfil assinado e sincronizado sem acoplar a foto ao manifesto do grupo;
+- busca local, diagnóstico de conexão e estimativa de armazenamento;
+- histórico local paginado, carregado em blocos de 100 mensagens;
+- controle de ensurdecer durante chamadas.
 
 No Windows, o compartilhamento de tela pode capturar o áudio do sistema usando o caminho nativo do Electron. No Linux existe um caminho experimental via PipeWire para compartilhar áudio do sistema sem retransmitir o próprio áudio reproduzido pelo Risk; quando esse caminho não está disponível, o compartilhamento continua somente com vídeo.
 
@@ -88,6 +98,8 @@ O protocolo inclui:
 - previews de mídia;
 - armazenamento local de anexos.
 
+O desktop aplica por padrão uma quota total de 50 GiB para anexos e remove transferências temporárias abandonadas há mais de sete dias. A quota pode ser ajustada com `RISK_ATTACHMENT_QUOTA_BYTES`.
+
 ## Chamadas
 
 O transporte atual usa WebRTC Mesh e limita cada cliente a cinco peers remotos, totalizando até **seis participantes por chamada**.
@@ -106,6 +118,9 @@ A interface de chamada suporta:
 - tela cheia;
 - zoom com a roda do mouse no modo tela cheia;
 - alternância entre chamada e chat sem encerrar a conexão.
+- autenticação ECDSA dos membros antes de publicar mídia;
+- indicador local de qualidade baseado em RTT, jitter e perda;
+- bitrate adaptado automaticamente ao tamanho da chamada.
 
 ## Componentes
 
@@ -115,7 +130,7 @@ apps/desktop       Electron Main + preload
 packages/rtc       WebRTC, mídia, DataChannels e file transfer
 packages/protocol  Tipos e mensagens compartilhadas
 desktop-backend    Backend local Rust/Axum + SQLite
-server             Backend PostgreSQL legado/experimental
+server             Backend PostgreSQL legado isolado (somente migração)
 infrastructure     Coturn, Docker e infraestrutura auxiliar
 ```
 
@@ -143,6 +158,7 @@ Copie `.env.example` para `.env` e configure pelo menos:
 VITE_SUPABASE_URL=https://seu-projeto.supabase.co
 VITE_SUPABASE_ANON_KEY=sua-chave-publica
 VITE_DEBUG_SIGNALING=false
+VITE_ENABLE_LEGACY_SERVER=false
 ```
 
 Configuração pública de ICE também pode ser definida por build:
@@ -152,6 +168,8 @@ VITE_ICE_SERVERS_JSON=[{"urls":["stun:stun.example.com:3478"]}]
 ```
 
 Nunca coloque `service_role`, senha de banco, `JWT_SECRET` ou `TURN_SECRET` no frontend.
+
+Se a lista ICE contiver apenas `stun:`, o Risk opera em **STUN direto**. Isso funciona em muitas redes domésticas, mas não garante conexão entre CGNAT, NAT simétrico ou firewalls restritivos. A tela de diagnóstico identifica explicitamente `Somente STUN`; TURN só aparece como disponível quando uma URL `turn:`/`turns:` foi realmente entregue ao app.
 
 ## Desenvolvimento
 
@@ -241,8 +259,10 @@ pnpm typecheck
 pnpm test
 ```
 
-A CI valida TypeScript, testes Web/P2P, build Web, Electron e o código Rust dos backends.
+A CI valida TypeScript, testes Web/P2P, build Web, migração de um banco 0.1 preenchido e duas instâncias empacotadas do Electron. Cada instância precisa renderizar React, iniciar o sidecar Rust saudável e conseguir gravar `localStorage` e IndexedDB na origem persistente.
 O backend desktop também é verificado no Windows para cobrir os caminhos específicos de captura de áudio desse sistema.
+
+Tags `v*` executam o workflow de release para gerar NSIS, AppImage, DEB, atestados de proveniência e `SHA256SUMS.txt`. Releases Windows exigem `CSC_LINK` e `CSC_KEY_PASSWORD`: o pipeline interrompe o build se faltarem e valida a assinatura Authenticode dos executáveis antes da publicação. Builds locais continuam podendo ser não assinados. O servidor PostgreSQL antigo só é ativado explicitamente com `VITE_ENABLE_LEGACY_SERVER=true` e o profile Docker `legacy-server`.
 
 ## Destaques da versão Alpha atual
 
@@ -257,7 +277,26 @@ Esta versão adiciona e melhora principalmente:
 - gerenciamento de grupos e canais;
 - melhorias de estabilidade e conexão P2P;
 - suporte experimental a áudio de screen share via PipeWire no Linux;
-- nova identidade visual do aplicativo.
+- nova identidade visual do aplicativo;
+- manifesto de grupo v2 assinado, com canais, membros e remoções consistentes;
+- resolução determinística de edições concorrentes e epoch de administradores controlado pelo proprietário;
+- delegações de administrador assinadas pelo proprietário e verificáveis mesmo por peers atrasados;
+- rendezvous de grupo rotacionado após remoções, evitando que ex-membros continuem descobrindo a sala;
+- negociação explícita de versão/capacidades antes de liberar chat ou mídia;
+- recuperação visual de falhas do renderer e uma tentativa controlada de reinício do sidecar;
+- revogação P2P retransmissível também ao reconectar diretamente em uma chamada;
+- reparo manual e seguro de aliases antigos da identidade local;
+- mensagens offline na caixa de saída até outro peer confirmar o recebimento;
+- diagnóstico de Presence, WebRTC, ICE, RTT, jitter e perda sem expor SDP ou candidatos;
+- entrada em salas ativas pela tela de atividade e aviso de limites locais;
+- busca no histórico local e visão de uso do armazenamento;
+- paginação do histórico SQLite/IndexedDB para conversas longas;
+- controle de ensurdecer e sincronização assinada de perfil.
+
+Limites defensivos desta fase Alpha: até 48 membros ativos e 48 certificados de
+revogação por grupo, oito chats em segundo plano e 32 grupos monitorados na área
+de atividade. Uma identidade revogada não volta ao mesmo grupo; um novo convite
+exige uma nova identidade P2P.
 
 ## Documentação
 

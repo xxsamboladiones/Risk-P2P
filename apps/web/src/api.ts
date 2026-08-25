@@ -9,6 +9,7 @@ import { resolveStaticIceConfiguration } from "./services/rtc/ice";
 
 const configuredApiUrl = import.meta.env.VITE_API_URL?.trim().replace(/\/$/, "");
 const STATIC_API_URL = configuredApiUrl || (import.meta.env.DEV ? "http://localhost:8080" : "");
+const LEGACY_SERVER_ENABLED = import.meta.env.VITE_ENABLE_LEGACY_SERVER === "true";
 const LOCAL_TOKEN_PREFIX = "risk-local:";
 const DESKTOP_TOKEN_HEADER = "x-risk-desktop-token";
 let refreshInFlight: Promise<string | null> | undefined;
@@ -16,20 +17,25 @@ let runtimeConfig: Promise<ApiRuntimeConfig | null> | undefined;
 
 type ApiRuntimeConfig = { baseUrl: string; desktopToken?: string };
 
+export function resetApiRuntimeConfig(): void {
+  runtimeConfig = undefined;
+  refreshInFlight = undefined;
+}
+
 export class ApiRequestError extends Error {
   constructor(message: string, public readonly status: number) { super(message); }
 }
 
-export type Friend = { id: string; displayName: string; local?: boolean };
+export type Friend = { id: string; displayName: string; avatar?: string; local?: boolean };
 export type PendingFriend = Friend & { requestId: string };
-export type Community = { id: string; name: string; local?: boolean };
+export type Community = { id: string; name: string; avatar?: string; local?: boolean };
 export type Channel = { id: string; name: string; kind: "text" | "voice"; voiceRoomId?: string | null };
 export type ChatMessage = { id: string; author: string; content: string; createdAt: string };
 export type CommunityInvite = { id: string; communityId: string; communityName: string; inviter: string };
-export type CurrentUser = { id: string; displayName: string; email: string };
+export type CurrentUser = { id: string; displayName: string; avatar?: string; email: string };
 
 export function isApiConfigured(): boolean {
-  return Boolean(window.desktop?.getBackendConfig || STATIC_API_URL);
+  return Boolean(window.desktop?.getBackendConfig || (LEGACY_SERVER_ENABLED && STATIC_API_URL));
 }
 
 export function isLocalSessionToken(token: string | null | undefined): boolean {
@@ -50,7 +56,7 @@ async function resolveApiConfig(): Promise<ApiRuntimeConfig | null> {
         }
         return { baseUrl: desktop.baseUrl.replace(/\/$/, ""), desktopToken: desktop.token };
       }
-      return STATIC_API_URL ? { baseUrl: STATIC_API_URL } : null;
+      return LEGACY_SERVER_ENABLED && STATIC_API_URL ? { baseUrl: STATIC_API_URL } : null;
     })().catch((error) => {
       runtimeConfig = undefined;
       throw error;
@@ -88,7 +94,7 @@ async function localSession(displayName?: string): Promise<{ accessToken: string
 async function localCurrentUser(): Promise<CurrentUser> {
   const identity = await loadLocalIdentity();
   if (!identity) throw new ApiRequestError("Perfil P2P local não encontrado.", 401);
-  return { id: identity.peerId, displayName: identity.displayName, email: "" };
+  return { id: identity.peerId, displayName: identity.displayName, avatar: identity.avatar, email: "" };
 }
 
 function headersFor(config: ApiRuntimeConfig, init?: HeadersInit): Headers {
@@ -192,14 +198,16 @@ async function logout(): Promise<void> {
 async function me(token: string): Promise<CurrentUser> {
   if (isLocalSessionToken(token) || !isApiConfigured()) return localCurrentUser();
   const profile = await request<CurrentUser>("/me", { method: "GET", headers: { authorization: `Bearer ${token}` } });
-  await getOrCreateLocalIdentity(profile.displayName).catch(() => undefined);
-  return profile;
+  const local = await loadLocalIdentity().catch(() => null);
+  if (local) return { ...profile, displayName: local.displayName, avatar: local.avatar };
+  const identity = await getOrCreateLocalIdentity(profile.displayName).catch(() => null);
+  return identity ? { ...profile, displayName: identity.displayName, avatar: identity.avatar } : profile;
 }
 
 async function friends(token: string): Promise<{ friends: Friend[]; pending: PendingFriend[] }> {
   if (isLocalSessionToken(token) || !isApiConfigured()) {
     const local = await loadLocalFriends();
-    return { friends: local.map((friend) => ({ id: friend.peerId, displayName: friend.displayName, local: true })), pending: [] };
+    return { friends: local.map((friend) => ({ id: friend.peerId, displayName: friend.displayName, avatar: friend.avatar, local: true })), pending: [] };
   }
   return request<{ friends: Friend[]; pending: PendingFriend[] }>("/friends", { method: "GET", headers: { authorization: `Bearer ${token}` } });
 }

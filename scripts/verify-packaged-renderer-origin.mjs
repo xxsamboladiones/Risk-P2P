@@ -66,7 +66,13 @@ try {
   if (!Number.isInteger(report.rootChildren) || report.rootChildren < 1 || !Number.isInteger(report.rootTextLength) || report.rootTextLength < 1) {
     throw new Error("A origem foi carregada, mas o React não renderizou conteúdo. Possível tela preta no pacote.");
   }
-  console.log(`Renderer empacotado e interface React validados em ${report.origin} (${report.href}).`);
+  if (report.backendLoopback !== true || report.backendHealth !== true) {
+    throw new Error("O sidecar Rust empacotado não iniciou saudável no loopback autenticado.");
+  }
+  if (report.storageWritable !== true || report.indexedDbWritable !== true) {
+    throw new Error("A origem empacotada não conseguiu gravar localStorage/IndexedDB; a identidade P2P não seria persistente.");
+  }
+  console.log(`Renderer, sidecar e armazenamento local validados em ${report.origin} (${report.href}).`);
 } catch (error) {
   if (stdout.trim()) console.error(`stdout do aplicativo:\n${stdout.trim()}`);
   if (stderr.trim()) console.error(`stderr do aplicativo:\n${stderr.trim()}`);

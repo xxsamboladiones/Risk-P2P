@@ -2,7 +2,6 @@ import type {
   AnswerMessage,
   IceCandidateMessage,
   OfferMessage,
-  PeerProfileMessage,
   PeerStateMessage,
 } from "./types";
 
@@ -82,15 +81,6 @@ export function parsePeerState(value: unknown): PeerStateMessage | null {
     && (state.screenStreamId === undefined || typeof state.screenStreamId === "string")
     && (state.screenAudio === undefined || typeof state.screenAudio === "boolean");
   return valid ? value as PeerStateMessage : null;
-}
-
-export function parsePeerProfile(value: unknown): PeerProfileMessage | null {
-  if (!validBase(value, "peer.profile")) return null;
-  const payload = value.payload as RecordValue;
-  const displayName = payload.displayName;
-  return typeof displayName === "string" && displayName.trim().length >= 2 && displayName.length <= 100
-    ? value as PeerProfileMessage
-    : null;
 }
 
 export function isValidPeer(value: unknown): value is { peerId: string; joinedAt: number; clientVersion?: string } {

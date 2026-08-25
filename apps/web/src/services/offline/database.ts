@@ -1,5 +1,5 @@
 const DATABASE = "risk-offline";
-const VERSION = 3;
+const VERSION = 4;
 
 export const OFFLINE_STORES = {
   messages: "chat-messages",
@@ -9,6 +9,7 @@ export const OFFLINE_STORES = {
   attachments: "attachments",
   attachmentChunks: "attachment-chunks",
   syncCheckpoints: "sync-checkpoints",
+  outbox: "chat-outbox",
 } as const;
 
 export function openRiskDatabase(): Promise<IDBDatabase> {
@@ -41,6 +42,11 @@ export function openRiskDatabase(): Promise<IDBDatabase> {
         : database.createObjectStore(OFFLINE_STORES.syncCheckpoints, { keyPath: "id" });
       if (!checkpoints.indexNames.contains("channelId")) checkpoints.createIndex("channelId", "channelId", { unique: false });
       if (!checkpoints.indexNames.contains("remotePeerId")) checkpoints.createIndex("remotePeerId", "remotePeerId", { unique: false });
+
+      const outbox = database.objectStoreNames.contains(OFFLINE_STORES.outbox)
+        ? request.transaction!.objectStore(OFFLINE_STORES.outbox)
+        : database.createObjectStore(OFFLINE_STORES.outbox, { keyPath: "key" });
+      if (!outbox.indexNames.contains("channelId")) outbox.createIndex("channelId", "channelId", { unique: false });
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error("IndexedDB indisponível."));

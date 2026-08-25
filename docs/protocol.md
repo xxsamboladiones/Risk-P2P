@@ -36,8 +36,7 @@ Eventos utilizados pelo signaling:
 - `webrtc.offer`;
 - `webrtc.answer`;
 - `webrtc.ice-candidate`;
-- `peer.state`;
-- `peer.profile`.
+- `peer.state`.
 
 Cada payload usa envelope versão 1:
 
@@ -96,7 +95,7 @@ Ao sair, o provider executa `untrack`/remoção do canal e o transporte fecha Da
 }
 ```
 
-`peer.profile` transporta somente o nome de exibição necessário à interface. Esses dados são efêmeros e não substituem a identidade persistente da conta.
+Perfis não passam pelo Supabase. Nome, avatar e prova da identidade atravessam somente o DataChannel WebRTC.
 
 ## Chat por DataChannel
 
@@ -116,11 +115,23 @@ Mensagem wire versão 1:
 }
 ```
 
-O receptor valida canal, UUID da mensagem, tamanho, conteúdo e timestamp. O campo `author` continua no wire por compatibilidade, porém o `ChatController` não confia nele para a identidade exibida: a mensagem é associada ao `remotePeerId` real do DataChannel e ao `peer.profile` observado para aquele peer.
+O receptor valida canal, UUID da mensagem, tamanho, conteúdo, timestamp e assinatura ECDSA. O campo `author` da versão 1 permanece apenas para compatibilidade; sessões autenticadas utilizam a versão 2 assinada e a identidade já confiada localmente.
+
+Na versão 2, mensagens que ainda não receberam `chat.message.ack` permanecem em uma caixa de saída local. Elas são reenviadas quando um DataChannel autenticado abre e só são removidas após a confirmação do peer. IDs repetidos são deduplicados pelo receptor. Nada dessa fila passa pelo banco do Supabase.
+
+O perfil usa `chat.profile.update`, assinado pela identidade P2P. Avatares são limitados e não fazem parte dos snapshots recorrentes de membros, evitando inflar o manifesto do grupo.
+
+## Manifesto de grupo v2
+
+O proprietário e administradores autorizados distribuem pelo DataChannel um snapshot assinado com `manifestVersion`, `manifestActorPeerId`, `manifestOperationId`, `administratorEpoch`, `administratorGrants`, `membershipVersion`, canais, membros, `administratorPeerIds`, `removedPeerIds`, `rendezvousVersion`, `rendezvousSecret` e certificados de revogação. Revisões iguais são desempatadas de forma determinística; o proprietário vence um administrador no mesmo número de versão. Somente o proprietário incrementa `administratorEpoch` e muda cargos. Toda mudança de epoch gera novas delegações ECDSA para os administradores restantes. Um epoch mais novo substitui snapshots de administradores rebaixados. Administradores podem editar o grupo, os canais, criar convites e remover membros comuns.
+
+Cada remoção gera um certificado ECDSA independente. Quando o emissor é administrador, o certificado incorpora a delegação assinada pelo proprietário, permitindo verificação offline por membros com manifesto atrasado. Qualquer membro que já o possua pode retransmiti-lo pelo chat ou pela chamada, mas não pode alterá-lo. A remoção também troca o segredo usado para derivar os canais de rendezvous. O peer removido passa por autenticação apenas para receber o certificado; ele não recebe mensagens, histórico, outbox, anexos, estados de mídia ou tracks. O receptor apaga a cópia local do grupo e notifica a interface. Esse estado social continua local e P2P; Supabase Realtime é usado apenas para o rendezvous efêmero.
+
+O manifesto Alpha limita a lista ativa a 48 membros e o conjunto retransmissível a 48 certificados. Tombstones têm precedência sobre adições concorrentes e uma identidade revogada não pode ser readmitida no mesmo grupo.
 
 O transporte rejeita payloads acima de 64 KiB. O chat usa limite menor na validação e mensagens de até 4.000 caracteres. Quando `RTCDataChannel.bufferedAmount` ultrapassa o limite local de segurança, novas mensagens deixam de ser enfileiradas e o envio retorna falha ao chamador.
 
-O conteúdo do chat não passa pelo Supabase. No desktop, a cópia recebida é salva no SQLite local do sidecar; no modo web sem sidecar, o fallback usa IndexedDB.
+O conteúdo do chat não passa pelo Supabase. No desktop, a cópia recebida é salva no SQLite local do sidecar; no modo web sem sidecar, o fallback usa IndexedDB. O histórico é lido em páginas de até 100 mensagens pela interface, com limite defensivo de 200 itens por consulta.
 
 ## Convites temporários
 
@@ -198,7 +209,7 @@ Isso reduz exposição acidental da chave, embora qualquer código executado com
 ## Limitações deliberadas
 
 - sem peer online não existe entrega P2P remota;
-- Presence não é uma identidade de conta autenticada criptograficamente;
-- o chat ainda não assina cada mensagem com a identidade persistente;
-- conhecer/derivar um tópico Realtime não é o mesmo que passar por autorização de membership do backend;
+- Presence não é uma identidade de conta; a autorização acontece depois, pelo DataChannel;
+- sem o dono online, novos snapshots de membership não podem ser emitidos;
+- conhecer um tópico Realtime permite tentar negociar, mas a mídia de grupo continua bloqueada até a prova ECDSA;
 - Mesh é adequado a grupos pequenos; para grupos maiores seria necessário considerar SFU/arquitetura diferente.

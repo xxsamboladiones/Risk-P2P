@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { parseIceCandidate, parseOffer, parsePeerProfile, parsePeerState } from "./validation";
+import { parseIceCandidate, parseOffer, parsePeerState } from "./validation";
 
 const FROM = "00000000-0000-4000-8000-000000000001";
 const TARGET = "00000000-0000-4000-8000-000000000002";
@@ -28,12 +28,6 @@ describe("validação de signaling externo", () => {
   it("recusa ICE excessivo e estado malformado", () => {
     expect(parseIceCandidate(envelope("webrtc.ice-candidate", { candidate: { candidate: "x".repeat(4_097) } }))).toBeNull();
     expect(parsePeerState(envelope("peer.state", { state: { microphone: "yes", camera: false, screenShare: false } }))).toBeNull();
-  });
-
-  it("aceita apenas nomes de exibição pequenos e válidos", () => {
-    expect(parsePeerProfile(envelope("peer.profile", { displayName: "Maria" }))).not.toBeNull();
-    expect(parsePeerProfile(envelope("peer.profile", { displayName: "M" }))).toBeNull();
-    expect(parsePeerProfile(envelope("peer.profile", { displayName: "x".repeat(101) }))).toBeNull();
   });
 
   it("recusa timestamp futuro", () => {

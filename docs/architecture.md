@@ -68,7 +68,7 @@ Supabase é rendezvous/signaling efêmero:
 
 A sala é derivada antes de virar tópico Realtime. O provider rejeita mensagens próprias, mensagens destinadas a outro peer, mensagens duplicadas, antigas ou de peers que não estejam presentes no canal.
 
-Presence ainda usa identidade efêmera escolhida pelo cliente. O protocolo de convites possui identidade ECDSA permanente, mas signaling geral e chat ainda podem ser endurecidos com handshake/assinaturas ligadas à identidade P2P durável.
+Presence usa apenas identidade efêmera de transporte. Chats e chamadas de grupo executam um desafio ECDSA pelo DataChannel; na chamada, nenhuma track é anexada ao peer antes de sua identidade permanente corresponder ao roster local do grupo.
 
 ## WebRTC
 
@@ -82,12 +82,22 @@ O transporte implementa:
 - backpressure simples de DataChannel;
 - limpeza de tracks, peer connections e callbacks;
 - diagnóstico sem expor SDP ou credenciais completas.
+- autorização de mídia por peer;
+- ICE restart após desconexão prolongada;
+- bitrate de vídeo adaptado à quantidade de peers;
+- métricas locais de RTT, jitter, perda e bitrate.
 
 ## Chat P2P
 
 O chat negocia um DataChannel ordenado usando o mesmo modelo de signaling. Mensagens trafegam diretamente pelo WebRTC.
 
-O nome recebido não é confiado cegamente ao campo `author`; o cliente o associa ao peer conectado. Ainda falta ligar cada sessão de chat à identidade criptográfica permanente para uma garantia mais forte contra impersonação.
+Mensagens versão 2 são assinadas pela identidade ECDSA permanente. Antes de aceitar conteúdo ou histórico, os peers concluem um desafio bilateral e conferem a chave pública com a lista local de membros/amigos. Até oito canais locais podem manter sessões leves em segundo plano para não lidas e notificações.
+
+O proprietário e administradores autorizados podem assinar snapshots de membership. Cada administrador possui uma delegação ECDSA assinada pelo proprietário para um `administratorEpoch`; ao mudar cargos, o proprietário avança o epoch e renova todas as delegações restantes. O certificado de remoção inclui essa cadeia, portanto um peer atrasado consegue verificar a autoridade sem confiar cegamente no snapshot atual. Revisões usam versão, autor e ID de operação para desempatar edições concorrentes. Remoções são *remove-wins*, rotacionam o segredo efêmero de rendezvous do grupo e produzem um certificado retransmissível. Uma identidade revogada abre apenas o caminho restrito necessário para receber esse certificado: histórico, outbox, anexos e mídia permanecem bloqueados.
+
+Antes de autorizar DataChannel ou mídia, os peers anunciam versão do aplicativo e versões dos protocolos de chamada, chat e manifesto. Versões incompatíveis são recusadas com diagnóstico explícito, em vez de falharem silenciosamente durante SDP/ICE.
+
+Nesta fase Alpha, cada grupo aceita no máximo 48 membros ativos e conserva até 48 certificados de revogação. Uma chave revogada não pode ser readmitida no mesmo grupo: o retorno exige uma nova identidade P2P. O monitor de atividade acompanha até 32 grupos e o cliente mantém até oito chats autenticados em segundo plano.
 
 ## Convites P2P
 
@@ -113,6 +123,8 @@ Para redes em que conexão direta/STUN falha, o Risk deve usar:
 
 Esse serviço não precisa armazenar amigos, mensagens ou grupos.
 
+Sem uma URL `turn:`/`turns:` válida, o produto se declara `Somente STUN`; ele não promete conectividade universal e orienta o usuário quando ICE falha por NAT/CGNAT/firewall.
+
 ## Electron
 
 O processo desktop usa:
@@ -127,6 +139,8 @@ O processo desktop usa:
 - IPC validado por origem;
 - single-instance lock;
 - sidecar iniciado antes da UI ficar disponível.
+
+Se o sidecar encerrar depois do readiness, o processo principal faz uma única tentativa controlada de reinício, renova o endpoint/token de loopback e notifica o renderer. Se o renderer falhar, a janela tenta uma recarga; erros React restantes caem em uma tela de recuperação com relatório sanitizado.
 
 ## Empacotamento
 
@@ -157,5 +171,7 @@ Além da CI, validar manualmente:
 - upgrade sem perda de dados;
 - encerramento do sidecar junto com Electron;
 - dois PCs em redes diferentes;
-- fallback TURN em NAT restritivo;
+- diagnóstico explícito quando a conexão direta STUN falhar em NAT/CGNAT restritivo;
 - câmera, microfone e compartilhamento de tela/áudio.
+- promoção/rebaixamento de administrador e remoção com proprietário offline;
+- atualização de um banco 0.1 com grupos legados para o schema 0.2.

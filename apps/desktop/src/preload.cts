@@ -12,6 +12,11 @@ export type DesktopBackendConfig = {
   token: string;
 };
 
+export type DesktopBackendStatus = {
+  state: "restarting" | "recovered" | "failed";
+  message: string;
+};
+
 const FULLSCREEN_STYLE_ID = "risk-native-stream-fullscreen-style";
 const MIN_FULLSCREEN_ZOOM = 0.5;
 const MAX_FULLSCREEN_ZOOM = 5;
@@ -361,4 +366,9 @@ contextBridge.exposeInMainWorld("desktop", {
   selectScreenSource: (sourceId: string): Promise<void> => ipcRenderer.invoke("screen:select", sourceId),
   setWindowFullscreen: (enabled: boolean): Promise<{ fullscreen: boolean }> => ipcRenderer.invoke("window:fullscreen", enabled),
   getBackendConfig: (): Promise<DesktopBackendConfig> => ipcRenderer.invoke("backend:config"),
+  onBackendStatus: (callback: (status: DesktopBackendStatus) => void): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, status: DesktopBackendStatus) => callback(status);
+    ipcRenderer.on("backend:status", listener);
+    return () => ipcRenderer.removeListener("backend:status", listener);
+  },
 });

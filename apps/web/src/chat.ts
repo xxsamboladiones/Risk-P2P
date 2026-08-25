@@ -4,22 +4,45 @@ import { createAttachmentStorage } from "./services/attachments/desktop-storage"
 import type { StoredAttachmentRecord } from "./services/attachments/indexeddb-storage";
 import { SupabaseSignalingProvider } from "./services/supabase/signaling";
 import type { SignalingNamespace, SignalingProvider } from "./services/signaling/types";
-import { loadLocalMessages, saveLocalMessage, type LocalChatMessage } from "./services/offline/chat-storage";
 import {
+  compatibleAppVersion,
+  compatibleChatPeer,
+  incompatiblePeerMessage,
+  LOCAL_RISK_CAPABILITIES,
+  validRiskPeerCapabilities,
+  type RiskPeerCapabilities,
+} from "./services/protocol-compatibility";
+import { loadLocalMessages, saveLocalMessage, type LocalChatMessage, type MessagePageOptions } from "./services/offline/chat-storage";
+import { enqueueOutbox, loadOutbox, markOutboxAttempt, removeOutbox } from "./services/offline/outbox-storage";
+import { validAvatarDataUrl } from "./services/offline/profile";
+import {
+  applyGroupRevocationCertificate,
   getOrCreateLocalIdentity,
   loadLocalGroups,
-  mergeLocalGroupMembers,
+  mergeLocalGroupManifest,
+  updateKnownPeerProfile,
+  validGroupAdministratorGrant,
+  validGroupRevocationCertificate,
+  groupRendezvousId,
+  type GroupAdministratorGrant,
+  type GroupRevocationCertificate,
+  type LocalGroupChannel,
   type LocalIdentity,
   type PublicPeerIdentity,
 } from "./services/offline/social-storage";
 
-export type ChatConnectionStatus = "disconnected" | "connecting" | "connected" | "ready" | "error";
+export type ChatConnectionStatus = "disconnected" | "connecting" | "connected" | "ready" | "incompatible" | "error";
 export type ChatAttachmentRecord = StoredAttachmentRecord;
 export type ChatAttachmentProgress = AttachmentRuntimeState;
 
 export type ChatConnectionOptions = {
   identity?: LocalIdentity;
   trustedPeers?: PublicPeerIdentity[];
+  revokedPeers?: PublicPeerIdentity[];
+  revocations?: GroupRevocationCertificate[];
+  groupId?: string;
+  requireIdentityAuthentication?: boolean;
+  rendezvousId?: string;
   namespace?: SignalingNamespace;
   maxRemotePeers?: number;
 };
@@ -53,6 +76,7 @@ type IdentityChallengeWireMessage = {
   fromPeerId: string;
   nonce: string;
   timestamp: number;
+  capabilities: RiskPeerCapabilities;
 };
 
 type IdentityProofWireMessage = {
@@ -63,6 +87,7 @@ type IdentityProofWireMessage = {
   toPeerId: string;
   nonce: string;
   timestamp: number;
+  capabilities: RiskPeerCapabilities;
   signature: string;
 };
 
@@ -95,7 +120,35 @@ type GroupMembersWireMessage = {
   channelId: string;
   groupId: string;
   senderPeerId: string;
+  ownerPeerId: string;
+  membershipVersion: number;
+  manifestVersion: number;
+  manifestActorPeerId: string;
+  manifestOperationId: string;
+  administratorEpoch: number;
+  administratorGrants: GroupAdministratorGrant[];
+  name: string;
+  avatar?: string;
+  channels: LocalGroupChannel[];
+  administratorPeerIds: string[];
+  removedPeerIds: string[];
+  removedMembers: PublicPeerIdentity[];
+  revocations: GroupRevocationCertificate[];
+  rendezvousVersion: number;
+  rendezvousSecret: string;
   members: PublicPeerIdentity[];
+  timestamp: number;
+  signature: string;
+};
+
+type MessageAckWireMessage = { version: 2; type: "chat.message.ack"; channelId: string; messageId: string };
+type GroupRevocationWireMessage = { version: 2; type: "chat.group.revocation"; channelId: string; certificate: GroupRevocationCertificate };
+
+type ProfileUpdateWireMessage = {
+  version: 2;
+  type: "chat.profile.update";
+  channelId: string;
+  identity: PublicPeerIdentity;
   timestamp: number;
   signature: string;
 };
@@ -108,13 +161,18 @@ type ChatWireEnvelope =
   | HistoryRequestWireMessage
   | HistoryChunkWireMessage
   | HistoryCompleteWireMessage
-  | GroupMembersWireMessage;
+  | GroupMembersWireMessage
+  | ProfileUpdateWireMessage
+  | GroupRevocationWireMessage
+  | MessageAckWireMessage;
 
 const MAX_WIRE_BYTES = 64 * 1024;
 const MAX_HISTORY_IDS = 200;
 const HISTORY_CHUNK_MESSAGES = 8;
-const MAX_GROUP_SYNC_MEMBERS = 128;
+const MAX_GROUP_SYNC_MEMBERS = 48;
+const MAX_GROUP_SYNC_REVOCATIONS = 48;
 const LIVE_MESSAGE_MAX_AGE_MS = 120_000;
+const QUEUED_MESSAGE_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 const FUTURE_CLOCK_SKEW_MS = 30_000;
 const IDENTITY_HANDSHAKE_RETRY_MS = 1_200;
 const IDENTITY_HANDSHAKE_TIMEOUT_MS = 12_000;
@@ -126,6 +184,8 @@ export class ChatController {
   private attachmentService?: AttachmentService;
   private channelId?: string;
   private groupId?: string;
+  private rendezvousId?: string;
+  private signalingNamespace: SignalingNamespace = "chat";
   private peerId?: string;
   private displayName = "Participante";
   private identity?: LocalIdentity;
@@ -133,8 +193,11 @@ export class ChatController {
   private readonly processed = new Set<string>();
   private readonly dataChannelPeers = new Set<string>();
   private readonly openDataPeers = new Set<string>();
+  private readonly revocationOnlyPeers = new Set<string>();
   private readonly peerNames = new Map<string, string>();
   private readonly trustedPeers = new Map<string, PublicPeerIdentity>();
+  private readonly revokedPeers = new Map<string, PublicPeerIdentity>();
+  private revocations: GroupRevocationCertificate[] = [];
   private readonly verifyKeys = new Map<string, Promise<CryptoKey>>();
   private readonly pendingIdentityChallenges = new Map<string, string>();
   private readonly identityHandshakeTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -152,7 +215,7 @@ export class ChatController {
 
   constructor(private readonly createSignaling: () => SignalingProvider = () => new SupabaseSignalingProvider()) {}
 
-  history(channelId: string): Promise<LocalChatMessage[]> { return loadLocalMessages(channelId); }
+  history(channelId: string, options?: MessagePageOptions): Promise<LocalChatMessage[]> { return loadLocalMessages(channelId, options); }
 
   async attachmentHistory(channelId: string): Promise<StoredAttachmentRecord[]> {
     if (this.attachmentService && this.channelId === channelId) return this.attachmentService.history();
@@ -171,15 +234,24 @@ export class ChatController {
     const inferred = options.identity ? null : await inferLocalGroupSecurity(channelId, displayName);
     const identity = options.identity ?? inferred?.identity;
     const trustedPeers = options.trustedPeers ?? inferred?.trustedPeers ?? [];
+    const revokedPeers = options.revokedPeers ?? inferred?.revokedPeers ?? [];
+    if (options.requireIdentityAuthentication && !identity) {
+      throw new Error("A identidade P2P é obrigatória para conectar ao chat deste grupo.");
+    }
 
     this.channelId = channelId;
-    this.groupId = inferred?.groupId;
+    this.groupId = options.groupId ?? inferred?.groupId;
+    this.rendezvousId = options.rendezvousId ?? inferred?.rendezvousId ?? channelId;
+    this.signalingNamespace = options.namespace ?? "chat";
     this.identity = identity;
     this.peerId = identity?.peerId ?? crypto.randomUUID();
     this.displayName = displayName.trim();
     this.trustedPeers.clear();
+    this.revokedPeers.clear();
+    this.revocations = options.revocations ?? inferred?.revocations ?? [];
     this.verifyKeys.clear();
     for (const peer of trustedPeers) this.trustedPeers.set(peer.peerId, peer);
+    for (const peer of revokedPeers) this.revokedPeers.set(peer.peerId, peer);
     if (identity) {
       this.trustedPeers.set(identity.peerId, {
         peerId: identity.peerId,
@@ -221,11 +293,12 @@ export class ChatController {
       },
       onTransferMessage: (remotePeerId, data) => {
         if (this.sessionToken !== sessionToken) return;
+        if (!this.openDataPeers.has(remotePeerId)) return;
         void this.attachmentService?.handleTransferFrame(remotePeerId, data).catch((error) => console.warn("Frame de anexo rejeitado", error));
       },
       onTransferState: (remotePeerId, state) => {
         if (this.sessionToken !== sessionToken) return;
-        if (state === "open" && this.openDataPeers.has(remotePeerId)) void this.attachmentService?.peerReady(remotePeerId).catch(() => undefined);
+        if (state === "open" && this.openDataPeers.has(remotePeerId) && !this.revokedPeers.has(remotePeerId)) void this.attachmentService?.peerReady(remotePeerId).catch(() => undefined);
       },
     }, options.maxRemotePeers);
     this.transport = transport;
@@ -247,11 +320,10 @@ export class ChatController {
       this.unsubscribers.push(() => window.removeEventListener("risk:social-updated", refresh));
     }
     try {
-      await signaling.connect(channelId, this.peerId, options.namespace ?? "chat");
+      await signaling.connect(this.rendezvousId, this.peerId, this.signalingNamespace);
       if (this.sessionToken !== sessionToken) throw new DOMException("Conexão do chat substituída por outra sessão.", "AbortError");
       this.setStatus("connected");
       this.armReadyTimeout(sessionToken);
-      await signaling.sendPeerProfile(this.displayName);
       if (this.groupId) await this.refreshGroupMembership(false);
       else await this.connectPresentTrustedPeers();
     } catch (error) {
@@ -274,14 +346,19 @@ export class ChatController {
     this.attachmentService = undefined;
     this.channelId = undefined;
     this.groupId = undefined;
+    this.rendezvousId = undefined;
+    this.signalingNamespace = "chat";
     this.peerId = undefined;
     this.identity = undefined;
     this.refreshingMembers = undefined;
     this.clearReadyTimeout();
     this.dataChannelPeers.clear();
     this.openDataPeers.clear();
+    this.revocationOnlyPeers.clear();
     this.peerNames.clear();
     this.trustedPeers.clear();
+    this.revokedPeers.clear();
+    this.revocations = [];
     this.verifyKeys.clear();
     this.pendingIdentityChallenges.clear();
     this.identityHandshakeStartedAt.clear();
@@ -299,26 +376,15 @@ export class ChatController {
 
   async send(content: string): Promise<LocalChatMessage> {
     if (!this.channelId || !this.transport) throw new Error("Conecte o chat primeiro.");
-    if (this.openDataPeers.size === 0) throw new Error("Aguardando outro participante autenticar o chat P2P.");
     const trimmed = content.trim();
     if (!trimmed || trimmed.length > 4_000) throw new Error("Mensagem inválida.");
     const timestamp = Date.now();
 
     if (this.identity) {
-      const unsigned: Omit<SignedChatWireMessage, "signature"> = {
-        version: 2,
-        type: "chat.message",
-        channelId: this.channelId,
-        id: crypto.randomUUID(),
-        authorPeerId: this.identity.peerId,
-        author: this.displayName,
-        content: trimmed,
-        timestamp,
-      };
-      const wire: SignedChatWireMessage = { ...unsigned, signature: await this.signCanonical(canonicalSignedMessage(unsigned)) };
-      if (this.sendToAuthenticatedPeers(JSON.stringify(wire)) === 0) {
-        throw new Error("Nenhuma conexão P2P autenticada disponível ou os canais estão congestionados.");
-      }
+      const wire = await this.createSignedMessage(this.channelId, trimmed, timestamp);
+      const serialized = JSON.stringify(wire);
+      await enqueueOutbox(this.channelId, wire.id, serialized);
+      this.sendToAuthenticatedPeers(serialized);
       const local = signedToLocal(wire);
       this.remember(local.id);
       await saveLocalMessage(local);
@@ -340,6 +406,23 @@ export class ChatController {
     }
     const local = legacyToLocal(wire, this.displayName);
     this.remember(local.id);
+    await saveLocalMessage(local);
+    this.emitMessage(local);
+    return local;
+  }
+
+  async queue(channelId: string, content: string, displayName: string): Promise<LocalChatMessage> {
+    const trimmed = content.trim();
+    if (!trimmed || trimmed.length > 4_000) throw new Error("Mensagem inválida.");
+    const identity = await getOrCreateLocalIdentity(displayName);
+    const unsigned: Omit<SignedChatWireMessage, "signature"> = {
+      version: 2, type: "chat.message", channelId, id: crypto.randomUUID(), authorPeerId: identity.peerId,
+      author: identity.displayName, content: trimmed, timestamp: Date.now(),
+    };
+    const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, identity.privateKey, new TextEncoder().encode(canonicalSignedMessage(unsigned)));
+    const wire: SignedChatWireMessage = { ...unsigned, signature: bytesToBase64Url(new Uint8Array(signature)) };
+    await enqueueOutbox(channelId, wire.id, JSON.stringify(wire));
+    const local = signedToLocal(wire);
     await saveLocalMessage(local);
     this.emitMessage(local);
     return local;
@@ -393,6 +476,7 @@ export class ChatController {
   }
 
   private async receiveData(remotePeerId: string, raw: string): Promise<void> {
+    if (this.identity && this.rejectIncompatibleIdentityEnvelope(remotePeerId, raw)) return;
     if (this.openDataPeers.has(remotePeerId) && this.attachmentService) {
       try {
         if (await this.attachmentService.handleControlString(remotePeerId, raw)) return;
@@ -407,6 +491,10 @@ export class ChatController {
   private bindSignaling(signaling: SignalingProvider, peerId: string): void {
     this.unsubscribers.push(
       signaling.onPeerJoined((peer) => {
+        if (this.identity && peer.clientVersion && !compatibleAppVersion(peer.clientVersion)) {
+          this.rejectIncompatiblePeer(peer.peerId, peer.clientVersion);
+          return;
+        }
         if (!this.isTrustedRemote(peer.peerId)) {
           if (this.groupId) {
             void this.refreshGroupMembership(true).then(() => {
@@ -444,10 +532,6 @@ export class ChatController {
         if (!this.isTrustedRemote(message.fromPeerId)) return;
         void this.transport?.addIceCandidate(message.fromPeerId, message.payload.candidate).catch(() => undefined);
       }),
-      signaling.onPeerProfile((message) => {
-        if (!this.isTrustedRemote(message.fromPeerId)) return;
-        if (!this.peerNames.has(message.fromPeerId)) this.peerNames.set(message.fromPeerId, message.payload.displayName);
-      }),
       signaling.onStatusChange((status) => {
         if (status === "connected" && this.openDataPeers.size === 0) {
           this.setStatus("connected");
@@ -467,12 +551,12 @@ export class ChatController {
       this.setStatus(this.openDataPeers.size ? "ready" : "connected");
       if (this.sessionToken && this.openDataPeers.size === 0) this.armReadyTimeout(this.sessionToken);
     });
-    await this.signaling?.sendPeerProfile(this.displayName).catch(() => undefined);
   }
 
   private isTrustedRemote(remotePeerId: string): boolean {
     if (!this.identity) return remotePeerId !== this.peerId;
-    return remotePeerId !== this.identity.peerId && this.trustedPeers.has(remotePeerId);
+    return remotePeerId !== this.identity.peerId
+      && (this.trustedPeers.has(remotePeerId) || this.revokedPeers.has(remotePeerId));
   }
 
   private forgetPeerConnection(remotePeerId: string): void {
@@ -480,6 +564,7 @@ export class ChatController {
     this.identityHandshakeFailedPeers.delete(remotePeerId);
     this.dataChannelPeers.delete(remotePeerId);
     this.openDataPeers.delete(remotePeerId);
+    this.revocationOnlyPeers.delete(remotePeerId);
     this.pendingIdentityChallenges.delete(remotePeerId);
     this.historyRequests.delete(remotePeerId);
     this.attachmentService?.forgetPeer(remotePeerId);
@@ -505,6 +590,7 @@ export class ChatController {
       fromPeerId: this.identity.peerId,
       nonce,
       timestamp: now,
+      capabilities: LOCAL_RISK_CAPABILITIES,
     };
     this.pendingIdentityChallenges.set(remotePeerId, nonce);
     this.transport.sendData(JSON.stringify(challenge), remotePeerId);
@@ -569,6 +655,7 @@ export class ChatController {
       toPeerId: remotePeerId,
       nonce: challenge.nonce,
       timestamp: Date.now(),
+      capabilities: LOCAL_RISK_CAPABILITIES,
     };
     const proof: IdentityProofWireMessage = {
       ...unsigned,
@@ -592,21 +679,64 @@ export class ChatController {
     this.pendingIdentityChallenges.delete(remotePeerId);
     this.clearIdentityHandshake(remotePeerId);
     this.identityHandshakeFailedPeers.delete(remotePeerId);
-    this.markPeerReady(remotePeerId);
+    if (this.revokedPeers.has(remotePeerId)) this.markRevokedPeerReady(remotePeerId);
+    else this.markPeerReady(remotePeerId);
+  }
+
+  private rejectIncompatibleIdentityEnvelope(remotePeerId: string, raw: string): boolean {
+    if (new TextEncoder().encode(raw).byteLength > MAX_WIRE_BYTES) return false;
+    let parsed: unknown;
+    try { parsed = JSON.parse(raw); } catch { return false; }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const message = parsed as Record<string, unknown>;
+    if (message.type !== "chat.identity.challenge" && message.type !== "chat.identity.proof") return false;
+    if (!validRiskPeerCapabilities(message.capabilities) || !compatibleChatPeer(message.capabilities)) {
+      const version = validRiskPeerCapabilities(message.capabilities) ? message.capabilities.appVersion : undefined;
+      this.rejectIncompatiblePeer(remotePeerId, version);
+      return true;
+    }
+    return false;
+  }
+
+  private rejectIncompatiblePeer(remotePeerId: string, remoteVersion?: string): void {
+    console.warn(incompatiblePeerMessage(remoteVersion), { remotePeerId });
+    this.forgetPeerConnection(remotePeerId);
+    if (this.openDataPeers.size === 0) {
+      this.clearReadyTimeout();
+      this.setStatus("incompatible");
+    }
+    void this.transport?.disconnect(remotePeerId);
+  }
+
+  private markRevokedPeerReady(remotePeerId: string): void {
+    if (!this.dataChannelPeers.has(remotePeerId) || this.revocationOnlyPeers.has(remotePeerId)) return;
+    this.openDataPeers.delete(remotePeerId);
+    this.revocationOnlyPeers.add(remotePeerId);
+    this.clearReadyTimeout();
+    void this.sendRevocations(remotePeerId);
   }
 
   private markPeerReady(remotePeerId: string): void {
     if (!this.dataChannelPeers.has(remotePeerId) || this.openDataPeers.has(remotePeerId)) return;
+    if (this.revokedPeers.has(remotePeerId)) {
+      this.markRevokedPeerReady(remotePeerId);
+      return;
+    }
     this.clearIdentityHandshake(remotePeerId);
     this.identityHandshakeFailedPeers.delete(remotePeerId);
     this.openDataPeers.add(remotePeerId);
     this.clearReadyTimeout();
     this.setStatus("ready");
     void (async () => {
+      await this.sendProfileUpdate(remotePeerId);
       await this.sendGroupMembership(remotePeerId);
+      await this.flushOutbox(remotePeerId);
       await this.requestHistory(remotePeerId);
       await this.attachmentService?.peerReady(remotePeerId);
-    })();
+    })().catch((error) => {
+      console.warn("Falha ao preparar peer autenticado do chat", { remotePeerId, error });
+      if (this.openDataPeers.size === 0) this.setStatus("error");
+    });
   }
 
   private armReadyTimeout(sessionToken: object): void {
@@ -651,18 +781,39 @@ export class ChatController {
       await this.acceptIdentityProof(remotePeerId, envelope);
       return;
     }
-    if (this.identity && !this.openDataPeers.has(remotePeerId)) return;
+    if (envelope.type === "chat.group.revocation") {
+      if (!this.groupId || envelope.certificate.groupId !== this.groupId) return;
+      if (await applyGroupRevocationCertificate(envelope.certificate)) {
+        if (envelope.certificate.targetPeerId === this.identity?.peerId) await this.disconnect();
+        else await this.refreshGroupMembership(false).catch(() => undefined);
+      }
+      return;
+    }
+    if (this.identity && !this.openDataPeers.has(remotePeerId) && !this.revocationOnlyPeers.has(remotePeerId)) return;
+    // Uma identidade revogada só pode concluir o handshake e receber o
+    // certificado assinado que explica sua remoção. Todo o restante é negado.
+    if (this.revocationOnlyPeers.has(remotePeerId)) return;
+
+    if (envelope.type === "chat.message.ack") {
+      if (this.channelId) await removeOutbox(this.channelId, envelope.messageId);
+      return;
+    }
 
     if (envelope.type === "chat.message") {
-      if (this.processed.has(envelope.id)) return;
       if (envelope.version === 2) {
+        if (this.processed.has(envelope.id)) {
+          this.sendMessageAck(remotePeerId, envelope.id);
+          return;
+        }
         if (!this.identity || envelope.authorPeerId !== remotePeerId || !(await this.verifySignedMessage(envelope))) return;
         this.remember(envelope.id);
         const local = signedToLocal(envelope);
         await saveLocalMessage(local);
         this.emitMessage(local);
+        this.sendMessageAck(remotePeerId, envelope.id);
         return;
       }
+      if (this.processed.has(envelope.id)) return;
       if (this.identity) return;
       this.remember(envelope.id);
       const trustedDisplayName = this.peerNames.get(remotePeerId) ?? `Peer ${remotePeerId.slice(0, 6)}`;
@@ -675,10 +826,44 @@ export class ChatController {
     if (!this.identity) return;
     if (envelope.type === "chat.members.snapshot") {
       if (!this.groupId || envelope.groupId !== this.groupId || envelope.senderPeerId !== remotePeerId) return;
-      if (!(await this.verifyGroupMembership(envelope))) return;
-      const merged = await mergeLocalGroupMembers(this.groupId, envelope.members);
-      this.installTrustedPeers(merged.members);
+      const current = (await loadLocalGroups()).find((group) => group.groupId === this.groupId);
+      if (!current) return;
+      const senderAuthorized = current.ownerPeerId === remotePeerId || (current.administratorPeerIds ?? []).includes(remotePeerId);
+      if (!senderAuthorized || !(await this.verifyGroupMembership(envelope))) return;
+      // Apenas o proprietário pode mudar cargos. Um snapshot de administrador
+      // precisa preservar exatamente a lista de cargos já confiada localmente.
+      if (remotePeerId !== current.ownerPeerId
+        && (envelope.administratorEpoch !== (current.administratorEpoch ?? 1)
+          || JSON.stringify([...envelope.administratorPeerIds].sort()) !== JSON.stringify([...(current.administratorPeerIds ?? [])].sort()))) return;
+      const merged = await mergeLocalGroupManifest({
+        ...current,
+        name: envelope.name,
+        avatar: envelope.avatar,
+        channels: envelope.channels,
+        members: envelope.members,
+        ownerPeerId: envelope.ownerPeerId,
+        membershipVersion: envelope.membershipVersion,
+        manifestVersion: envelope.manifestVersion,
+        manifestActorPeerId: envelope.manifestActorPeerId,
+        manifestOperationId: envelope.manifestOperationId,
+        administratorEpoch: envelope.administratorEpoch,
+        administratorGrants: envelope.administratorGrants,
+        administratorPeerIds: envelope.administratorPeerIds,
+        removedPeerIds: envelope.removedPeerIds,
+        removedMembers: envelope.removedMembers,
+        revocations: envelope.revocations,
+        rendezvousVersion: envelope.rendezvousVersion,
+        rendezvousSecret: envelope.rendezvousSecret,
+      }, remotePeerId);
+      this.installGroupPeers(merged.members ?? [], merged.removedMembers ?? [], merged.revocations ?? []);
       await this.connectPresentTrustedPeers();
+      return;
+    }
+    if (envelope.type === "chat.profile.update") {
+      if (envelope.identity.peerId !== remotePeerId || !(await this.verifyCanonical(remotePeerId, envelope.signature, canonicalProfileUpdate(envelope)))) return;
+      await updateKnownPeerProfile(envelope.identity);
+      this.trustedPeers.set(remotePeerId, envelope.identity);
+      this.peerNames.set(remotePeerId, envelope.identity.displayName);
       return;
     }
     if (envelope.type === "chat.history.request") {
@@ -750,19 +935,45 @@ export class ChatController {
     this.refreshingMembers = (async () => {
       const group = (await loadLocalGroups()).find((item) => item.groupId === this.groupId);
       if (!group) return;
-      this.installTrustedPeers(group.members);
+      const nextRendezvousId = this.channelId ? groupRendezvousId(group, "chat", this.channelId) : undefined;
+      const rendezvousChanged = Boolean(nextRendezvousId && this.rendezvousId && nextRendezvousId !== this.rendezvousId);
+      this.installGroupPeers(group.members ?? [], group.removedMembers ?? [], group.revocations ?? []);
       await this.connectPresentTrustedPeers();
       if (broadcast) await Promise.all([...this.openDataPeers].map((peerId) => this.sendGroupMembership(peerId)));
+      if (rendezvousChanged && nextRendezvousId && this.signaling && this.peerId) {
+        this.rendezvousId = nextRendezvousId;
+        this.setStatus("connecting");
+        await this.signaling.connect(nextRendezvousId, this.peerId, this.signalingNamespace);
+        this.setStatus("connected");
+        await this.connectPresentTrustedPeers();
+      }
     })().finally(() => { this.refreshingMembers = undefined; });
     return this.refreshingMembers;
   }
 
-  private installTrustedPeers(peers: PublicPeerIdentity[]): void {
-    for (const peer of peers) {
-      const current = this.trustedPeers.get(peer.peerId);
-      if (current && !samePeerPublicKey(current, peer)) continue;
+  private installGroupPeers(activePeers: PublicPeerIdentity[], revokedPeers: PublicPeerIdentity[], revocations: GroupRevocationCertificate[]): void {
+    const active = new Map(activePeers.map((peer) => [peer.peerId, peer]));
+    const revoked = new Map(revokedPeers.filter((peer) => !active.has(peer.peerId)).map((peer) => [peer.peerId, peer]));
+    this.trustedPeers.clear();
+    this.revokedPeers.clear();
+    this.verifyKeys.clear();
+    this.peerNames.clear();
+    for (const peer of active.values()) {
       this.trustedPeers.set(peer.peerId, peer);
       this.peerNames.set(peer.peerId, peer.displayName);
+    }
+    for (const peer of revoked.values()) this.revokedPeers.set(peer.peerId, peer);
+    this.revocations = revocations.filter(validGroupRevocationCertificate);
+
+    for (const remotePeerId of [...this.dataChannelPeers]) {
+      if (this.revokedPeers.has(remotePeerId)) {
+        this.openDataPeers.delete(remotePeerId);
+        this.attachmentService?.forgetPeer(remotePeerId);
+        this.markRevokedPeerReady(remotePeerId);
+      } else if (!this.trustedPeers.has(remotePeerId)) {
+        this.forgetPeerConnection(remotePeerId);
+        void this.transport?.disconnect(remotePeerId);
+      }
     }
   }
 
@@ -775,14 +986,33 @@ export class ChatController {
   private async sendGroupMembership(remotePeerId: string): Promise<void> {
     if (!this.groupId || !this.identity || !this.channelId || !this.transport || !this.openDataPeers.has(remotePeerId)) return;
     const group = (await loadLocalGroups()).find((item) => item.groupId === this.groupId);
-    if (!group) return;
-    const members = group.members.slice(0, MAX_GROUP_SYNC_MEMBERS);
+    if (!group || (group.ownerPeerId !== this.identity.peerId && !(group.administratorPeerIds ?? []).includes(this.identity.peerId))) return;
+    // Avatares mudam com frequência e são sincronizados pelo evento de perfil
+    // assinado. O manifesto mantém apenas a identidade estável do membro.
+    const members = (group.members ?? []).slice(0, MAX_GROUP_SYNC_MEMBERS).map(({ avatar: _avatar, ...member }) => member);
+    const removedMembers = (group.removedMembers ?? []).slice(0, MAX_GROUP_SYNC_MEMBERS).map(({ avatar: _avatar, ...member }) => member);
     const unsigned: Omit<GroupMembersWireMessage, "signature"> = {
       version: 2,
       type: "chat.members.snapshot",
       channelId: this.channelId,
       groupId: this.groupId,
       senderPeerId: this.identity.peerId,
+      ownerPeerId: group.ownerPeerId,
+      membershipVersion: group.membershipVersion,
+      manifestVersion: group.manifestVersion,
+      manifestActorPeerId: group.manifestActorPeerId ?? group.ownerPeerId,
+      manifestOperationId: group.manifestOperationId ?? `legacy-${group.manifestVersion}`,
+      administratorEpoch: group.administratorEpoch ?? 1,
+      administratorGrants: group.administratorGrants ?? [],
+      name: group.name,
+      avatar: group.avatar,
+      channels: group.channels,
+      administratorPeerIds: group.administratorPeerIds ?? [],
+      removedPeerIds: group.removedPeerIds ?? [],
+      removedMembers,
+      revocations: (group.revocations ?? []).slice(-MAX_GROUP_SYNC_REVOCATIONS),
+      rendezvousVersion: group.rendezvousVersion ?? 1,
+      rendezvousSecret: group.rendezvousSecret ?? group.groupId,
       members,
       timestamp: Date.now(),
     };
@@ -790,6 +1020,41 @@ export class ChatController {
       ...unsigned,
       signature: await this.signCanonical(canonicalGroupMembership(unsigned)),
     };
+    const serialized = JSON.stringify(message);
+    if (new TextEncoder().encode(serialized).byteLength > MAX_WIRE_BYTES) {
+      throw new Error("O manifesto do grupo excedeu o limite P2P seguro. Remova canais ou identidades antigas antes de sincronizar.");
+    }
+    this.transport.sendData(serialized, remotePeerId);
+  }
+
+  private async sendRevocations(remotePeerId: string): Promise<void> {
+    if (!this.channelId || !this.transport || !this.revocationOnlyPeers.has(remotePeerId)) return;
+    for (const certificate of this.revocations.filter((item) => item.targetPeerId === remotePeerId)) {
+      const message: GroupRevocationWireMessage = {
+        version: 2,
+        type: "chat.group.revocation",
+        channelId: this.channelId,
+        certificate,
+      };
+      this.transport.sendData(JSON.stringify(message), remotePeerId);
+    }
+  }
+
+  private async sendProfileUpdate(remotePeerId: string): Promise<void> {
+    if (!this.identity || !this.channelId || !this.transport || !this.openDataPeers.has(remotePeerId)) return;
+    const unsigned: Omit<ProfileUpdateWireMessage, "signature"> = {
+      version: 2,
+      type: "chat.profile.update",
+      channelId: this.channelId,
+      identity: {
+        peerId: this.identity.peerId,
+        publicKey: this.identity.publicKey,
+        displayName: this.identity.displayName,
+        avatar: this.identity.avatar,
+      },
+      timestamp: Date.now(),
+    };
+    const message: ProfileUpdateWireMessage = { ...unsigned, signature: await this.signCanonical(canonicalProfileUpdate(unsigned)) };
     this.transport.sendData(JSON.stringify(message), remotePeerId);
   }
 
@@ -798,6 +1063,33 @@ export class ChatController {
     let sent = 0;
     for (const peerId of this.openDataPeers) sent += this.transport.sendData(data, peerId);
     return sent;
+  }
+
+  private async createSignedMessage(channelId: string, content: string, timestamp: number): Promise<SignedChatWireMessage> {
+    if (!this.identity) throw new Error("Identidade P2P indisponível para assinar dados.");
+    const unsigned: Omit<SignedChatWireMessage, "signature"> = {
+      version: 2, type: "chat.message", channelId, id: crypto.randomUUID(), authorPeerId: this.identity.peerId,
+      author: this.displayName, content, timestamp,
+    };
+    return { ...unsigned, signature: await this.signCanonical(canonicalSignedMessage(unsigned)) };
+  }
+
+  private async flushOutbox(remotePeerId: string): Promise<void> {
+    if (!this.channelId || !this.transport || !this.openDataPeers.has(remotePeerId)) return;
+    for (const record of await loadOutbox(this.channelId)) {
+      const envelope = parseChatWireEnvelope(record.wire, this.channelId);
+      if (!envelope || envelope.type !== "chat.message" || envelope.version !== 2) {
+        await removeOutbox(this.channelId, record.messageId);
+        continue;
+      }
+      if (this.transport.sendData(record.wire, remotePeerId) > 0) await markOutboxAttempt(record);
+    }
+  }
+
+  private sendMessageAck(remotePeerId: string, messageId: string): void {
+    if (!this.channelId || !this.transport || !this.openDataPeers.has(remotePeerId)) return;
+    const ack: MessageAckWireMessage = { version: 2, type: "chat.message.ack", channelId: this.channelId, messageId };
+    this.transport.sendData(JSON.stringify(ack), remotePeerId);
   }
 
   private async signCanonical(value: string): Promise<string> {
@@ -819,7 +1111,7 @@ export class ChatController {
   }
 
   private async verifyCanonical(peerId: string, signature: string, canonical: string): Promise<boolean> {
-    const peer = this.trustedPeers.get(peerId);
+    const peer = this.trustedPeers.get(peerId) ?? this.revokedPeers.get(peerId);
     if (!peer) return false;
     try {
       let key = this.verifyKeys.get(peer.peerId);
@@ -868,13 +1160,16 @@ export async function privateConversationId(peerA: string, peerB: string): Promi
 async function inferLocalGroupSecurity(
   channelId: string,
   displayName: string,
-): Promise<{ groupId: string; identity: LocalIdentity; trustedPeers: PublicPeerIdentity[] } | null> {
+): Promise<{ groupId: string; identity: LocalIdentity; trustedPeers: PublicPeerIdentity[]; revokedPeers: PublicPeerIdentity[]; revocations: GroupRevocationCertificate[]; rendezvousId: string } | null> {
   const group = (await loadLocalGroups()).find((item) => item.channels.some((channel) => channel.kind === "text" && channel.id === channelId));
   if (!group) return null;
   return {
     groupId: group.groupId,
     identity: await getOrCreateLocalIdentity(displayName),
-    trustedPeers: group.members,
+    trustedPeers: group.members ?? [],
+    revokedPeers: group.removedMembers ?? [],
+    revocations: group.revocations ?? [],
+    rendezvousId: groupRendezvousId(group, "chat", channelId),
   };
 }
 
@@ -894,6 +1189,13 @@ function parseChatWireEnvelope(raw: string, channelId?: string): ChatWireEnvelop
   if (message.version === 2 && message.type === "chat.identity.challenge") return parseIdentityChallenge(message, channelId);
   if (message.version === 2 && message.type === "chat.identity.proof") return parseIdentityProof(message, channelId);
   if (message.version === 2 && message.type === "chat.members.snapshot") return parseGroupMembership(message, channelId);
+  if (message.version === 2 && message.type === "chat.group.revocation" && validGroupRevocationCertificate(message.certificate)) {
+    return { version: 2, type: "chat.group.revocation", channelId: channelId!, certificate: message.certificate };
+  }
+  if (message.version === 2 && message.type === "chat.profile.update") return parseProfileUpdate(message, channelId);
+  if (message.version === 2 && message.type === "chat.message.ack" && validWireId(message.messageId)) {
+    return { version: 2, type: "chat.message.ack", channelId: channelId!, messageId: message.messageId };
+  }
 
   if (message.version !== 2 || !validWireId(message.requestId)) return null;
   const requestId = message.requestId as string;
@@ -930,7 +1232,7 @@ function parseSignedMessageObject(value: unknown, channelId?: string, allowHisto
   const now = Date.now();
   const timestampValid = typeof message.timestamp === "number" && Number.isFinite(message.timestamp)
     && message.timestamp > 0 && message.timestamp <= now + FUTURE_CLOCK_SKEW_MS
-    && (allowHistorical || message.timestamp >= now - LIVE_MESSAGE_MAX_AGE_MS);
+    && (allowHistorical || message.timestamp >= now - QUEUED_MESSAGE_MAX_AGE_MS);
   return message.version === 2 && message.type === "chat.message" && message.channelId === channelId
     && validWireId(message.id) && validWireId(message.authorPeerId)
     && typeof message.author === "string" && message.author.trim().length >= 2 && message.author.length <= 80
@@ -941,7 +1243,7 @@ function parseSignedMessageObject(value: unknown, channelId?: string, allowHisto
 }
 
 function parseIdentityChallenge(message: Record<string, unknown>, channelId?: string): IdentityChallengeWireMessage | null {
-  if (!validWireId(message.fromPeerId) || !validWireId(message.nonce) || !freshTimestamp(message.timestamp)) return null;
+  if (!validWireId(message.fromPeerId) || !validWireId(message.nonce) || !freshTimestamp(message.timestamp) || !validRiskPeerCapabilities(message.capabilities)) return null;
   return {
     version: 2,
     type: "chat.identity.challenge",
@@ -949,11 +1251,12 @@ function parseIdentityChallenge(message: Record<string, unknown>, channelId?: st
     fromPeerId: message.fromPeerId,
     nonce: message.nonce,
     timestamp: message.timestamp,
+    capabilities: message.capabilities,
   } as IdentityChallengeWireMessage;
 }
 
 function parseIdentityProof(message: Record<string, unknown>, channelId?: string): IdentityProofWireMessage | null {
-  if (!validWireId(message.fromPeerId) || !validWireId(message.toPeerId) || !validWireId(message.nonce) || !freshTimestamp(message.timestamp)) return null;
+  if (!validWireId(message.fromPeerId) || !validWireId(message.toPeerId) || !validWireId(message.nonce) || !freshTimestamp(message.timestamp) || !validRiskPeerCapabilities(message.capabilities)) return null;
   if (typeof message.signature !== "string" || !/^[A-Za-z0-9_-]{16,256}$/.test(message.signature)) return null;
   return {
     version: 2,
@@ -963,13 +1266,27 @@ function parseIdentityProof(message: Record<string, unknown>, channelId?: string
     toPeerId: message.toPeerId,
     nonce: message.nonce,
     timestamp: message.timestamp,
+    capabilities: message.capabilities,
     signature: message.signature,
   } as IdentityProofWireMessage;
 }
 
 function parseGroupMembership(message: Record<string, unknown>, channelId?: string): GroupMembersWireMessage | null {
   if (!validWireId(message.groupId) || !validWireId(message.senderPeerId)) return null;
+  if (!validWireId(message.ownerPeerId) || !Number.isSafeInteger(message.membershipVersion) || Number(message.membershipVersion) < 1) return null;
   if (!Array.isArray(message.members) || message.members.length === 0 || message.members.length > MAX_GROUP_SYNC_MEMBERS) return null;
+  if (!Number.isSafeInteger(message.manifestVersion) || Number(message.manifestVersion) < 1) return null;
+  if (!validWireId(message.manifestActorPeerId) || !validWireId(message.manifestOperationId)) return null;
+  if (!Number.isSafeInteger(message.administratorEpoch) || Number(message.administratorEpoch) < 1) return null;
+  if (!Array.isArray(message.administratorGrants) || message.administratorGrants.length > MAX_GROUP_SYNC_MEMBERS || !message.administratorGrants.every(validGroupAdministratorGrant)) return null;
+  if (typeof message.name !== "string" || message.name.trim().length < 2 || message.name.length > 80) return null;
+  if (message.avatar !== undefined && !validAvatarDataUrl(message.avatar)) return null;
+  if (!Array.isArray(message.channels) || message.channels.length > 100 || !message.channels.every(isLocalGroupChannel)) return null;
+  if (!Array.isArray(message.administratorPeerIds) || message.administratorPeerIds.length > 64 || !message.administratorPeerIds.every(validWireId)) return null;
+  if (!Array.isArray(message.removedPeerIds) || message.removedPeerIds.length > 256 || !message.removedPeerIds.every(validWireId)) return null;
+  if (!Array.isArray(message.removedMembers) || message.removedMembers.length > MAX_GROUP_SYNC_MEMBERS || !message.removedMembers.every(isPublicPeerIdentity)) return null;
+  if (!Array.isArray(message.revocations) || message.revocations.length > MAX_GROUP_SYNC_REVOCATIONS || !message.revocations.every(validGroupRevocationCertificate)) return null;
+  if (!Number.isSafeInteger(message.rendezvousVersion) || Number(message.rendezvousVersion) < 1 || !validWireId(message.rendezvousSecret)) return null;
   if (!message.members.every(isPublicPeerIdentity) || !freshTimestamp(message.timestamp)) return null;
   if (typeof message.signature !== "string" || !/^[A-Za-z0-9_-]{16,256}$/.test(message.signature)) return null;
   return {
@@ -978,6 +1295,22 @@ function parseGroupMembership(message: Record<string, unknown>, channelId?: stri
     channelId: channelId!,
     groupId: message.groupId,
     senderPeerId: message.senderPeerId,
+    ownerPeerId: message.ownerPeerId,
+    membershipVersion: Number(message.membershipVersion),
+    manifestVersion: Number(message.manifestVersion),
+    manifestActorPeerId: message.manifestActorPeerId,
+    manifestOperationId: message.manifestOperationId,
+    administratorEpoch: Number(message.administratorEpoch),
+    administratorGrants: message.administratorGrants,
+    name: message.name,
+    avatar: typeof message.avatar === "string" ? message.avatar : undefined,
+    channels: message.channels,
+    administratorPeerIds: [...new Set(message.administratorPeerIds as string[])],
+    removedPeerIds: [...new Set(message.removedPeerIds as string[])],
+    removedMembers: message.removedMembers,
+    revocations: message.revocations,
+    rendezvousVersion: Number(message.rendezvousVersion),
+    rendezvousSecret: message.rendezvousSecret,
     members: message.members,
     timestamp: message.timestamp,
     signature: message.signature,
@@ -1006,6 +1339,7 @@ function canonicalIdentityProof(message: Omit<IdentityProofWireMessage, "signatu
     toPeerId: message.toPeerId,
     nonce: message.nonce,
     timestamp: message.timestamp,
+    capabilities: message.capabilities,
   });
 }
 
@@ -1016,19 +1350,57 @@ function canonicalGroupMembership(message: Omit<GroupMembersWireMessage, "signat
     channelId: message.channelId,
     groupId: message.groupId,
     senderPeerId: message.senderPeerId,
-    members: [...message.members]
-      .sort((left, right) => left.peerId.localeCompare(right.peerId))
-      .map((member) => ({
-        peerId: member.peerId,
-        displayName: member.displayName,
-        avatar: member.avatar ?? null,
-        publicKey: {
-          kty: member.publicKey.kty ?? null,
-          crv: member.publicKey.crv ?? null,
-          x: member.publicKey.x ?? null,
-          y: member.publicKey.y ?? null,
-        },
-      })),
+    ownerPeerId: message.ownerPeerId,
+    membershipVersion: message.membershipVersion,
+    manifestVersion: message.manifestVersion,
+    manifestActorPeerId: message.manifestActorPeerId,
+    manifestOperationId: message.manifestOperationId,
+    administratorEpoch: message.administratorEpoch,
+    administratorGrants: [...message.administratorGrants].sort((left, right) => left.administratorPeerId.localeCompare(right.administratorPeerId)),
+    name: message.name,
+    avatar: message.avatar ?? null,
+    channels: [...message.channels].sort((left, right) => left.id.localeCompare(right.id)),
+    administratorPeerIds: [...message.administratorPeerIds].sort(),
+    removedPeerIds: [...message.removedPeerIds].sort(),
+    removedMembers: canonicalPeerIdentities(message.removedMembers),
+    revocations: [...message.revocations].sort((left, right) => left.messageId.localeCompare(right.messageId)),
+    rendezvousVersion: message.rendezvousVersion,
+    rendezvousSecret: message.rendezvousSecret,
+    members: canonicalPeerIdentities(message.members),
+    timestamp: message.timestamp,
+  });
+}
+
+function canonicalPeerIdentities(members: PublicPeerIdentity[]): object[] {
+  return [...members].sort((left, right) => left.peerId.localeCompare(right.peerId)).map((member) => ({
+    peerId: member.peerId,
+    displayName: member.displayName,
+    avatar: member.avatar ?? null,
+    publicKey: {
+      kty: member.publicKey.kty ?? null,
+      crv: member.publicKey.crv ?? null,
+      x: member.publicKey.x ?? null,
+      y: member.publicKey.y ?? null,
+    },
+  }));
+}
+
+function canonicalProfileUpdate(message: Omit<ProfileUpdateWireMessage, "signature"> | ProfileUpdateWireMessage): string {
+  return JSON.stringify({
+    version: 2,
+    type: "chat.profile.update",
+    channelId: message.channelId,
+    identity: {
+      peerId: message.identity.peerId,
+      displayName: message.identity.displayName,
+      avatar: message.identity.avatar ?? null,
+      publicKey: {
+        kty: message.identity.publicKey.kty ?? null,
+        crv: message.identity.publicKey.crv ?? null,
+        x: message.identity.publicKey.x ?? null,
+        y: message.identity.publicKey.y ?? null,
+      },
+    },
     timestamp: message.timestamp,
   });
 }
@@ -1070,9 +1442,12 @@ function isPublicPeerIdentity(value: unknown): value is PublicPeerIdentity {
   const identity = value as Record<string, unknown>;
   if (!validWireId(identity.peerId)) return false;
   if (typeof identity.displayName !== "string" || identity.displayName.trim().length < 2 || identity.displayName.length > 80) return false;
+  if (identity.avatar !== undefined && !validAvatarDataUrl(identity.avatar)) return false;
   if (!identity.publicKey || typeof identity.publicKey !== "object") return false;
   const key = identity.publicKey as JsonWebKey;
-  return key.kty === "EC" && key.crv === "P-256" && typeof key.x === "string" && typeof key.y === "string";
+  return key.kty === "EC" && key.crv === "P-256"
+    && typeof key.x === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(key.x)
+    && typeof key.y === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(key.y);
 }
 
 function samePeerPublicKey(left: PublicPeerIdentity, right: PublicPeerIdentity): boolean {
@@ -1116,4 +1491,18 @@ function triggerDownload(blob: Blob, filename: string): void {
   anchor.rel = "noopener";
   anchor.click();
   setTimeout(() => URL.revokeObjectURL(url), 30_000);
+}
+
+function parseProfileUpdate(message: Record<string, unknown>, channelId?: string): ProfileUpdateWireMessage | null {
+  if (!isPublicPeerIdentity(message.identity) || !freshTimestamp(message.timestamp)) return null;
+  if (typeof message.signature !== "string" || !/^[A-Za-z0-9_-]{16,256}$/.test(message.signature)) return null;
+  return { version: 2, type: "chat.profile.update", channelId: channelId!, identity: message.identity, timestamp: message.timestamp, signature: message.signature };
+}
+
+function isLocalGroupChannel(value: unknown): value is LocalGroupChannel {
+  if (!value || typeof value !== "object") return false;
+  const channel = value as Record<string, unknown>;
+  return validWireId(channel.id) && typeof channel.name === "string" && channel.name.trim().length >= 1 && channel.name.length <= 80
+    && (channel.kind === "text" || channel.kind === "voice")
+    && (channel.voiceRoomId === undefined || channel.voiceRoomId === null || validWireId(channel.voiceRoomId));
 }

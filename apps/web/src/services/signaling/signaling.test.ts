@@ -34,16 +34,6 @@ describe("InMemorySignalingProvider", () => {
     expect(answerA).toHaveBeenCalledOnce(); expect(iceB).toHaveBeenCalledOnce();
   });
 
-  it("envia o nome necessário por Broadcast efêmero, fora do Presence", async () => {
-    const hub = new InMemorySignalingHub();
-    const a = new InMemorySignalingProvider(hub); const b = new InMemorySignalingProvider(hub);
-    const profile = vi.fn(); b.onPeerProfile(profile);
-    await a.connect("room", A); await b.connect("room", B);
-    await a.sendPeerProfile("Maria");
-    expect(profile).toHaveBeenCalledWith(expect.objectContaining({ payload: { displayName: "Maria" } }));
-    expect(a.getDiagnostics().presencePeers).toEqual([B]);
-  });
-
   it("ignora mensagens próprias e duplicadas", async () => {
     const hub = new InMemorySignalingHub();
     const a = new InMemorySignalingProvider(hub); const b = new InMemorySignalingProvider(hub);

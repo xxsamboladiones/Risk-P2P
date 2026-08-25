@@ -1,4 +1,4 @@
-import { loadLocalGroups, saveLocalGroup, type LocalGroupChannel } from "./social-storage";
+import { canManageLocalGroup, loadLocalGroups, loadLocalIdentity, nextGroupManifestRevision, saveLocalGroup, type LocalGroupChannel } from "./social-storage";
 
 function validateChannelName(name: string): string {
   const normalized = name.trim();
@@ -15,6 +15,8 @@ export async function renameLocalGroupChannel(
 ): Promise<LocalGroupChannel> {
   const group = (await loadLocalGroups()).find((item) => item.groupId === groupId);
   if (!group) throw new Error("Grupo local não encontrado.");
+  const identity = await loadLocalIdentity();
+  if (!identity || !canManageLocalGroup(group, identity.peerId)) throw new Error("Somente administradores do grupo podem alterar canais.");
 
   const index = group.channels.findIndex((channel) => channel.id === channelId);
   if (index < 0) throw new Error("Canal não encontrado.");
@@ -24,6 +26,7 @@ export async function renameLocalGroupChannel(
     name: validateChannelName(name),
   };
   group.channels[index] = updated;
+  Object.assign(group, nextGroupManifestRevision(group, identity.peerId));
   await saveLocalGroup(group);
   return updated;
 }
@@ -31,10 +34,13 @@ export async function renameLocalGroupChannel(
 export async function deleteLocalGroupChannel(groupId: string, channelId: string): Promise<void> {
   const group = (await loadLocalGroups()).find((item) => item.groupId === groupId);
   if (!group) throw new Error("Grupo local não encontrado.");
+  const identity = await loadLocalIdentity();
+  if (!identity || !canManageLocalGroup(group, identity.peerId)) throw new Error("Somente administradores do grupo podem alterar canais.");
 
   const index = group.channels.findIndex((channel) => channel.id === channelId);
   if (index < 0) throw new Error("Canal não encontrado.");
 
   group.channels.splice(index, 1);
+  Object.assign(group, nextGroupManifestRevision(group, identity.peerId));
   await saveLocalGroup(group);
 }

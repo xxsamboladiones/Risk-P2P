@@ -3,7 +3,6 @@ import type {
   AnswerMessage,
   IceCandidateMessage,
   OfferMessage,
-  PeerProfileMessage,
   PeerStateMessage,
   SignalingDiagnostics,
   SignalingEnvelope,
@@ -12,8 +11,9 @@ import type {
   SignalingNamespace,
   SignalingStatus,
 } from "./types";
+import { RISK_APP_VERSION } from "../protocol-compatibility";
 
-type TestEnvelope = OfferMessage | AnswerMessage | IceCandidateMessage | PeerStateMessage | PeerProfileMessage;
+type TestEnvelope = OfferMessage | AnswerMessage | IceCandidateMessage | PeerStateMessage;
 type Listener<T> = (value: T) => void;
 
 export class InMemorySignalingHub {
@@ -63,10 +63,12 @@ export class InMemorySignalingProvider implements SignalingProvider {
   private readonly answers = new Set<Listener<AnswerMessage>>();
   private readonly ice = new Set<Listener<IceCandidateMessage>>();
   private readonly peerStates = new Set<Listener<PeerStateMessage>>();
-  private readonly peerProfiles = new Set<Listener<PeerProfileMessage>>();
   private readonly statuses = new Set<Listener<SignalingStatus>>();
 
-  constructor(private readonly hub: InMemorySignalingHub) {}
+  constructor(
+    private readonly hub: InMemorySignalingHub,
+    private readonly clientVersion = RISK_APP_VERSION,
+  ) {}
 
   get currentPeerId(): string { return this.peerId ?? ""; }
 
@@ -104,7 +106,6 @@ export class InMemorySignalingProvider implements SignalingProvider {
     return this.send("webrtc.ice-candidate", targetPeerId, { candidate });
   }
   sendPeerState(state: PeerState): Promise<void> { return this.send("peer.state", undefined, { state }); }
-  sendPeerProfile(displayName: string): Promise<void> { return this.send("peer.profile", undefined, { displayName: displayName.trim() }); }
 
   onPeerJoined(callback: Listener<SignalingPeer>): () => void { return add(this.peerJoined, callback); }
   onPeerLeft(callback: Listener<string>): () => void { return add(this.peerLeft, callback); }
@@ -112,7 +113,6 @@ export class InMemorySignalingProvider implements SignalingProvider {
   onAnswer(callback: Listener<AnswerMessage>): () => void { return add(this.answers, callback); }
   onIceCandidate(callback: Listener<IceCandidateMessage>): () => void { return add(this.ice, callback); }
   onPeerState(callback: Listener<PeerStateMessage>): () => void { return add(this.peerStates, callback); }
-  onPeerProfile(callback: Listener<PeerProfileMessage>): () => void { return add(this.peerProfiles, callback); }
   onStatusChange(callback: Listener<SignalingStatus>): () => void { return add(this.statuses, callback); }
 
   getDiagnostics(): SignalingDiagnostics {
@@ -145,11 +145,10 @@ export class InMemorySignalingProvider implements SignalingProvider {
       case "webrtc.answer": this.answers.forEach((callback) => callback(envelope)); break;
       case "webrtc.ice-candidate": this.ice.forEach((callback) => callback(envelope)); break;
       case "peer.state": this.peerStates.forEach((callback) => callback(envelope)); break;
-      case "peer.profile": this.peerProfiles.forEach((callback) => callback(envelope)); break;
     }
   }
 
-  private asPeer(): SignalingPeer { return { peerId: this.peerId!, joinedAt: Date.now(), clientVersion: "test" }; }
+  private asPeer(): SignalingPeer { return { peerId: this.peerId!, joinedAt: Date.now(), clientVersion: this.clientVersion }; }
 
   private async send<Type extends TestEnvelope["type"], Payload>(type: Type, targetPeerId: string | undefined, payload: Payload): Promise<void> {
     if (!this.roomId || !this.peerId || this.status !== "connected") throw new Error("Provider em memória desconectado.");

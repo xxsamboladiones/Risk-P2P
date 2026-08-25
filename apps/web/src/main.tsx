@@ -4,17 +4,25 @@ import {
   Hash,
   Headphones,
   LogOut,
+  Maximize2,
   MessageCircle,
+  Mic,
+  MicOff,
   Pencil,
   Plus,
   Settings2,
+  Shield,
+  ShieldCheck,
   Sparkles,
   Trash2,
   UserMinus,
   UserPlus,
   Users,
+  Video,
+  VideoOff,
+  PhoneOff,
 } from "lucide-react";
-import { api, type Channel, type ChatMessage, type Community, type CurrentUser, type Friend, type PendingFriend } from "./api";
+import { api, resetApiRuntimeConfig, type Channel, type ChatMessage, type Community, type CurrentUser, type Friend, type PendingFriend } from "./api";
 import { CallController } from "./call";
 import {
   ChatController,
@@ -24,11 +32,21 @@ import {
   type ChatConnectionStatus,
 } from "./chat";
 import { CallWorkspace } from "./components/CallWorkspace";
+import { AppErrorBoundary } from "./components/AppErrorBoundary";
 import { ConversationTimeline } from "./components/ConversationTimeline";
 import { GroupInvitePanel } from "./components/GroupInvitePanel";
+import { GroupEditor } from "./components/GroupEditor";
 import { MessageComposer } from "./components/MessageComposer";
+import { LocalStoragePanel } from "./components/LocalStoragePanel";
+import { Modal } from "./components/Modal";
 import { P2PInvitePanel } from "./components/P2PInvitePanel";
+import { ProfileAvatar } from "./components/ProfileAvatar";
+import { ProfileEditor } from "./components/ProfileEditor";
 import { VoiceVideoSettingsPanel } from "./components/VoiceVideoSettingsPanel";
+import type { LocalProfile } from "./services/offline/profile";
+import { incompatiblePeerMessage } from "./services/protocol-compatibility";
+import { resetChatStorageRuntime } from "./services/offline/chat-storage";
+import { dedupeMembersForDisplay } from "./services/offline/member-display";
 import { deleteLocalGroupChannel, renameLocalGroupChannel } from "./services/offline/channel-storage";
 import {
   addLocalGroupChannel,
@@ -36,16 +54,26 @@ import {
   deleteLocalFriend,
   deleteLocalGroup,
   getOrCreateLocalIdentity,
+  groupRendezvousId,
   loadLocalFriends,
   loadLocalGroups,
   publicIdentity,
+  removeLocalGroupMember,
+  resetSocialStorageRuntime,
+  setLocalGroupAdministrator,
+  type LocalGroup,
   type PublicPeerIdentity,
 } from "./services/offline/social-storage";
 import { useCallStore } from "./store";
+import { BackgroundChatManager } from "./services/chat/background-manager";
+import { VoiceActivityDirectory, type VoiceActivity } from "./services/supabase/voice-activity";
 import "./styles.css";
 
 const call = new CallController();
 const chat = new ChatController();
+const callChat = new ChatController();
+const backgroundChats = new BackgroundChatManager();
+const voiceActivities = new VoiceActivityDirectory();
 let sessionRestore: Promise<string | null> | undefined;
 let sessionRestoreSuppressed = false;
 
@@ -94,31 +122,21 @@ function Auth() {
   </section></main>;
 }
 
-function Modal({ title, children, onClose }: { title: string; children: React.ReactNode; onClose(): void }) {
-  return <div className="modal-backdrop" onMouseDown={onClose}>
-    <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
-      <button className="modal-close" onClick={onClose}>×</button><h2>{title}</h2>{children}</section>
-  </div>;
-}
-
-type SocialModal = "friend" | "group" | "channel" | "member" | "joinGroup" | "settings" | null;
+type SocialModal = "friend" | "group" | "groupProfile" | "channel" | "inviteMember" | "manageMember" | "joinGroup" | "settings" | "profile" | null;
 type DeleteTarget = { kind: "friend"; friend: Friend } | { kind: "group"; group: Community } | null;
 type ChannelActionTarget = { mode: "edit" | "delete"; channel: Channel } | null;
-
-function dedupeMembersForDisplay(members: PublicPeerIdentity[]): PublicPeerIdentity[] {
-  const unique = new Map<string, PublicPeerIdentity>();
-  for (const member of members) {
-    const key = member.displayName.trim().normalize("NFKC").toLocaleLowerCase();
-    if (!key || unique.has(key)) continue;
-    unique.set(key, member);
-  }
-  return [...unique.values()];
-}
 
 function SocialHome() {
   const token = useCallStore((state) => state.token)!;
   const reset = useCallStore((state) => state.reset);
   const setRoom = useCallStore((state) => state.setRoom);
+  const roomId = useCallStore((state) => state.roomId);
+  const callContext = useCallStore((state) => state.callContext);
+  const callWorkspaceOpen = useCallStore((state) => state.callWorkspaceOpen);
+  const setCallContext = useCallStore((state) => state.setCallContext);
+  const setCallWorkspaceOpen = useCallStore((state) => state.setCallWorkspaceOpen);
+  const localCallState = useCallStore((state) => state.localState);
+  const callParticipants = useCallStore((state) => state.participants);
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [communities, setCommunities] = useState<Community[]>([]);
   const [friends, setFriends] = useState<Friend[]>([]);
@@ -127,9 +145,16 @@ function SocialHome() {
   const [activeFriend, setActiveFriend] = useState<Friend | null>(null);
   const [privateChannelId, setPrivateChannelId] = useState<string | null>(null);
   const [groupMembers, setGroupMembers] = useState<PublicPeerIdentity[]>([]);
+  const [selectedLocalGroup, setSelectedLocalGroup] = useState<LocalGroup | null>(null);
+  const [canEditSelectedGroup, setCanEditSelectedGroup] = useState(false);
+  const [localIdentityPeerId, setLocalIdentityPeerId] = useState("");
+  const [selectedMember, setSelectedMember] = useState<PublicPeerIdentity | null>(null);
+  const [memberSaving, setMemberSaving] = useState(false);
   const [channels, setChannels] = useState<Channel[]>([]);
   const [activeChannel, setActiveChannel] = useState<Channel | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [hasOlderMessages, setHasOlderMessages] = useState(false);
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
   const [attachments, setAttachments] = useState<ChatAttachmentRecord[]>([]);
   const [attachmentProgress, setAttachmentProgress] = useState<Record<string, ChatAttachmentProgress | undefined>>({});
   const [modal, setModal] = useState<SocialModal>(null);
@@ -139,6 +164,56 @@ function SocialHome() {
   const [channelSaving, setChannelSaving] = useState(false);
   const [error, setError] = useState("");
   const [chatStatus, setChatStatus] = useState<ChatConnectionStatus>("disconnected");
+  const [unreadChannels, setUnreadChannels] = useState<Record<string, number>>({});
+  const [activeVoiceRooms, setActiveVoiceRooms] = useState<VoiceActivity[]>([]);
+  const [messageSearch, setMessageSearch] = useState("");
+
+  useEffect(() => backgroundChats.onUnread((items) => setUnreadChannels(Object.fromEntries(items))), []);
+  useEffect(() => voiceActivities.onChange(setActiveVoiceRooms), []);
+
+  useEffect(() => {
+    const removed = (event: Event) => {
+      const detail = (event as CustomEvent<{ groupId: string; groupName: string }>).detail;
+      if (!detail) return;
+      setError(`Você foi removido do grupo ${detail.groupName}. O grupo foi removido deste dispositivo.`);
+      setCommunities((items) => items.filter((group) => group.id !== detail.groupId));
+      if (selectedCommunity?.id === detail.groupId) {
+        setSelectedCommunity(null);
+        setChannels([]);
+        setActiveChannel(null);
+      }
+      if (callContext?.groupId === detail.groupId && roomId) {
+        void call.leave(roomId);
+        setRoom(null);
+        setCallContext(null);
+        setCallWorkspaceOpen(false);
+      }
+    };
+    window.addEventListener("risk:group-removed", removed);
+    return () => window.removeEventListener("risk:group-removed", removed);
+  }, [callContext?.groupId, roomId, selectedCommunity?.id]);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    let alive = true;
+    void Promise.all([loadLocalGroups(), getOrCreateLocalIdentity(currentUser.displayName)])
+      .then(([groups, identity]) => alive ? voiceActivities.sync(groups, identity.peerId) : undefined)
+      .catch((cause) => { if (alive) setError(cause instanceof Error ? cause.message : "Falha ao observar salas de voz"); });
+    return () => { alive = false; };
+  }, [communities, currentUser]);
+
+  useEffect(() => {
+    if (!roomId) void voiceActivities.clearPublished();
+  }, [roomId]);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    let alive = true;
+    void Promise.all([loadLocalGroups(), api.turnCredentials(token)])
+      .then(([groups, { iceServers }]) => { if (alive) return backgroundChats.sync(groups, currentUser.displayName, iceServers, activeChannel?.id); })
+      .catch(() => undefined);
+    return () => { alive = false; };
+  }, [activeChannel?.id, currentUser, communities, token]);
 
   async function loadSocial() {
     const [social, groups, localFriends, localGroups] = await Promise.all([
@@ -150,14 +225,14 @@ function SocialHome() {
     const mergedFriends = [...social.friends];
     localFriends.forEach((friend) => {
       const existing = mergedFriends.find((item) => item.id === friend.peerId);
-      if (existing) existing.local = true;
-      else mergedFriends.push({ id: friend.peerId, displayName: friend.displayName, local: true });
+      if (existing) Object.assign(existing, { local: true, displayName: friend.displayName, avatar: friend.avatar });
+      else mergedFriends.push({ id: friend.peerId, displayName: friend.displayName, avatar: friend.avatar, local: true });
     });
     const mergedGroups = [...groups];
     localGroups.forEach((group) => {
       const existing = mergedGroups.find((item) => item.id === group.groupId);
-      if (existing) existing.local = true;
-      else mergedGroups.push({ id: group.groupId, name: group.name, local: true });
+      if (existing) Object.assign(existing, { local: true, name: group.name, avatar: group.avatar });
+      else mergedGroups.push({ id: group.groupId, name: group.name, avatar: group.avatar, local: true });
     });
     setFriends(mergedFriends);
     setPending(social.pending);
@@ -200,15 +275,24 @@ function SocialHome() {
   useEffect(() => {
     let alive = true;
     async function loadMembers() {
-      if (!selectedCommunity?.local) { if (alive) setGroupMembers([]); return; }
-      const group = (await loadLocalGroups()).find((item) => item.groupId === selectedCommunity.id);
-      if (alive) setGroupMembers(dedupeMembersForDisplay(group?.members ?? []));
+      if (!selectedCommunity?.local) { if (alive) { setGroupMembers([]); setSelectedLocalGroup(null); setCanEditSelectedGroup(false); setLocalIdentityPeerId(""); } return; }
+      const [groups, identity] = await Promise.all([
+        loadLocalGroups(),
+        getOrCreateLocalIdentity(currentUser?.displayName ?? "Participante"),
+      ]);
+      const group = groups.find((item) => item.groupId === selectedCommunity.id);
+      if (alive) {
+        setSelectedLocalGroup(group ?? null);
+        setLocalIdentityPeerId(identity.peerId);
+        setCanEditSelectedGroup(Boolean(group && (group.ownerPeerId === identity.peerId || (group.administratorPeerIds ?? []).includes(identity.peerId))));
+        setGroupMembers(dedupeMembersForDisplay(group?.members ?? [], publicIdentity(identity)));
+      }
     }
-    void loadMembers().catch(() => { if (alive) setGroupMembers([]); });
+    void loadMembers().catch(() => { if (alive) { setGroupMembers([]); setSelectedLocalGroup(null); setCanEditSelectedGroup(false); } });
     const reload = () => { void loadMembers().catch(() => undefined); };
     window.addEventListener("risk:social-updated", reload);
     return () => { alive = false; window.removeEventListener("risk:social-updated", reload); };
-  }, [selectedCommunity]);
+  }, [selectedCommunity, currentUser?.displayName, currentUser?.avatar]);
 
   useEffect(() => {
     if (!selectedCommunity) { setChannels([]); setActiveChannel(null); return; }
@@ -231,7 +315,7 @@ function SocialHome() {
 
   useEffect(() => {
     const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
-    if (!conversationId) { setMessages([]); setAttachments([]); setAttachmentProgress({}); return; }
+    if (!conversationId) { setMessages([]); setHasOlderMessages(false); setAttachments([]); setAttachmentProgress({}); return; }
     let alive = true;
     const offMessage = chat.onMessage((message) => {
       if (!alive) return;
@@ -240,7 +324,11 @@ function SocialHome() {
         return [...current, message].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
       });
     });
-    const offStatus = chat.onStatus((status) => { if (alive) setChatStatus(status); });
+    const offStatus = chat.onStatus((status) => {
+      if (!alive) return;
+      setChatStatus(status);
+      if (status === "incompatible") setError(incompatiblePeerMessage());
+    });
     const offAttachment = chat.onAttachment((record) => {
       if (!alive || record.channelId !== conversationId) return;
       setAttachments((current) => upsertAttachment(current, record));
@@ -254,6 +342,7 @@ function SocialHome() {
       .then(([chatItems, attachmentItems]) => {
         if (!alive) return;
         setMessages([...chatItems].sort((a, b) => a.createdAt.localeCompare(b.createdAt)));
+        setHasOlderMessages(chatItems.length === 100);
         setAttachments(dedupeAttachments(attachmentItems));
       })
       .catch((cause) => setError(cause instanceof Error ? cause.message : "Falha no histórico local"));
@@ -269,18 +358,55 @@ function SocialHome() {
     };
   }, [activeChannel, activeFriend, privateChannelId]);
 
-  async function enterVoice(channel: Channel) {
+  useEffect(() => setMessageSearch(""), [activeChannel?.id, activeFriend?.id]);
+
+  async function enterVoice(channel: Channel, community = selectedCommunity, availableChannels = channels) {
     if (!channel.voiceRoomId) return;
+    if (roomId === channel.voiceRoomId) {
+      setCallWorkspaceOpen(true);
+      return;
+    }
     try {
-      const { iceServers } = await api.turnCredentials(token);
-      await call.join(token, channel.voiceRoomId, iceServers);
+      const [{ iceServers }, identity, localGroups] = await Promise.all([
+        api.turnCredentials(token),
+        getOrCreateLocalIdentity(currentUser?.displayName ?? "Participante"),
+        loadLocalGroups(),
+      ]);
+      const localGroup = localGroups.find((group) => group.groupId === community?.id);
+      if (community?.local && !localGroup) {
+        throw new Error("Os dados locais deste grupo não estão disponíveis. A chamada foi bloqueada para proteger sua identidade e mídia.");
+      }
+      await call.join(token, channel.voiceRoomId, iceServers, localGroup
+        ? {
+            identity,
+            trustedPeers: localGroup.members,
+            revokedPeers: localGroup.removedMembers ?? [],
+            revocations: localGroup.revocations,
+            groupId: localGroup.groupId,
+            rendezvousId: groupRendezvousId(localGroup, "voice", channel.voiceRoomId),
+            requireIdentityAuthentication: true,
+          }
+        : {});
+      const textChannel = availableChannels.find((item) => item.kind === "text") ?? null;
+      setCallContext({
+        groupId: community?.id ?? "",
+        groupName: community?.name ?? "Grupo",
+        voiceChannelId: channel.id,
+        voiceChannelName: channel.name,
+        textChannelId: textChannel?.id ?? null,
+        textChannelName: textChannel?.name ?? null,
+        displayName: currentUser?.displayName ?? "Participante",
+        avatar: currentUser?.avatar,
+      });
       setRoom(channel.voiceRoomId);
+      if (localGroup) void voiceActivities.publish(localGroup, channel.id, channel.voiceRoomId, identity.peerId).catch(() => undefined);
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Não foi possível entrar na voz"); }
   }
 
   async function connectChat() {
     if (!currentUser) return;
     try {
+      if ("Notification" in window && Notification.permission === "default") void Notification.requestPermission();
       const { iceServers } = await api.turnCredentials(token);
       if (activeFriend) {
         if (!activeFriend.local || !privateChannelId) throw new Error("Esta conversa privada P2P ainda não está pronta.");
@@ -299,18 +425,58 @@ function SocialHome() {
         return;
       }
       if (!activeChannel || activeChannel.kind !== "text") return;
-      await chat.connect(activeChannel.id, currentUser.displayName, iceServers);
+      const [identity, groups] = await Promise.all([
+        getOrCreateLocalIdentity(currentUser.displayName),
+        loadLocalGroups(),
+      ]);
+      const group = groups.find((item) => item.groupId === selectedCommunity?.id);
+      if (selectedCommunity?.local && !group) {
+        throw new Error("Os dados locais deste grupo não estão disponíveis. O chat foi bloqueado para evitar uma conexão sem autenticação.");
+      }
+      await chat.connect(activeChannel.id, currentUser.displayName, iceServers, group ? {
+        identity,
+        trustedPeers: group.members,
+        revokedPeers: group.removedMembers ?? [],
+        revocations: group.revocations,
+        groupId: group.groupId,
+        rendezvousId: groupRendezvousId(group, "chat", activeChannel.id),
+        requireIdentityAuthentication: true,
+      } : {});
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Falha ao conectar o chat"); }
   }
 
   async function submitMessage(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!activeFriend && !activeChannel) return;
+    const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
+    if (!conversationId || !currentUser) return;
     const input = event.currentTarget.elements.namedItem("message") as HTMLInputElement;
     const content = input.value.trim();
     if (!content) return;
-    try { await chat.send(content); input.value = ""; }
+    try {
+      if (chatStatus === "disconnected" || chatStatus === "error" || chatStatus === "incompatible") await chat.queue(conversationId, content, currentUser.displayName);
+      else await chat.send(content);
+      input.value = "";
+    }
     catch (cause) { setError(cause instanceof Error ? cause.message : "Falha ao enviar mensagem"); }
+  }
+
+  async function loadOlderMessages(): Promise<void> {
+    const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
+    const before = messages[0]?.createdAt;
+    if (!conversationId || !before || loadingOlderMessages) return;
+    setLoadingOlderMessages(true);
+    try {
+      const older = await chat.history(conversationId, { before, limit: 100 });
+      setHasOlderMessages(older.length === 100);
+      setMessages((current) => {
+        const known = new Set(current.map((message) => message.id));
+        return [...older.filter((message) => !known.has(message.id)), ...current]
+          .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+      });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Falha ao carregar mensagens antigas");
+    } finally { setLoadingOlderMessages(false); }
   }
 
   async function sendFiles(files: File[]) {
@@ -413,13 +579,69 @@ function SocialHome() {
   async function logout() {
     sessionRestoreSuppressed = true;
     sessionRestore = undefined;
-    try { await api.logout(); }
+    try {
+      if (roomId) await call.leave(roomId);
+      await voiceActivities.disconnect();
+      await Promise.all([chat.disconnect(), callChat.disconnect()]);
+      await api.logout();
+    }
     catch { /* logout local continua mesmo se a API estiver indisponível */ }
     finally { reset(); }
   }
 
+  function profileSaved(profile: LocalProfile): void {
+    setCurrentUser((current) => current ? { ...current, ...profile } : current);
+    void getOrCreateLocalIdentity(profile.displayName).then((identity) => {
+      const self = publicIdentity(identity);
+      setGroupMembers((members) => dedupeMembersForDisplay(members, self));
+    }).catch(() => undefined);
+    setCallContext(callContext ? { ...callContext, ...profile } : null);
+    if (roomId) call.updateProfile(profile.displayName, profile.avatar);
+    setModal(null);
+    void loadSocial();
+    window.dispatchEvent(new Event("risk:social-updated"));
+  }
+
+  function groupSaved(group: LocalGroup): void {
+    const updated: Community = { id: group.groupId, name: group.name, avatar: group.avatar, local: true };
+    setCommunities((items) => items.map((item) => item.id === group.groupId ? { ...item, ...updated } : item));
+    setSelectedCommunity((current) => current?.id === group.groupId ? { ...current, ...updated } : current);
+    setSelectedLocalGroup(group);
+    if (callContext?.groupId === group.groupId) setCallContext({ ...callContext, groupName: group.name });
+    setModal(null);
+    void loadSocial();
+  }
+
+  async function changeMemberRole(administrator: boolean): Promise<void> {
+    if (!selectedLocalGroup || !selectedMember || memberSaving) return;
+    setMemberSaving(true);
+    try {
+      const updated = await setLocalGroupAdministrator(selectedLocalGroup.groupId, selectedMember.peerId, administrator);
+      setSelectedLocalGroup(updated);
+      setModal(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível alterar o cargo.");
+    } finally { setMemberSaving(false); }
+  }
+
+  async function removeSelectedMember(): Promise<void> {
+    if (!selectedLocalGroup || !selectedMember || memberSaving) return;
+    setMemberSaving(true);
+    try {
+      const updated = await removeLocalGroupMember(selectedLocalGroup.groupId, selectedMember.peerId);
+      setSelectedLocalGroup(updated);
+      setGroupMembers(dedupeMembersForDisplay(updated.members));
+      setModal(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível remover o membro.");
+    } finally { setMemberSaving(false); }
+  }
+
+  const visibleMessages = messageSearch.trim()
+    ? messages.filter((message) => `${message.author} ${message.content}`.toLocaleLowerCase().includes(messageSearch.trim().toLocaleLowerCase()))
+    : messages;
   const timeline = <ConversationTimeline
-    messages={messages}
+    messages={visibleMessages}
     attachments={attachments}
     progress={attachmentProgress}
     connected={chatStatus === "ready"}
@@ -436,33 +658,54 @@ function SocialHome() {
       <aside className="space-rail">
         <button className={!selectedCommunity ? "space active" : "space"} onClick={() => { setSelectedCommunity(null); setActiveFriend(null); }} title="Amigos"><Sparkles/></button>
         <div className="rail-separator"/>
-        {communities.map((group) => <button key={group.id} className={selectedCommunity?.id === group.id ? "space active" : "space"} onClick={() => { setActiveFriend(null); setSelectedCommunity(group); }} title={group.name}>{group.name.slice(0, 2).toUpperCase()}</button>)}
+        {communities.map((group) => <button key={group.id} className={selectedCommunity?.id === group.id ? "space active" : "space"} onClick={() => { setActiveFriend(null); setSelectedCommunity(group); }} title={group.name}><ProfileAvatar displayName={group.name} avatar={group.avatar} className="group-space-avatar"/></button>)}
         <button className="space add" onClick={() => setModal("group")} title="Criar grupo"><Plus/></button>
       </aside>
 
-      <aside className="navigation">
-        <div className="nav-title"><span>{selectedCommunity?.name ?? activeFriend?.displayName ?? "Risk"}</span>{selectedCommunity && <button className="nav-danger" title="Apagar ou sair do grupo" aria-label="Apagar ou sair do grupo" onClick={() => setDeleteTarget({ kind: "group", group: selectedCommunity })}><Trash2 size={16}/></button>}</div>
+      <aside className={`navigation ${roomId ? "in-call" : ""}`}>
+        <div className="nav-title"><span>{selectedCommunity?.name ?? activeFriend?.displayName ?? "Risk"}</span>{selectedCommunity && <div className="nav-title-actions">{canEditSelectedGroup && <button className="nav-edit" title="Personalizar grupo" aria-label="Personalizar grupo" onClick={() => setModal("groupProfile")}><Pencil size={16}/></button>}<button className="nav-danger" title="Apagar ou sair do grupo" aria-label="Apagar ou sair do grupo" onClick={() => setDeleteTarget({ kind: "group", group: selectedCommunity })}><Trash2 size={16}/></button></div>}</div>
         {selectedCommunity ? <>
-          <div className="nav-section"><span>CANAIS DE TEXTO</span><button onClick={() => setModal("channel")}><Plus size={15}/></button></div>
+          <div className="nav-section"><span>CANAIS DE TEXTO</span>{canEditSelectedGroup && <button onClick={() => setModal("channel")}><Plus size={15}/></button>}</div>
           {channels.filter((item) => item.kind === "text").map((channel) => <div className="channel-item" key={channel.id}>
-            <button className={activeChannel?.id === channel.id ? "channel active" : "channel"} onClick={() => setActiveChannel(channel)}><Hash/><span>{channel.name}</span></button>
-            {selectedCommunity.local && <div className="channel-actions"><button title="Renomear canal" aria-label={`Renomear ${channel.name}`} onClick={() => setChannelAction({ mode: "edit", channel })}><Pencil size={14}/></button><button className="delete" title="Apagar canal" aria-label={`Apagar ${channel.name}`} onClick={() => setChannelAction({ mode: "delete", channel })}><Trash2 size={14}/></button></div>}
+            <button className={activeChannel?.id === channel.id ? "channel active" : "channel"} onClick={() => { backgroundChats.clear(channel.id); setActiveChannel(channel); }}><Hash/><span>{channel.name}</span>{Boolean(unreadChannels[channel.id]) && <small className="unread-badge">{unreadChannels[channel.id]}</small>}</button>
+            {selectedCommunity.local && canEditSelectedGroup && <div className="channel-actions"><button title="Renomear canal" aria-label={`Renomear ${channel.name}`} onClick={() => setChannelAction({ mode: "edit", channel })}><Pencil size={14}/></button><button className="delete" title="Apagar canal" aria-label={`Apagar ${channel.name}`} onClick={() => setChannelAction({ mode: "delete", channel })}><Trash2 size={14}/></button></div>}
           </div>)}
-          <div className="nav-section"><span>SALAS DE VOZ</span><button onClick={() => setModal("channel")}><Plus size={15}/></button></div>
+          <div className="nav-section"><span>SALAS DE VOZ</span>{canEditSelectedGroup && <button onClick={() => setModal("channel")}><Plus size={15}/></button>}</div>
           {channels.filter((item) => item.kind === "voice").map((channel) => <div className="channel-item" key={channel.id}>
-            <button className="channel voice" onClick={() => void enterVoice(channel)}><Headphones/><span>{channel.name}</span></button>
-            {selectedCommunity.local && <div className="channel-actions"><button title="Renomear sala de voz" aria-label={`Renomear ${channel.name}`} onClick={() => setChannelAction({ mode: "edit", channel })}><Pencil size={14}/></button><button className="delete" title="Apagar sala de voz" aria-label={`Apagar ${channel.name}`} onClick={() => setChannelAction({ mode: "delete", channel })}><Trash2 size={14}/></button></div>}
+            <button className={`channel voice ${roomId === channel.voiceRoomId ? "connected" : ""}`} onClick={() => void enterVoice(channel)}><Headphones/><span>{channel.name}</span>{roomId === channel.voiceRoomId && <small>{Object.keys(callParticipants).length + 1}</small>}</button>
+            {selectedCommunity.local && canEditSelectedGroup && <div className="channel-actions"><button title="Renomear sala de voz" aria-label={`Renomear ${channel.name}`} onClick={() => setChannelAction({ mode: "edit", channel })}><Pencil size={14}/></button><button className="delete" title="Apagar sala de voz" aria-label={`Apagar ${channel.name}`} onClick={() => setChannelAction({ mode: "delete", channel })}><Trash2 size={14}/></button></div>}
           </div>)}
-          <div className="nav-section"><span>MEMBROS</span><button onClick={() => setModal("member")}><UserPlus size={15}/></button></div>
-          {dedupeMembersForDisplay(groupMembers).slice(0, 8).map((member) => <div className="mini-user" key={member.peerId}><i>{member.displayName[0]?.toUpperCase()}</i><span>{member.displayName}</span></div>)}
+          <div className="nav-section"><span>MEMBROS — {dedupeMembersForDisplay(groupMembers).length}</span>{canEditSelectedGroup && <button onClick={() => setModal("inviteMember")}><UserPlus size={15}/></button>}</div>
+          {dedupeMembersForDisplay(groupMembers).map((member) => {
+            const owner = selectedLocalGroup?.ownerPeerId === member.peerId;
+            const administrator = selectedLocalGroup?.administratorPeerIds?.includes(member.peerId);
+            return <button className="mini-user member-menu-trigger" key={member.peerId} onClick={() => { setSelectedMember(member); setModal("manageMember"); }}><ProfileAvatar displayName={member.displayName} avatar={member.avatar}/><span>{member.displayName}</span>{owner ? <em title="Proprietário"><ShieldCheck size={14}/> Dono</em> : administrator ? <em title="Administrador"><Shield size={14}/> Admin</em> : null}</button>;
+          })}
         </> : <>
           <button className={!activeFriend ? "channel active" : "channel"} onClick={() => setActiveFriend(null)}><Users/>Amigos</button>
           {activeFriend && <button className="channel active"><MessageCircle/>{activeFriend.displayName}</button>}
           <button className="channel" onClick={() => setModal("friend")}><UserPlus/>Adicionar amigo</button>
         </>}
+        {roomId && <section className="voice-session-panel">
+          <button className="voice-session-summary" onClick={() => setCallWorkspaceOpen(true)}>
+            <span><i/>Voz conectada</span>
+            <small>{callContext?.voiceChannelName ?? "Sala de voz"} / {callContext?.groupName ?? "Risk"}</small>
+          </button>
+          <div className="voice-session-actions">
+            <button className={localCallState.microphone ? "" : "off"} onClick={() => void call.toggleMicrophone(roomId)} title={localCallState.microphone ? "Desativar microfone" : "Ativar microfone"}>{localCallState.microphone ? <Mic/> : <MicOff/>}</button>
+            <button className={localCallState.camera ? "active" : ""} onClick={() => void call.toggleCamera(roomId)} title={localCallState.camera ? "Desativar câmera" : "Ativar câmera"}>{localCallState.camera ? <Video/> : <VideoOff/>}</button>
+            <button className={callWorkspaceOpen ? "active" : ""} onClick={() => setCallWorkspaceOpen(true)} title="Abrir chamada"><Maximize2/></button>
+            <button className="disconnect" onClick={() => {
+              setRoom(null);
+              setCallContext(null);
+              void callChat.disconnect();
+              void call.leave(roomId);
+            }} title="Desconectar"><PhoneOff/></button>
+          </div>
+        </section>}
         <div className="account-bar">
-          <div className="avatar">{currentUser?.displayName.slice(0, 2).toUpperCase() ?? "EU"}</div>
-          <div><strong>{currentUser?.displayName ?? "Carregando…"}</strong><small>Disponível</small></div>
+          <button className="account-profile" onClick={() => setModal("profile")} title="Editar perfil"><ProfileAvatar displayName={currentUser?.displayName ?? "Eu"} avatar={currentUser?.avatar}/></button>
+          <button className="account-identity" onClick={() => setModal("profile")} title="Editar perfil"><strong>{currentUser?.displayName ?? "Carregando…"}</strong><small>Disponível</small></button>
           <button onClick={() => setModal("settings")} title="Voz e vídeo"><Settings2/></button>
           <button onClick={() => void logout()} title="Sair"><LogOut/></button>
         </div>
@@ -471,8 +714,9 @@ function SocialHome() {
       <section className="content-panel">
         {error && <div className="global-error" onClick={() => setError("")}>{error}</div>}
         {activeFriend ? <>
-          <header className="content-header"><MessageCircle/><strong>{activeFriend.displayName}</strong><span>Mensagem direta P2P</span><button className={`chat-connect ${chatStatus}`} disabled={!privateChannelId || chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat privado conectado" : chatStatus === "connected" ? "Aguardando amigo…" : chatStatus === "connecting" ? "Conectando…" : "Conectar P2P"}</button></header>
+          <header className="content-header"><MessageCircle/><strong>{activeFriend.displayName}</strong><span>Mensagem direta P2P</span><input className="message-search" value={messageSearch} onChange={(event) => setMessageSearch(event.target.value)} placeholder="Buscar"/><button className={`chat-connect ${chatStatus}`} disabled={!privateChannelId || chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat privado conectado" : chatStatus === "connected" ? "Aguardando amigo…" : chatStatus === "connecting" ? "Conectando…" : chatStatus === "incompatible" ? "Versão incompatível" : "Conectar P2P"}</button></header>
           <div className="messages">
+            {hasOlderMessages && <button className="load-older-messages" disabled={loadingOlderMessages} onClick={() => void loadOlderMessages()}>{loadingOlderMessages ? "Carregando…" : "Carregar mensagens anteriores"}</button>}
             {timeline}
             {!messages.length && !attachments.length && <div className="channel-welcome"><MessageCircle/><h2>Conversa com {activeFriend.displayName}</h2><p>Os dois amigos devem abrir esta conversa e clicar em Conectar P2P. Depois disso mensagens e arquivos seguem diretamente pelo WebRTC.</p></div>}
           </div>
@@ -482,12 +726,30 @@ function SocialHome() {
           <div className="friends-layout"><div>
             <h3>Seus amigos — {friends.length}</h3>
             {pending.map((request) => <div className="friend-row pending" key={request.requestId}><div className="avatar">{request.displayName[0]}</div><div><strong>{request.displayName}</strong><small>Quer adicionar você</small></div><button onClick={() => void api.acceptFriend(token, request.requestId).then(loadSocial).catch((cause) => setError(cause instanceof Error ? cause.message : "Falha ao aceitar"))}>Aceitar</button></div>)}
-            {friends.map((friend) => <div className="friend-row" key={friend.id}><div className="avatar">{friend.displayName[0]}</div><div><strong>{friend.displayName}</strong><small>{friend.local ? "Amigo P2P neste dispositivo" : "Amigo no Risk"}</small></div><div className="friend-actions"><button disabled={!friend.local} title={friend.local ? "Abrir chat privado P2P" : "Chat P2P requer amizade por identidade local"} onClick={() => { setSelectedCommunity(null); setActiveFriend(friend); }}><MessageCircle size={18}/></button><button className="danger-icon" title="Desfazer amizade" aria-label={`Desfazer amizade com ${friend.displayName}`} onClick={() => setDeleteTarget({ kind: "friend", friend })}><UserMinus size={18}/></button></div></div>)}
+            {friends.map((friend) => <div className="friend-row" key={friend.id}><ProfileAvatar displayName={friend.displayName} avatar={friend.avatar}/><div><strong>{friend.displayName}</strong><small>{friend.local ? "Amigo P2P neste dispositivo" : "Amigo no Risk"}</small></div><div className="friend-actions"><button disabled={!friend.local} title={friend.local ? "Abrir chat privado P2P" : "Chat P2P requer amizade por identidade local"} onClick={() => { setSelectedCommunity(null); setActiveFriend(friend); }}><MessageCircle size={18}/></button><button className="danger-icon" title="Desfazer amizade" aria-label={`Desfazer amizade com ${friend.displayName}`} onClick={() => setDeleteTarget({ kind: "friend", friend })}><UserMinus size={18}/></button></div></div>)}
             {!friends.length && !pending.length && <div className="empty-social"><Users/><h2>Seu círculo começa aqui</h2><p>Crie um código temporário ou use o código de outra pessoa.</p><button onClick={() => setModal("friend")}>Adicionar primeiro amigo</button></div>}
-          </div><aside><h3>Atividade</h3><p>As salas de voz ativas dos seus grupos aparecerão aqui futuramente.</p></aside></div>
+          </div><aside className="activity-panel"><h3>Atividade</h3>
+            {activeVoiceRooms.length ? <div className="voice-activity-list">{activeVoiceRooms.map((activity) => <button
+              key={`${activity.groupId}:${activity.channelId}`}
+              className={roomId === activity.roomId ? "voice-activity active" : "voice-activity"}
+              onClick={() => {
+                const group = communities.find((item) => item.id === activity.groupId);
+                if (group) { setActiveFriend(null); setSelectedCommunity(group); }
+                if (roomId === activity.roomId) { setCallWorkspaceOpen(true); return; }
+                void loadLocalGroups().then((groups) => {
+                  const local = groups.find((item) => item.groupId === activity.groupId);
+                  const channel = local?.channels.find((item) => item.id === activity.channelId);
+                  if (group && channel) { setChannels(local!.channels); void enterVoice(channel, group, local!.channels); }
+                });
+              }}
+            ><span className="voice-activity-icon"><Headphones/></span><span><strong>{activity.channelName}</strong><small>{activity.groupName}</small><em>{activity.participantCount} {activity.participantCount === 1 ? "pessoa conectada" : "pessoas conectadas"}</em></span><i/></button>)}</div>
+              : <p>Nenhuma sala de voz ativa nos seus grupos.</p>}
+            {communities.length > 32 && <small>A atividade acompanha os primeiros 32 grupos neste dispositivo.</small>}
+          </aside></div>
         </> : activeChannel?.kind === "text" ? <>
-          <header className="content-header"><Hash/><strong>{activeChannel.name}</strong><span>{selectedCommunity.name}</span><button className={`chat-connect ${chatStatus}`} disabled={chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat P2P conectado" : chatStatus === "connected" ? "Aguardando peer…" : chatStatus === "connecting" ? "Conectando…" : "Conectar chat"}</button></header>
+          <header className="content-header"><Hash/><strong>{activeChannel.name}</strong><span>{selectedCommunity.name}</span><input className="message-search" value={messageSearch} onChange={(event) => setMessageSearch(event.target.value)} placeholder="Buscar"/><button className={`chat-connect ${chatStatus}`} disabled={chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat P2P conectado" : chatStatus === "connected" ? "Aguardando peer…" : chatStatus === "connecting" ? "Conectando…" : chatStatus === "incompatible" ? "Versão incompatível" : "Conectar chat"}</button></header>
           <div className="messages">
+            {hasOlderMessages && <button className="load-older-messages" disabled={loadingOlderMessages} onClick={() => void loadOlderMessages()}>{loadingOlderMessages ? "Carregando…" : "Carregar mensagens anteriores"}</button>}
             {timeline}
             {!messages.length && !attachments.length && <div className="channel-welcome"><Hash/><h2>Bem-vindo a #{activeChannel.name}</h2><p>Este é o começo deste canal P2P salvo neste dispositivo.</p></div>}
           </div>
@@ -496,7 +758,9 @@ function SocialHome() {
       </section>
 
       {modal === "friend" && <Modal title="Adicionar amigo" onClose={() => setModal(null)}>{currentUser ? <P2PInvitePanel type="friend" token={token} displayName={currentUser.displayName} onComplete={() => void loadSocial()}/> : <p>Carregando sua identidade…</p>}</Modal>}
-      {modal === "settings" && <Modal title="Voz e vídeo" onClose={() => setModal(null)}><VoiceVideoSettingsPanel/></Modal>}
+      {modal === "settings" && <Modal title="Configurações" onClose={() => setModal(null)}><VoiceVideoSettingsPanel/><LocalStoragePanel/></Modal>}
+      {modal === "profile" && currentUser && <Modal title="Editar perfil" onClose={() => setModal(null)}><ProfileEditor profile={{ displayName: currentUser.displayName, avatar: currentUser.avatar }} onSaved={profileSaved}/></Modal>}
+      {modal === "groupProfile" && selectedLocalGroup && <Modal title="Personalizar grupo" onClose={() => setModal(null)}><GroupEditor group={selectedLocalGroup} onSaved={groupSaved}/></Modal>}
       {modal === "group" && <Modal title="Criar um grupo" onClose={() => setModal(null)}><form onSubmit={(event) => {
         event.preventDefault();
         const name = String(new FormData(event.currentTarget).get("name")).trim();
@@ -529,7 +793,16 @@ function SocialHome() {
           window.dispatchEvent(new Event("risk:social-updated"));
         }).catch((cause) => setError(cause instanceof Error ? cause.message : "Falha ao criar canal"));
       }}><input name="name" minLength={2} maxLength={80} placeholder="Nome do canal" required/><select name="kind"><option value="text">Canal de texto</option><option value="voice">Sala de voz</option></select><button>Criar canal</button></form></Modal>}
-      {modal === "member" && selectedCommunity && <Modal title="Adicionar membro" onClose={() => setModal(null)}>{currentUser ? <GroupInvitePanel token={token} displayName={currentUser.displayName} preferredGroupId={selectedCommunity.id} preferredGroupName={selectedCommunity.name} preferredGroupChannels={channels} initialMode="create" onComplete={() => void loadSocial()}/> : <p>Carregando sua identidade…</p>}</Modal>}
+      {modal === "inviteMember" && selectedCommunity && <Modal title="Adicionar membro" onClose={() => setModal(null)}>{currentUser ? <GroupInvitePanel token={token} displayName={currentUser.displayName} preferredGroupId={selectedCommunity.id} preferredGroupName={selectedCommunity.name} preferredGroupChannels={channels} initialMode="create" onComplete={() => void loadSocial()}/> : <p>Carregando sua identidade…</p>}</Modal>}
+      {modal === "manageMember" && selectedMember && selectedLocalGroup && <Modal title="Gerenciar membro" onClose={() => { if (!memberSaving) setModal(null); }}>
+        <div className="member-manager"><ProfileAvatar displayName={selectedMember.displayName} avatar={selectedMember.avatar}/><div><strong>{selectedMember.displayName}</strong><small>{selectedLocalGroup.ownerPeerId === selectedMember.peerId ? "Proprietário" : (selectedLocalGroup.administratorPeerIds ?? []).includes(selectedMember.peerId) ? "Administrador" : "Membro"}</small></div></div>
+        <div className="member-manager-actions">
+          {localIdentityPeerId === selectedLocalGroup.ownerPeerId && selectedMember.peerId !== selectedLocalGroup.ownerPeerId && ((selectedLocalGroup.administratorPeerIds ?? []).includes(selectedMember.peerId) ? <button disabled={memberSaving} onClick={() => void changeMemberRole(false)}><Shield/> Remover administrador</button> : <button disabled={memberSaving} onClick={() => void changeMemberRole(true)}><ShieldCheck/> Tornar administrador</button>)}
+          {selectedMember.peerId !== localIdentityPeerId && selectedMember.peerId !== selectedLocalGroup.ownerPeerId && canEditSelectedGroup && (!(selectedLocalGroup.administratorPeerIds ?? []).includes(selectedMember.peerId) || localIdentityPeerId === selectedLocalGroup.ownerPeerId) && <button className="danger-action" disabled={memberSaving} onClick={() => void removeSelectedMember()}><UserMinus/> {memberSaving ? "Removendo…" : "Remover do grupo"}</button>}
+          {selectedMember.peerId === localIdentityPeerId && <p>Este é o seu perfil no grupo.</p>}
+          {selectedMember.peerId === selectedLocalGroup.ownerPeerId && localIdentityPeerId !== selectedLocalGroup.ownerPeerId && <p>O proprietário possui autoridade final sobre o grupo.</p>}
+        </div>
+      </Modal>}
       {modal === "joinGroup" && <Modal title="Entrar em grupo" onClose={() => setModal(null)}>{currentUser ? <GroupInvitePanel token={token} displayName={currentUser.displayName} initialMode="join" onComplete={() => { void loadSocial(); setModal(null); }}/> : <p>Carregando sua identidade…</p>}</Modal>}
       {deleteTarget && <Modal title={deleteTarget.kind === "friend" ? "Desfazer amizade" : "Remover grupo"} onClose={() => { if (!deleting) setDeleteTarget(null); }}><div className="danger-confirm"><div className="danger-confirm-icon">{deleteTarget.kind === "friend" ? <UserMinus/> : <Trash2/>}</div>{deleteTarget.kind === "friend" ? <p>Desfazer amizade com <strong>{deleteTarget.friend.displayName}</strong>? O histórico local não será apagado automaticamente.</p> : <p>Remover <strong>{deleteTarget.group.name}</strong>? Se você for o dono, o grupo será apagado. Caso contrário, você apenas sairá dele.</p>}<div className="danger-confirm-actions"><button className="secondary" disabled={deleting} onClick={() => setDeleteTarget(null)}>Cancelar</button><button className="danger-action" disabled={deleting} onClick={() => void performDelete()}>{deleting ? "Removendo…" : deleteTarget.kind === "friend" ? "Desfazer amizade" : "Remover grupo"}</button></div></div></Modal>}
       {channelAction?.mode === "edit" && <Modal title={channelAction.channel.kind === "text" ? "Renomear canal" : "Renomear sala de voz"} onClose={() => { if (!channelSaving) setChannelAction(null); }}><form className="channel-edit-form" onSubmit={renameChannel}><input name="name" defaultValue={channelAction.channel.name} minLength={2} maxLength={80} autoFocus required/><small>O tipo do canal será mantido como {channelAction.channel.kind === "text" ? "texto" : "voz"}.</small><button disabled={channelSaving}>{channelSaving ? "Salvando…" : "Salvar nome"}</button></form></Modal>}
@@ -558,12 +831,14 @@ function attachmentStateWeight(state: ChatAttachmentRecord["state"]): number {
 }
 
 function CallRoom() {
-  return <CallWorkspace call={call} chat={chat}/>;
+  const setCallWorkspaceOpen = useCallStore((state) => state.setCallWorkspaceOpen);
+  return <CallWorkspace call={call} chat={callChat} onMinimize={() => setCallWorkspaceOpen(false)}/>;
 }
 
 function App() {
   const token = useCallStore((state) => state.token);
   const room = useCallStore((state) => state.roomId);
+  const callWorkspaceOpen = useCallStore((state) => state.callWorkspaceOpen);
   const setSession = useCallStore((state) => state.setSession);
   const [checkingSession, setCheckingSession] = useState(!token);
 
@@ -578,7 +853,30 @@ function App() {
   }, [token, setSession]);
 
   if (checkingSession) return <main className="auth"><div className="session-loading"><Sparkles/><span>Restaurando sua sessão…</span></div></main>;
-  return !token ? <Auth/> : room ? <CallRoom/> : <SocialHome/>;
+  if (!token) return <Auth/>;
+  return <div className="risk-application">
+    <SocialHome/>
+    {room && <div className={`call-layer ${callWorkspaceOpen ? "open" : "background"}`} aria-hidden={!callWorkspaceOpen}><CallRoom/></div>}
+  </div>;
 }
 
-createRoot(document.getElementById("root")!).render(<React.StrictMode><App/></React.StrictMode>);
+function DesktopRecoveryNotice() {
+  const [status, setStatus] = useState<RiskDesktopBackendStatus>();
+  useEffect(() => window.desktop?.onBackendStatus?.((next) => {
+    resetApiRuntimeConfig();
+    resetChatStorageRuntime();
+    resetSocialStorageRuntime();
+    setStatus(next);
+  }), []);
+  if (!status) return null;
+  return <button
+    className={`desktop-recovery-notice ${status.state}`}
+    onClick={() => setStatus(undefined)}
+    title="Clique para fechar"
+  >{status.message}</button>;
+}
+
+createRoot(document.getElementById("root")!).render(<React.StrictMode>
+  <AppErrorBoundary><App/></AppErrorBoundary>
+  <DesktopRecoveryNotice/>
+</React.StrictMode>);

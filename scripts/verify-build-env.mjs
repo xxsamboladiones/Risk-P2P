@@ -40,4 +40,12 @@ if (values.VITE_ICE_SERVERS_JSON?.trim()) {
   }
 }
 
-console.log(`Variáveis públicas do build validadas. Modo: ${values.VITE_API_URL?.trim() ? "híbrido (API + P2P)" : "P2P local"}.`);
+if (values.RISK_REQUIRE_WINDOWS_SIGNING === "true") {
+  const signingMissing = ["CSC_LINK", "CSC_KEY_PASSWORD"].filter((name) => !values[name]?.trim());
+  if (signingMissing.length) {
+    console.error(`Release Windows interrompida: assinatura obrigatória sem ${signingMissing.join(", ")}.`);
+    process.exit(1);
+  }
+}
+
+console.log(`Variáveis públicas do build validadas. Modo: ${values.VITE_API_URL?.trim() ? "híbrido (API + P2P)" : "P2P local"}.${values.RISK_REQUIRE_WINDOWS_SIGNING === "true" ? " Assinatura Windows obrigatória." : ""}`);

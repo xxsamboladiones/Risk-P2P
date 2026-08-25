@@ -140,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from("risk-data"));
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("não foi possível criar {}", data_dir.display()))?;
+    p2p::attachments::cleanup_stale_transfers().await;
     let db_path = data_dir.join("risk.sqlite3");
     let options = SqliteConnectOptions::new()
         .filename(&db_path)
@@ -902,5 +903,85 @@ mod tests {
         let right = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
         assert_eq!(canonical_pair(left, right), canonical_pair(right, left));
         assert_eq!(canonical_pair(left, right), (right, left));
+    }
+
+    #[tokio::test]
+    async fn upgrades_a_legacy_p2p_group_without_losing_data() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0001_initial.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0002_p2p_social.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0003_p2p_messages.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/0004_p2p_message_signatures.sql"
+        ))
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0005_p2p_group_ownership.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../tests/fixtures/risk_v0_1_seed.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(include_str!("../migrations/0006_group_manifest.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0007_group_roles.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0008_group_consistency.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let row = sqlx::query_as::<_, (String, i64, String, String, String, String)>(
+            "SELECT name,manifest_version,administrator_peer_ids_json,removed_peer_ids_json,removed_members_json,consistency_json FROM p2p_groups WHERE group_id=?",
+        )
+        .bind("group_legacy_0001")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "Grupo P2P legado");
+        assert_eq!(row.1, 1);
+        assert_eq!(row.2, "[]");
+        assert_eq!(row.3, "[]");
+        assert_eq!(row.4, "[]");
+        assert_eq!(row.5, "{}");
+
+        let preserved = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            "SELECT (SELECT COUNT(*) FROM friendships),(SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM p2p_friends),(SELECT COUNT(*) FROM p2p_messages)",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(preserved, (1, 1, 1, 1));
+        let group_payload = sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT channels_json,members_json,membership_version FROM p2p_groups WHERE group_id=?",
+        )
+        .bind("group_legacy_0001")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(group_payload.0.contains("channel_legacy_voice"));
+        assert!(group_payload.1.contains("peer_friend_legacy"));
+        assert_eq!(group_payload.2, 3);
     }
 }

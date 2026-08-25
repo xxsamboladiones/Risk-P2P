@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type RefObject } from "react";
 import {
+  Activity,
+  Copy,
   Hash,
   Maximize2,
   MessageCircle,
   Mic,
   MicOff,
   MonitorUp,
+  PanelLeft,
   PhoneOff,
   Settings2,
   Sparkles,
@@ -17,7 +20,7 @@ import {
 } from "lucide-react";
 import type { ChatMessage } from "../api";
 import { api } from "../api";
-import type { CallController } from "../call";
+import type { CallController, CallDiagnostics } from "../call";
 import type {
   ChatAttachmentProgress,
   ChatAttachmentRecord,
@@ -25,10 +28,12 @@ import type {
   ChatController,
 } from "../chat";
 import { loadLocalGroups } from "../services/offline/social-storage";
-import { useCallStore, type CallContext, type Participant } from "../store";
+import { incompatiblePeerMessage } from "../services/protocol-compatibility";
+import { useCallStore, type Participant } from "../store";
 import { ConversationTimeline } from "./ConversationTimeline";
 import { InCallAudioSettings } from "./InCallAudioSettings";
 import { MessageComposer } from "./MessageComposer";
+import { ProfileAvatar } from "./ProfileAvatar";
 import "./call-workspace.css";
 
 type ViewMode = "call" | "chat";
@@ -134,12 +139,14 @@ function VideoTile({
   tileId,
   focused,
   compact,
+  deafened,
   onFocus,
 }: {
   participant: Participant;
   tileId: string;
   focused: boolean;
   compact: boolean;
+  deafened: boolean;
   onFocus(tileId: string): void;
 }) {
   const streams = Object.values(participant.streams ?? {});
@@ -186,9 +193,9 @@ function VideoTile({
     onDoubleClick={() => { void articleRef.current?.requestFullscreen().catch(() => undefined); }}
   >
     <video ref={videoRef} autoPlay playsInline muted className={hasVideo ? source : "hidden-video"}/>
-    {!hasVideo && <div className="video-off"><VideoOff/><span>Vídeo desligado</span></div>}
-    {userHasAudio && <RemoteAudio stream={microphoneStream!} volume={userVolume}/>} 
-    {screenHasAudio && <RemoteAudio stream={screenStream!} volume={screenVolume}/>} 
+    {!hasVideo && <div className="video-off"><ProfileAvatar displayName={participant.displayName} avatar={participant.avatar} className="call-profile-avatar"/><span>Vídeo desligado</span></div>}
+    {userHasAudio && <RemoteAudio stream={microphoneStream!} volume={deafened ? 0 : userVolume}/>}
+    {screenHasAudio && <RemoteAudio stream={screenStream!} volume={deafened ? 0 : screenVolume}/>}
     <FullscreenButton target={articleRef}/>
     {canSwitch && <div className="source-switch">
       <button className={source === "camera" ? "selected" : ""} onClick={(event) => { event.stopPropagation(); setSource("camera"); }}><Video size={14}/> Câmera</button>
@@ -199,6 +206,24 @@ function VideoTile({
       {screenHasAudio && <VolumeControl label="Transmissão" value={screenVolume} onChange={setScreenVolume}/>} 
     </div>}
     <div className="tile-label"><span>{participant.displayName}</span>{!participant.state.microphone && <MicOff size={15}/>} {participant.state.screenAudio && !compact && <em>ÁUDIO DA TELA</em>}</div>
+  </article>;
+}
+
+function LocalProfileTile({ displayName, avatar, microphone, tileId, focused, compact, onFocus }: {
+  displayName: string;
+  avatar?: string;
+  microphone: boolean;
+  tileId: string;
+  focused: boolean;
+  compact: boolean;
+  onFocus(tileId: string): void;
+}) {
+  return <article
+    className={`tile local online profile-only ${focused ? "focused" : ""} ${compact ? "thumbnail" : ""}`}
+    onClick={() => onFocus(tileId)}
+  >
+    <div className="video-off"><ProfileAvatar displayName={displayName} avatar={avatar} className="call-profile-avatar"/></div>
+    <div className="tile-label"><span>Você · {displayName}</span>{!microphone && <MicOff size={15}/>}</div>
   </article>;
 }
 
@@ -282,7 +307,7 @@ function ScreenSourcePicker({
   </div>;
 }
 
-export function CallWorkspace({ call, chat }: { call: CallController; chat: ChatController }) {
+export function CallWorkspace({ call, chat, onMinimize }: { call: CallController; chat: ChatController; onMinimize(): void }) {
   const token = useCallStore((state) => state.token)!;
   const roomId = useCallStore((state) => state.roomId)!;
   const callContext = useCallStore((state) => state.callContext);
@@ -305,8 +330,11 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
   const [sourcePickerOpen, setSourcePickerOpen] = useState(false);
   const [screenSources, setScreenSources] = useState<RiskDesktopSource[]>([]);
   const [screenSourcesLoading, setScreenSourcesLoading] = useState(false);
+  const [networkQuality, setNetworkQuality] = useState("Boa");
+  const [deafened, setDeafened] = useState(false);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [diagnostics, setDiagnostics] = useState<CallDiagnostics | null>(null);
 
-  const hasVideo = Boolean(localPreviews.camera || localPreviews.screen);
   const context = callContext;
 
   useEffect(() => {
@@ -318,13 +346,17 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
         if (!alive) return;
         const localGroup = localGroups.find((item) => item.channels.some((channel) => channel.kind === "voice" && channel.voiceRoomId === roomId));
         if (localGroup) {
+          const voiceChannel = localGroup.channels.find((channel) => channel.kind === "voice" && channel.voiceRoomId === roomId) ?? null;
           const textChannel = localGroup.channels.find((channel) => channel.kind === "text") ?? null;
           setCallContext({
             groupId: localGroup.groupId,
             groupName: localGroup.name,
+            voiceChannelId: voiceChannel?.id ?? null,
+            voiceChannelName: voiceChannel?.name ?? null,
             textChannelId: textChannel?.id ?? null,
             textChannelName: textChannel?.name ?? null,
             displayName: profile.displayName,
+            avatar: profile.avatar,
           });
           return;
         }
@@ -339,9 +371,12 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
           setCallContext({
             groupId: community.id,
             groupName: community.name,
+            voiceChannelId: voiceChannel.id,
+            voiceChannelName: voiceChannel.name,
             textChannelId: textChannel?.id ?? null,
             textChannelName: textChannel?.name ?? null,
             displayName: profile.displayName,
+            avatar: profile.avatar,
           });
           return;
         }
@@ -365,7 +400,11 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
         ? current
         : [...current, message].sort((left, right) => left.createdAt.localeCompare(right.createdAt)));
     });
-    const offStatus = chat.onStatus((status) => { if (alive) setChatStatus(status); });
+    const offStatus = chat.onStatus((status) => {
+      if (!alive) return;
+      setChatStatus(status);
+      if (status === "incompatible") setError(incompatiblePeerMessage());
+    });
     const offAttachment = chat.onAttachment((record) => {
       if (alive && record.channelId === channelId) setAttachments((current) => upsertAttachment(current, record));
     });
@@ -407,8 +446,23 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
     void applyScreenQuality(localPreviews.screen, quality);
   }, [localPreviews.screen, quality]);
 
+  useEffect(() => {
+    let alive = true;
+    const update = async () => {
+      const diagnostics = await call.getLiveDiagnostics().catch(() => null);
+      if (!alive || !diagnostics) return;
+      const degraded = diagnostics.peerConnections.some((peer) => (peer.roundTripTimeMs ?? 0) > 350 || (peer.jitterMs ?? 0) > 60 || (peer.packetsLost ?? 0) > 20);
+      const disconnected = diagnostics.peerConnections.some((peer) => !["connected", "connecting", "new"].includes(peer.connectionState));
+      setNetworkQuality(disconnected ? "Instável" : degraded ? "Limitada" : "Boa");
+    };
+    void update();
+    const timer = window.setInterval(() => void update(), 3_000);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, [call]);
+
   const tileIds = useMemo(() => {
     const ids: string[] = [];
+    if (!localPreviews.camera) ids.push("local-profile");
     if (localPreviews.camera) ids.push("local-camera");
     if (localPreviews.screen) ids.push("local-screen");
     peers.forEach((peer) => ids.push(`peer-${peer.peerId}`));
@@ -492,13 +546,22 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
   return <main className="room call-workspace">
     <header>
       <div className="brand"><Sparkles/> Risk</div>
-      <div><strong>Sala ao vivo</strong><span>{context?.groupName ? `${context.groupName} · ` : ""}{roomId}</span></div>
+      <div><strong>{context?.voiceChannelName ?? "Sala ao vivo"}</strong><span>{context?.groupName ? `${context.groupName} · ` : ""}{roomId}</span></div>
       <div className="call-header-actions">
+        <button className="minimize-call" onClick={() => {
+          setAudioSettingsOpen(false);
+          setSourcePickerOpen(false);
+          onMinimize();
+        }} title="Voltar para o Risk"><PanelLeft size={17}/><span>Voltar ao menu</span></button>
         <div className="call-view-tabs">
           <button className={view === "call" ? "active" : ""} onClick={() => setView("call")}><Video size={16}/> Chamada</button>
           <button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")} disabled={!context?.textChannelId}><MessageCircle size={16}/> Chat</button>
         </div>
-        <div className="status"><i/> Conectado · {peers.length + 1}</div>
+        <button
+          className={`network-header-button network-${networkQuality.toLocaleLowerCase()}`}
+          title="Abrir diagnóstico da conexão"
+          onClick={() => { void call.getLiveDiagnostics().then((value) => { setDiagnostics(value); setDiagnosticsOpen(true); }); }}
+        ><Activity size={17}/><span>Rede</span><small>{networkQuality} · {peers.length + 1}</small></button>
       </div>
     </header>
 
@@ -508,6 +571,15 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
       <section className={`stage ${focused ? "stage-focused" : ""}`} onMouseDown={(event) => {
         if (event.target === event.currentTarget) setFocusedTile(null);
       }}>
+        {!localPreviews.camera && <LocalProfileTile
+          displayName={context?.displayName ?? "Você"}
+          avatar={context?.avatar}
+          microphone={localState.microphone}
+          tileId="local-profile"
+          focused={focused === "local-profile"}
+          compact={Boolean(focused && focused !== "local-profile")}
+          onFocus={(id) => setFocusedTile((current) => current === id ? null : id)}
+        />}
         {localPreviews.camera && <LocalVideoTile
           stream={localPreviews.camera}
           tileId="local-camera"
@@ -536,17 +608,17 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
             tileId={id}
             focused={focused === id}
             compact={Boolean(focused && focused !== id)}
+            deafened={deafened}
             onFocus={(next) => setFocusedTile((current) => current === next ? null : next)}
           />;
         })}
-        {!hasVideo && !peers.length && <div className="empty"><div className="pulse"><Sparkles/></div><h2>Você chegou primeiro</h2><p>Compartilhe o código <b>{roomId}</b> para alguém entrar.</p></div>}
       </section>
     </section>
 
     <section className={`call-chat-view ${view === "chat" ? "" : "is-hidden"}`}>
       <header className="call-chat-header">
         <div><Hash/><span><strong>#{context?.textChannelName ?? "chat"}</strong><small>{context?.groupName ?? "Grupo atual"}</small></span></div>
-        <div className={`call-chat-status ${chatStatus}`}><i/>{chatStatus === "ready" ? "P2P conectado" : chatStatus === "connected" ? "Aguardando peers" : chatStatus === "connecting" ? "Conectando" : "Offline"}</div>
+        <div className={`call-chat-status ${chatStatus}`}><i/>{chatStatus === "ready" ? "P2P conectado" : chatStatus === "connected" ? "Aguardando peers" : chatStatus === "connecting" ? "Conectando" : chatStatus === "incompatible" ? "Versão incompatível" : "Offline"}</div>
         <button onClick={() => setView("call")}><Video size={16}/> Voltar para chamada</button>
       </header>
       <div className="messages call-chat-messages">
@@ -563,6 +635,7 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
 
     <footer>
       <button className={localState.microphone ? "" : "off"} onClick={() => void call.toggleMicrophone(roomId)}>{localState.microphone ? <Mic/> : <MicOff/>}<span>Microfone</span></button>
+      <button className={deafened ? "off" : ""} onClick={() => setDeafened((value) => !value)} title="Silenciar todo o áudio recebido">{deafened ? <VolumeX/> : <Volume2/>}<span>Ensurdecer</span></button>
       <button className={audioSettingsOpen ? "active" : ""} onClick={() => setAudioSettingsOpen((current) => !current)} title="Configurações de áudio"><Settings2/><span>Áudio</span></button>
       <button className={localState.camera ? "active" : ""} onClick={() => void call.toggleCamera(roomId)}>{localState.camera ? <Video/> : <VideoOff/>}<span>Câmera</span></button>
       <div className="share-control">
@@ -571,7 +644,6 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
           {Object.entries(QUALITY_PROFILES).map(([value, profile]) => <option key={value} value={value}>{profile.label}</option>)}
         </select>
       </div>
-      {context?.textChannelId && <button className={view === "chat" ? "active" : ""} onClick={() => setView(view === "chat" ? "call" : "chat")}><MessageCircle/><span>{view === "chat" ? "Chamada" : "Chat"}</span></button>}
       <button className="hangup" onClick={() => {
         setAudioSettingsOpen(false);
         setRoom(null);
@@ -582,6 +654,15 @@ export function CallWorkspace({ call, chat }: { call: CallController; chat: Chat
     </footer>
 
     {audioSettingsOpen && <InCallAudioSettings call={call} onClose={() => setAudioSettingsOpen(false)}/>} 
+    {diagnosticsOpen && <section className="network-diagnostics" role="dialog" aria-label="Diagnóstico da conexão">
+      <header><strong>Diagnóstico da conexão</strong><button onClick={() => setDiagnosticsOpen(false)}><X/></button></header>
+      <p>Signaling: <b>{diagnostics?.signaling?.status ?? "indisponível"}</b></p>
+      <p>Canal Supabase: <b>{diagnostics?.signaling?.channelStatus ?? "indisponível"}</b></p>
+      <p>Peers presentes: <b>{diagnostics?.signaling?.presencePeers.length ?? 0}</b></p>
+      <p>Conectividade: <b>{diagnostics?.connectivity.label ?? "verificando"}</b></p>
+      {(diagnostics?.peerConnections ?? []).map((peer) => <article key={peer.peerId}><strong>{peer.peerId.slice(0, 8)}</strong><span>WebRTC {peer.connectionState} · ICE {peer.iceConnectionState}</span><small>RTT {peer.roundTripTimeMs ?? 0} ms · jitter {peer.jitterMs ?? 0} ms · perdas {peer.packetsLost ?? 0}</small></article>)}
+      <button onClick={() => void navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2))}><Copy/> Copiar relatório sanitizado</button>
+    </section>}
     {sourcePickerOpen && <ScreenSourcePicker
       sources={screenSources}
       loading={screenSourcesLoading}

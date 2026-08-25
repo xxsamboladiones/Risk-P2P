@@ -11,6 +11,8 @@ import {
   Pencil,
   Plus,
   Settings2,
+  Shield,
+  ShieldCheck,
   Sparkles,
   Trash2,
   UserMinus,
@@ -32,7 +34,9 @@ import {
 import { CallWorkspace } from "./components/CallWorkspace";
 import { ConversationTimeline } from "./components/ConversationTimeline";
 import { GroupInvitePanel } from "./components/GroupInvitePanel";
+import { GroupEditor } from "./components/GroupEditor";
 import { MessageComposer } from "./components/MessageComposer";
+import { LocalStoragePanel } from "./components/LocalStoragePanel";
 import { Modal } from "./components/Modal";
 import { P2PInvitePanel } from "./components/P2PInvitePanel";
 import { ProfileAvatar } from "./components/ProfileAvatar";
@@ -50,6 +54,9 @@ import {
   loadLocalFriends,
   loadLocalGroups,
   publicIdentity,
+  removeLocalGroupMember,
+  setLocalGroupAdministrator,
+  type LocalGroup,
   type PublicPeerIdentity,
 } from "./services/offline/social-storage";
 import { useCallStore } from "./store";
@@ -110,7 +117,7 @@ function Auth() {
   </section></main>;
 }
 
-type SocialModal = "friend" | "group" | "channel" | "member" | "joinGroup" | "settings" | "profile" | null;
+type SocialModal = "friend" | "group" | "groupProfile" | "channel" | "inviteMember" | "manageMember" | "joinGroup" | "settings" | "profile" | null;
 type DeleteTarget = { kind: "friend"; friend: Friend } | { kind: "group"; group: Community } | null;
 type ChannelActionTarget = { mode: "edit" | "delete"; channel: Channel } | null;
 
@@ -133,9 +140,16 @@ function SocialHome() {
   const [activeFriend, setActiveFriend] = useState<Friend | null>(null);
   const [privateChannelId, setPrivateChannelId] = useState<string | null>(null);
   const [groupMembers, setGroupMembers] = useState<PublicPeerIdentity[]>([]);
+  const [selectedLocalGroup, setSelectedLocalGroup] = useState<LocalGroup | null>(null);
+  const [canEditSelectedGroup, setCanEditSelectedGroup] = useState(false);
+  const [localIdentityPeerId, setLocalIdentityPeerId] = useState("");
+  const [selectedMember, setSelectedMember] = useState<PublicPeerIdentity | null>(null);
+  const [memberSaving, setMemberSaving] = useState(false);
   const [channels, setChannels] = useState<Channel[]>([]);
   const [activeChannel, setActiveChannel] = useState<Channel | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [hasOlderMessages, setHasOlderMessages] = useState(false);
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
   const [attachments, setAttachments] = useState<ChatAttachmentRecord[]>([]);
   const [attachmentProgress, setAttachmentProgress] = useState<Record<string, ChatAttachmentProgress | undefined>>({});
   const [modal, setModal] = useState<SocialModal>(null);
@@ -147,9 +161,26 @@ function SocialHome() {
   const [chatStatus, setChatStatus] = useState<ChatConnectionStatus>("disconnected");
   const [unreadChannels, setUnreadChannels] = useState<Record<string, number>>({});
   const [activeVoiceRooms, setActiveVoiceRooms] = useState<VoiceActivity[]>([]);
+  const [messageSearch, setMessageSearch] = useState("");
 
   useEffect(() => backgroundChats.onUnread((items) => setUnreadChannels(Object.fromEntries(items))), []);
   useEffect(() => voiceActivities.onChange(setActiveVoiceRooms), []);
+
+  useEffect(() => {
+    const removed = (event: Event) => {
+      const detail = (event as CustomEvent<{ groupId: string; groupName: string }>).detail;
+      if (!detail) return;
+      setError(`Você foi removido do grupo ${detail.groupName}. O grupo foi removido deste dispositivo.`);
+      setCommunities((items) => items.filter((group) => group.id !== detail.groupId));
+      if (selectedCommunity?.id === detail.groupId) {
+        setSelectedCommunity(null);
+        setChannels([]);
+        setActiveChannel(null);
+      }
+    };
+    window.addEventListener("risk:group-removed", removed);
+    return () => window.removeEventListener("risk:group-removed", removed);
+  }, [selectedCommunity?.id]);
 
   useEffect(() => {
     if (!currentUser) return;
@@ -189,8 +220,8 @@ function SocialHome() {
     const mergedGroups = [...groups];
     localGroups.forEach((group) => {
       const existing = mergedGroups.find((item) => item.id === group.groupId);
-      if (existing) existing.local = true;
-      else mergedGroups.push({ id: group.groupId, name: group.name, local: true });
+      if (existing) Object.assign(existing, { local: true, name: group.name, avatar: group.avatar });
+      else mergedGroups.push({ id: group.groupId, name: group.name, avatar: group.avatar, local: true });
     });
     setFriends(mergedFriends);
     setPending(social.pending);
@@ -233,15 +264,20 @@ function SocialHome() {
   useEffect(() => {
     let alive = true;
     async function loadMembers() {
-      if (!selectedCommunity?.local) { if (alive) setGroupMembers([]); return; }
+      if (!selectedCommunity?.local) { if (alive) { setGroupMembers([]); setSelectedLocalGroup(null); setCanEditSelectedGroup(false); setLocalIdentityPeerId(""); } return; }
       const [groups, identity] = await Promise.all([
         loadLocalGroups(),
         getOrCreateLocalIdentity(currentUser?.displayName ?? "Participante"),
       ]);
       const group = groups.find((item) => item.groupId === selectedCommunity.id);
-      if (alive) setGroupMembers(dedupeMembersForDisplay(group?.members ?? [], publicIdentity(identity)));
+      if (alive) {
+        setSelectedLocalGroup(group ?? null);
+        setLocalIdentityPeerId(identity.peerId);
+        setCanEditSelectedGroup(Boolean(group && (group.ownerPeerId === identity.peerId || (group.administratorPeerIds ?? []).includes(identity.peerId))));
+        setGroupMembers(dedupeMembersForDisplay(group?.members ?? [], publicIdentity(identity)));
+      }
     }
-    void loadMembers().catch(() => { if (alive) setGroupMembers([]); });
+    void loadMembers().catch(() => { if (alive) { setGroupMembers([]); setSelectedLocalGroup(null); setCanEditSelectedGroup(false); } });
     const reload = () => { void loadMembers().catch(() => undefined); };
     window.addEventListener("risk:social-updated", reload);
     return () => { alive = false; window.removeEventListener("risk:social-updated", reload); };
@@ -268,7 +304,7 @@ function SocialHome() {
 
   useEffect(() => {
     const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
-    if (!conversationId) { setMessages([]); setAttachments([]); setAttachmentProgress({}); return; }
+    if (!conversationId) { setMessages([]); setHasOlderMessages(false); setAttachments([]); setAttachmentProgress({}); return; }
     let alive = true;
     const offMessage = chat.onMessage((message) => {
       if (!alive) return;
@@ -291,6 +327,7 @@ function SocialHome() {
       .then(([chatItems, attachmentItems]) => {
         if (!alive) return;
         setMessages([...chatItems].sort((a, b) => a.createdAt.localeCompare(b.createdAt)));
+        setHasOlderMessages(chatItems.length === 100);
         setAttachments(dedupeAttachments(attachmentItems));
       })
       .catch((cause) => setError(cause instanceof Error ? cause.message : "Falha no histórico local"));
@@ -306,7 +343,9 @@ function SocialHome() {
     };
   }, [activeChannel, activeFriend, privateChannelId]);
 
-  async function enterVoice(channel: Channel) {
+  useEffect(() => setMessageSearch(""), [activeChannel?.id, activeFriend?.id]);
+
+  async function enterVoice(channel: Channel, community = selectedCommunity, availableChannels = channels) {
     if (!channel.voiceRoomId) return;
     if (roomId === channel.voiceRoomId) {
       setCallWorkspaceOpen(true);
@@ -318,12 +357,12 @@ function SocialHome() {
         getOrCreateLocalIdentity(currentUser?.displayName ?? "Participante"),
         loadLocalGroups(),
       ]);
-      const localGroup = localGroups.find((group) => group.groupId === selectedCommunity?.id);
+      const localGroup = localGroups.find((group) => group.groupId === community?.id);
       await call.join(token, channel.voiceRoomId, iceServers, localGroup ? { identity, trustedPeers: localGroup.members } : {});
-      const textChannel = channels.find((item) => item.kind === "text") ?? null;
+      const textChannel = availableChannels.find((item) => item.kind === "text") ?? null;
       setCallContext({
-        groupId: selectedCommunity?.id ?? "",
-        groupName: selectedCommunity?.name ?? "Grupo",
+        groupId: community?.id ?? "",
+        groupName: community?.name ?? "Grupo",
         voiceChannelId: channel.id,
         voiceChannelName: channel.name,
         textChannelId: textChannel?.id ?? null,
@@ -365,11 +404,35 @@ function SocialHome() {
   async function submitMessage(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!activeFriend && !activeChannel) return;
+    const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
+    if (!conversationId || !currentUser) return;
     const input = event.currentTarget.elements.namedItem("message") as HTMLInputElement;
     const content = input.value.trim();
     if (!content) return;
-    try { await chat.send(content); input.value = ""; }
+    try {
+      if (chatStatus === "disconnected" || chatStatus === "error") await chat.queue(conversationId, content, currentUser.displayName);
+      else await chat.send(content);
+      input.value = "";
+    }
     catch (cause) { setError(cause instanceof Error ? cause.message : "Falha ao enviar mensagem"); }
+  }
+
+  async function loadOlderMessages(): Promise<void> {
+    const conversationId = activeFriend ? privateChannelId : activeChannel?.kind === "text" ? activeChannel.id : null;
+    const before = messages[0]?.createdAt;
+    if (!conversationId || !before || loadingOlderMessages) return;
+    setLoadingOlderMessages(true);
+    try {
+      const older = await chat.history(conversationId, { before, limit: 100 });
+      setHasOlderMessages(older.length === 100);
+      setMessages((current) => {
+        const known = new Set(current.map((message) => message.id));
+        return [...older.filter((message) => !known.has(message.id)), ...current]
+          .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+      });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Falha ao carregar mensagens antigas");
+    } finally { setLoadingOlderMessages(false); }
   }
 
   async function sendFiles(files: File[]) {
@@ -495,8 +558,46 @@ function SocialHome() {
     window.dispatchEvent(new Event("risk:social-updated"));
   }
 
+  function groupSaved(group: LocalGroup): void {
+    const updated: Community = { id: group.groupId, name: group.name, avatar: group.avatar, local: true };
+    setCommunities((items) => items.map((item) => item.id === group.groupId ? { ...item, ...updated } : item));
+    setSelectedCommunity((current) => current?.id === group.groupId ? { ...current, ...updated } : current);
+    setSelectedLocalGroup(group);
+    if (callContext?.groupId === group.groupId) setCallContext({ ...callContext, groupName: group.name });
+    setModal(null);
+    void loadSocial();
+  }
+
+  async function changeMemberRole(administrator: boolean): Promise<void> {
+    if (!selectedLocalGroup || !selectedMember || memberSaving) return;
+    setMemberSaving(true);
+    try {
+      const updated = await setLocalGroupAdministrator(selectedLocalGroup.groupId, selectedMember.peerId, administrator);
+      setSelectedLocalGroup(updated);
+      setModal(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível alterar o cargo.");
+    } finally { setMemberSaving(false); }
+  }
+
+  async function removeSelectedMember(): Promise<void> {
+    if (!selectedLocalGroup || !selectedMember || memberSaving) return;
+    setMemberSaving(true);
+    try {
+      const updated = await removeLocalGroupMember(selectedLocalGroup.groupId, selectedMember.peerId);
+      setSelectedLocalGroup(updated);
+      setGroupMembers(dedupeMembersForDisplay(updated.members));
+      setModal(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível remover o membro.");
+    } finally { setMemberSaving(false); }
+  }
+
+  const visibleMessages = messageSearch.trim()
+    ? messages.filter((message) => `${message.author} ${message.content}`.toLocaleLowerCase().includes(messageSearch.trim().toLocaleLowerCase()))
+    : messages;
   const timeline = <ConversationTimeline
-    messages={messages}
+    messages={visibleMessages}
     attachments={attachments}
     progress={attachmentProgress}
     connected={chatStatus === "ready"}
@@ -513,25 +614,29 @@ function SocialHome() {
       <aside className="space-rail">
         <button className={!selectedCommunity ? "space active" : "space"} onClick={() => { setSelectedCommunity(null); setActiveFriend(null); }} title="Amigos"><Sparkles/></button>
         <div className="rail-separator"/>
-        {communities.map((group) => <button key={group.id} className={selectedCommunity?.id === group.id ? "space active" : "space"} onClick={() => { setActiveFriend(null); setSelectedCommunity(group); }} title={group.name}>{group.name.slice(0, 2).toUpperCase()}</button>)}
+        {communities.map((group) => <button key={group.id} className={selectedCommunity?.id === group.id ? "space active" : "space"} onClick={() => { setActiveFriend(null); setSelectedCommunity(group); }} title={group.name}><ProfileAvatar displayName={group.name} avatar={group.avatar} className="group-space-avatar"/></button>)}
         <button className="space add" onClick={() => setModal("group")} title="Criar grupo"><Plus/></button>
       </aside>
 
       <aside className={`navigation ${roomId ? "in-call" : ""}`}>
-        <div className="nav-title"><span>{selectedCommunity?.name ?? activeFriend?.displayName ?? "Risk"}</span>{selectedCommunity && <button className="nav-danger" title="Apagar ou sair do grupo" aria-label="Apagar ou sair do grupo" onClick={() => setDeleteTarget({ kind: "group", group: selectedCommunity })}><Trash2 size={16}/></button>}</div>
+        <div className="nav-title"><span>{selectedCommunity?.name ?? activeFriend?.displayName ?? "Risk"}</span>{selectedCommunity && <div className="nav-title-actions">{canEditSelectedGroup && <button className="nav-edit" title="Personalizar grupo" aria-label="Personalizar grupo" onClick={() => setModal("groupProfile")}><Pencil size={16}/></button>}<button className="nav-danger" title="Apagar ou sair do grupo" aria-label="Apagar ou sair do grupo" onClick={() => setDeleteTarget({ kind: "group", group: selectedCommunity })}><Trash2 size={16}/></button></div>}</div>
         {selectedCommunity ? <>
-          <div className="nav-section"><span>CANAIS DE TEXTO</span><button onClick={() => setModal("channel")}><Plus size={15}/></button></div>
+          <div className="nav-section"><span>CANAIS DE TEXTO</span>{canEditSelectedGroup && <button onClick={() => setModal("channel")}><Plus size={15}/></button>}</div>
           {channels.filter((item) => item.kind === "text").map((channel) => <div className="channel-item" key={channel.id}>
             <button className={activeChannel?.id === channel.id ? "channel active" : "channel"} onClick={() => { backgroundChats.clear(channel.id); setActiveChannel(channel); }}><Hash/><span>{channel.name}</span>{Boolean(unreadChannels[channel.id]) && <small className="unread-badge">{unreadChannels[channel.id]}</small>}</button>
-            {selectedCommunity.local && <div className="channel-actions"><button title="Renomear canal" aria-label={`Renomear ${channel.name}`} onClick={() => setChannelAction({ mode: "edit", channel })}><Pencil size={14}/></button><button className="delete" title="Apagar canal" aria-label={`Apagar ${channel.name}`} onClick={() => setChannelAction({ mode: "delete", channel })}><Trash2 size={14}/></button></div>}
+            {selectedCommunity.local && canEditSelectedGroup && <div className="channel-actions"><button title="Renomear canal" aria-label={`Renomear ${channel.name}`} onClick={() => setChannelAction({ mode: "edit", channel })}><Pencil size={14}/></button><button className="delete" title="Apagar canal" aria-label={`Apagar ${channel.name}`} onClick={() => setChannelAction({ mode: "delete", channel })}><Trash2 size={14}/></button></div>}
           </div>)}
-          <div className="nav-section"><span>SALAS DE VOZ</span><button onClick={() => setModal("channel")}><Plus size={15}/></button></div>
+          <div className="nav-section"><span>SALAS DE VOZ</span>{canEditSelectedGroup && <button onClick={() => setModal("channel")}><Plus size={15}/></button>}</div>
           {channels.filter((item) => item.kind === "voice").map((channel) => <div className="channel-item" key={channel.id}>
             <button className={`channel voice ${roomId === channel.voiceRoomId ? "connected" : ""}`} onClick={() => void enterVoice(channel)}><Headphones/><span>{channel.name}</span>{roomId === channel.voiceRoomId && <small>{Object.keys(callParticipants).length + 1}</small>}</button>
-            {selectedCommunity.local && <div className="channel-actions"><button title="Renomear sala de voz" aria-label={`Renomear ${channel.name}`} onClick={() => setChannelAction({ mode: "edit", channel })}><Pencil size={14}/></button><button className="delete" title="Apagar sala de voz" aria-label={`Apagar ${channel.name}`} onClick={() => setChannelAction({ mode: "delete", channel })}><Trash2 size={14}/></button></div>}
+            {selectedCommunity.local && canEditSelectedGroup && <div className="channel-actions"><button title="Renomear sala de voz" aria-label={`Renomear ${channel.name}`} onClick={() => setChannelAction({ mode: "edit", channel })}><Pencil size={14}/></button><button className="delete" title="Apagar sala de voz" aria-label={`Apagar ${channel.name}`} onClick={() => setChannelAction({ mode: "delete", channel })}><Trash2 size={14}/></button></div>}
           </div>)}
-          <div className="nav-section"><span>MEMBROS</span><button onClick={() => setModal("member")}><UserPlus size={15}/></button></div>
-          {dedupeMembersForDisplay(groupMembers).slice(0, 8).map((member) => <div className="mini-user" key={member.peerId}><ProfileAvatar displayName={member.displayName} avatar={member.avatar}/><span>{member.displayName}</span></div>)}
+          <div className="nav-section"><span>MEMBROS — {dedupeMembersForDisplay(groupMembers).length}</span>{canEditSelectedGroup && <button onClick={() => setModal("inviteMember")}><UserPlus size={15}/></button>}</div>
+          {dedupeMembersForDisplay(groupMembers).map((member) => {
+            const owner = selectedLocalGroup?.ownerPeerId === member.peerId;
+            const administrator = selectedLocalGroup?.administratorPeerIds?.includes(member.peerId);
+            return <button className="mini-user member-menu-trigger" key={member.peerId} onClick={() => { setSelectedMember(member); setModal("manageMember"); }}><ProfileAvatar displayName={member.displayName} avatar={member.avatar}/><span>{member.displayName}</span>{owner ? <em title="Proprietário"><ShieldCheck size={14}/> Dono</em> : administrator ? <em title="Administrador"><Shield size={14}/> Admin</em> : null}</button>;
+          })}
         </> : <>
           <button className={!activeFriend ? "channel active" : "channel"} onClick={() => setActiveFriend(null)}><Users/>Amigos</button>
           {activeFriend && <button className="channel active"><MessageCircle/>{activeFriend.displayName}</button>}
@@ -565,8 +670,9 @@ function SocialHome() {
       <section className="content-panel">
         {error && <div className="global-error" onClick={() => setError("")}>{error}</div>}
         {activeFriend ? <>
-          <header className="content-header"><MessageCircle/><strong>{activeFriend.displayName}</strong><span>Mensagem direta P2P</span><button className={`chat-connect ${chatStatus}`} disabled={!privateChannelId || chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat privado conectado" : chatStatus === "connected" ? "Aguardando amigo…" : chatStatus === "connecting" ? "Conectando…" : "Conectar P2P"}</button></header>
+          <header className="content-header"><MessageCircle/><strong>{activeFriend.displayName}</strong><span>Mensagem direta P2P</span><input className="message-search" value={messageSearch} onChange={(event) => setMessageSearch(event.target.value)} placeholder="Buscar"/><button className={`chat-connect ${chatStatus}`} disabled={!privateChannelId || chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat privado conectado" : chatStatus === "connected" ? "Aguardando amigo…" : chatStatus === "connecting" ? "Conectando…" : "Conectar P2P"}</button></header>
           <div className="messages">
+            {hasOlderMessages && <button className="load-older-messages" disabled={loadingOlderMessages} onClick={() => void loadOlderMessages()}>{loadingOlderMessages ? "Carregando…" : "Carregar mensagens anteriores"}</button>}
             {timeline}
             {!messages.length && !attachments.length && <div className="channel-welcome"><MessageCircle/><h2>Conversa com {activeFriend.displayName}</h2><p>Os dois amigos devem abrir esta conversa e clicar em Conectar P2P. Depois disso mensagens e arquivos seguem diretamente pelo WebRTC.</p></div>}
           </div>
@@ -585,14 +691,21 @@ function SocialHome() {
               onClick={() => {
                 const group = communities.find((item) => item.id === activity.groupId);
                 if (group) { setActiveFriend(null); setSelectedCommunity(group); }
-                if (roomId === activity.roomId) setCallWorkspaceOpen(true);
+                if (roomId === activity.roomId) { setCallWorkspaceOpen(true); return; }
+                void loadLocalGroups().then((groups) => {
+                  const local = groups.find((item) => item.groupId === activity.groupId);
+                  const channel = local?.channels.find((item) => item.id === activity.channelId);
+                  if (group && channel) { setChannels(local!.channels); void enterVoice(channel, group, local!.channels); }
+                });
               }}
             ><span className="voice-activity-icon"><Headphones/></span><span><strong>{activity.channelName}</strong><small>{activity.groupName}</small><em>{activity.participantCount} {activity.participantCount === 1 ? "pessoa conectada" : "pessoas conectadas"}</em></span><i/></button>)}</div>
               : <p>Nenhuma sala de voz ativa nos seus grupos.</p>}
+            {communities.length > 32 && <small>A atividade acompanha os primeiros 32 grupos neste dispositivo.</small>}
           </aside></div>
         </> : activeChannel?.kind === "text" ? <>
-          <header className="content-header"><Hash/><strong>{activeChannel.name}</strong><span>{selectedCommunity.name}</span><button className={`chat-connect ${chatStatus}`} disabled={chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat P2P conectado" : chatStatus === "connected" ? "Aguardando peer…" : chatStatus === "connecting" ? "Conectando…" : "Conectar chat"}</button></header>
+          <header className="content-header"><Hash/><strong>{activeChannel.name}</strong><span>{selectedCommunity.name}</span><input className="message-search" value={messageSearch} onChange={(event) => setMessageSearch(event.target.value)} placeholder="Buscar"/><button className={`chat-connect ${chatStatus}`} disabled={chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat P2P conectado" : chatStatus === "connected" ? "Aguardando peer…" : chatStatus === "connecting" ? "Conectando…" : "Conectar chat"}</button></header>
           <div className="messages">
+            {hasOlderMessages && <button className="load-older-messages" disabled={loadingOlderMessages} onClick={() => void loadOlderMessages()}>{loadingOlderMessages ? "Carregando…" : "Carregar mensagens anteriores"}</button>}
             {timeline}
             {!messages.length && !attachments.length && <div className="channel-welcome"><Hash/><h2>Bem-vindo a #{activeChannel.name}</h2><p>Este é o começo deste canal P2P salvo neste dispositivo.</p></div>}
           </div>
@@ -601,8 +714,9 @@ function SocialHome() {
       </section>
 
       {modal === "friend" && <Modal title="Adicionar amigo" onClose={() => setModal(null)}>{currentUser ? <P2PInvitePanel type="friend" token={token} displayName={currentUser.displayName} onComplete={() => void loadSocial()}/> : <p>Carregando sua identidade…</p>}</Modal>}
-      {modal === "settings" && <Modal title="Voz e vídeo" onClose={() => setModal(null)}><VoiceVideoSettingsPanel/></Modal>}
+      {modal === "settings" && <Modal title="Configurações" onClose={() => setModal(null)}><VoiceVideoSettingsPanel/><LocalStoragePanel/></Modal>}
       {modal === "profile" && currentUser && <Modal title="Editar perfil" onClose={() => setModal(null)}><ProfileEditor profile={{ displayName: currentUser.displayName, avatar: currentUser.avatar }} onSaved={profileSaved}/></Modal>}
+      {modal === "groupProfile" && selectedLocalGroup && <Modal title="Personalizar grupo" onClose={() => setModal(null)}><GroupEditor group={selectedLocalGroup} onSaved={groupSaved}/></Modal>}
       {modal === "group" && <Modal title="Criar um grupo" onClose={() => setModal(null)}><form onSubmit={(event) => {
         event.preventDefault();
         const name = String(new FormData(event.currentTarget).get("name")).trim();
@@ -635,7 +749,16 @@ function SocialHome() {
           window.dispatchEvent(new Event("risk:social-updated"));
         }).catch((cause) => setError(cause instanceof Error ? cause.message : "Falha ao criar canal"));
       }}><input name="name" minLength={2} maxLength={80} placeholder="Nome do canal" required/><select name="kind"><option value="text">Canal de texto</option><option value="voice">Sala de voz</option></select><button>Criar canal</button></form></Modal>}
-      {modal === "member" && selectedCommunity && <Modal title="Adicionar membro" onClose={() => setModal(null)}>{currentUser ? <GroupInvitePanel token={token} displayName={currentUser.displayName} preferredGroupId={selectedCommunity.id} preferredGroupName={selectedCommunity.name} preferredGroupChannels={channels} initialMode="create" onComplete={() => void loadSocial()}/> : <p>Carregando sua identidade…</p>}</Modal>}
+      {modal === "inviteMember" && selectedCommunity && <Modal title="Adicionar membro" onClose={() => setModal(null)}>{currentUser ? <GroupInvitePanel token={token} displayName={currentUser.displayName} preferredGroupId={selectedCommunity.id} preferredGroupName={selectedCommunity.name} preferredGroupChannels={channels} initialMode="create" onComplete={() => void loadSocial()}/> : <p>Carregando sua identidade…</p>}</Modal>}
+      {modal === "manageMember" && selectedMember && selectedLocalGroup && <Modal title="Gerenciar membro" onClose={() => { if (!memberSaving) setModal(null); }}>
+        <div className="member-manager"><ProfileAvatar displayName={selectedMember.displayName} avatar={selectedMember.avatar}/><div><strong>{selectedMember.displayName}</strong><small>{selectedLocalGroup.ownerPeerId === selectedMember.peerId ? "Proprietário" : (selectedLocalGroup.administratorPeerIds ?? []).includes(selectedMember.peerId) ? "Administrador" : "Membro"}</small></div></div>
+        <div className="member-manager-actions">
+          {localIdentityPeerId === selectedLocalGroup.ownerPeerId && selectedMember.peerId !== selectedLocalGroup.ownerPeerId && ((selectedLocalGroup.administratorPeerIds ?? []).includes(selectedMember.peerId) ? <button disabled={memberSaving} onClick={() => void changeMemberRole(false)}><Shield/> Remover administrador</button> : <button disabled={memberSaving} onClick={() => void changeMemberRole(true)}><ShieldCheck/> Tornar administrador</button>)}
+          {selectedMember.peerId !== localIdentityPeerId && selectedMember.peerId !== selectedLocalGroup.ownerPeerId && canEditSelectedGroup && (!(selectedLocalGroup.administratorPeerIds ?? []).includes(selectedMember.peerId) || localIdentityPeerId === selectedLocalGroup.ownerPeerId) && <button className="danger-action" disabled={memberSaving} onClick={() => void removeSelectedMember()}><UserMinus/> {memberSaving ? "Removendo…" : "Remover do grupo"}</button>}
+          {selectedMember.peerId === localIdentityPeerId && <p>Este é o seu perfil no grupo.</p>}
+          {selectedMember.peerId === selectedLocalGroup.ownerPeerId && localIdentityPeerId !== selectedLocalGroup.ownerPeerId && <p>O proprietário possui autoridade final sobre o grupo.</p>}
+        </div>
+      </Modal>}
       {modal === "joinGroup" && <Modal title="Entrar em grupo" onClose={() => setModal(null)}>{currentUser ? <GroupInvitePanel token={token} displayName={currentUser.displayName} initialMode="join" onComplete={() => { void loadSocial(); setModal(null); }}/> : <p>Carregando sua identidade…</p>}</Modal>}
       {deleteTarget && <Modal title={deleteTarget.kind === "friend" ? "Desfazer amizade" : "Remover grupo"} onClose={() => { if (!deleting) setDeleteTarget(null); }}><div className="danger-confirm"><div className="danger-confirm-icon">{deleteTarget.kind === "friend" ? <UserMinus/> : <Trash2/>}</div>{deleteTarget.kind === "friend" ? <p>Desfazer amizade com <strong>{deleteTarget.friend.displayName}</strong>? O histórico local não será apagado automaticamente.</p> : <p>Remover <strong>{deleteTarget.group.name}</strong>? Se você for o dono, o grupo será apagado. Caso contrário, você apenas sairá dele.</p>}<div className="danger-confirm-actions"><button className="secondary" disabled={deleting} onClick={() => setDeleteTarget(null)}>Cancelar</button><button className="danger-action" disabled={deleting} onClick={() => void performDelete()}>{deleting ? "Removendo…" : deleteTarget.kind === "friend" ? "Desfazer amizade" : "Remover grupo"}</button></div></div></Modal>}
       {channelAction?.mode === "edit" && <Modal title={channelAction.channel.kind === "text" ? "Renomear canal" : "Renomear sala de voz"} onClose={() => { if (!channelSaving) setChannelAction(null); }}><form className="channel-edit-form" onSubmit={renameChannel}><input name="name" defaultValue={channelAction.channel.name} minLength={2} maxLength={80} autoFocus required/><small>O tipo do canal será mantido como {channelAction.channel.kind === "text" ? "texto" : "voz"}.</small><button disabled={channelSaving}>{channelSaving ? "Salvando…" : "Salvar nome"}</button></form></Modal>}

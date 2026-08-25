@@ -23,7 +23,7 @@ export class ApiRequestError extends Error {
 
 export type Friend = { id: string; displayName: string; avatar?: string; local?: boolean };
 export type PendingFriend = Friend & { requestId: string };
-export type Community = { id: string; name: string; local?: boolean };
+export type Community = { id: string; name: string; avatar?: string; local?: boolean };
 export type Channel = { id: string; name: string; kind: "text" | "voice"; voiceRoomId?: string | null };
 export type ChatMessage = { id: string; author: string; content: string; createdAt: string };
 export type CommunityInvite = { id: string; communityId: string; communityName: string; inviter: string };

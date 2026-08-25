@@ -1,16 +1,11 @@
 import { loadLocalIdentity, updateLocalIdentityProfile, type LocalIdentity } from "./social-storage";
+import { validAvatarDataUrl } from "./avatar-validation";
+export { MAX_AVATAR_DATA_URL_BYTES, validAvatarDataUrl } from "./avatar-validation";
 
 const MAX_AVATAR_SOURCE_BYTES = 8 * 1024 * 1024;
-export const MAX_AVATAR_DATA_URL_BYTES = 32 * 1024;
 const AVATAR_SIZE = 256;
 
 export type LocalProfile = Pick<LocalIdentity, "displayName" | "avatar">;
-
-export function validAvatarDataUrl(value: unknown): value is string {
-  return typeof value === "string"
-    && /^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]+=*$/i.test(value)
-    && new TextEncoder().encode(value).byteLength <= MAX_AVATAR_DATA_URL_BYTES;
-}
 
 export async function loadLocalProfile(): Promise<LocalProfile | null> {
   const identity = await loadLocalIdentity();
@@ -32,24 +27,30 @@ export async function avatarFromFile(file: File): Promise<string> {
   const bitmap = await createImageBitmap(file);
   try {
     const canvas = document.createElement("canvas");
-    canvas.width = AVATAR_SIZE;
-    canvas.height = AVATAR_SIZE;
     const context = canvas.getContext("2d", { alpha: false });
     if (!context) throw new Error("Não foi possível preparar a imagem de perfil.");
 
     const side = Math.min(bitmap.width, bitmap.height);
     const sourceX = Math.max(0, (bitmap.width - side) / 2);
     const sourceY = Math.max(0, (bitmap.height - side) / 2);
-    context.fillStyle = "#11161e";
-    context.fillRect(0, 0, AVATAR_SIZE, AVATAR_SIZE);
-    context.drawImage(bitmap, sourceX, sourceY, side, side, 0, 0, AVATAR_SIZE, AVATAR_SIZE);
+    const sizes = [...new Set([AVATAR_SIZE, 224, 192, 160, 128, 96].map((size) => Math.min(size, Math.max(1, Math.floor(side)))))]
+      .sort((left, right) => right - left);
 
-    for (const quality of [0.86, 0.72, 0.58, 0.44]) {
-      const blob = await canvasBlob(canvas, "image/webp", quality);
-      const dataUrl = await blobDataUrl(blob);
-      if (validAvatarDataUrl(dataUrl)) return dataUrl;
+    for (const size of sizes) {
+      canvas.width = size;
+      canvas.height = size;
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = "high";
+      context.fillStyle = "#11161e";
+      context.fillRect(0, 0, size, size);
+      context.drawImage(bitmap, sourceX, sourceY, side, side, 0, 0, size, size);
+      for (const quality of [0.86, 0.72, 0.58, 0.44, 0.32]) {
+        const blob = await canvasBlob(canvas, "image/webp", quality);
+        const dataUrl = await blobDataUrl(blob);
+        if (validAvatarDataUrl(dataUrl)) return dataUrl;
+      }
     }
-    throw new Error("Não foi possível reduzir a imagem ao tamanho seguro para o perfil P2P.");
+    throw new Error("Não foi possível reduzir a imagem para o formato P2P.");
   } finally {
     bitmap.close();
   }

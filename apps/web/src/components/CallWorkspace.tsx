@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type RefObject } from "react";
 import {
+  Activity,
+  Copy,
   Hash,
   Maximize2,
   MessageCircle,
@@ -18,7 +20,7 @@ import {
 } from "lucide-react";
 import type { ChatMessage } from "../api";
 import { api } from "../api";
-import type { CallController } from "../call";
+import type { CallController, CallDiagnostics } from "../call";
 import type {
   ChatAttachmentProgress,
   ChatAttachmentRecord,
@@ -136,12 +138,14 @@ function VideoTile({
   tileId,
   focused,
   compact,
+  deafened,
   onFocus,
 }: {
   participant: Participant;
   tileId: string;
   focused: boolean;
   compact: boolean;
+  deafened: boolean;
   onFocus(tileId: string): void;
 }) {
   const streams = Object.values(participant.streams ?? {});
@@ -189,8 +193,8 @@ function VideoTile({
   >
     <video ref={videoRef} autoPlay playsInline muted className={hasVideo ? source : "hidden-video"}/>
     {!hasVideo && <div className="video-off"><ProfileAvatar displayName={participant.displayName} avatar={participant.avatar} className="call-profile-avatar"/><span>Vídeo desligado</span></div>}
-    {userHasAudio && <RemoteAudio stream={microphoneStream!} volume={userVolume}/>} 
-    {screenHasAudio && <RemoteAudio stream={screenStream!} volume={screenVolume}/>} 
+    {userHasAudio && <RemoteAudio stream={microphoneStream!} volume={deafened ? 0 : userVolume}/>}
+    {screenHasAudio && <RemoteAudio stream={screenStream!} volume={deafened ? 0 : screenVolume}/>}
     <FullscreenButton target={articleRef}/>
     {canSwitch && <div className="source-switch">
       <button className={source === "camera" ? "selected" : ""} onClick={(event) => { event.stopPropagation(); setSource("camera"); }}><Video size={14}/> Câmera</button>
@@ -326,6 +330,9 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
   const [screenSources, setScreenSources] = useState<RiskDesktopSource[]>([]);
   const [screenSourcesLoading, setScreenSourcesLoading] = useState(false);
   const [networkQuality, setNetworkQuality] = useState("Boa");
+  const [deafened, setDeafened] = useState(false);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [diagnostics, setDiagnostics] = useState<CallDiagnostics | null>(null);
 
   const context = callContext;
 
@@ -545,7 +552,11 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
           <button className={view === "call" ? "active" : ""} onClick={() => setView("call")}><Video size={16}/> Chamada</button>
           <button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")} disabled={!context?.textChannelId}><MessageCircle size={16}/> Chat</button>
         </div>
-        <div className={`status network-${networkQuality.toLocaleLowerCase()}`} title="Qualidade calculada localmente por RTT, jitter e perda de pacotes"><i/> {networkQuality} · {peers.length + 1}</div>
+        <button
+          className={`network-header-button network-${networkQuality.toLocaleLowerCase()}`}
+          title="Abrir diagnóstico da conexão"
+          onClick={() => { void call.getLiveDiagnostics().then((value) => { setDiagnostics(value); setDiagnosticsOpen(true); }); }}
+        ><Activity size={17}/><span>Rede</span><small>{networkQuality} · {peers.length + 1}</small></button>
       </div>
     </header>
 
@@ -592,6 +603,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
             tileId={id}
             focused={focused === id}
             compact={Boolean(focused && focused !== id)}
+            deafened={deafened}
             onFocus={(next) => setFocusedTile((current) => current === next ? null : next)}
           />;
         })}
@@ -618,6 +630,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
 
     <footer>
       <button className={localState.microphone ? "" : "off"} onClick={() => void call.toggleMicrophone(roomId)}>{localState.microphone ? <Mic/> : <MicOff/>}<span>Microfone</span></button>
+      <button className={deafened ? "off" : ""} onClick={() => setDeafened((value) => !value)} title="Silenciar todo o áudio recebido">{deafened ? <VolumeX/> : <Volume2/>}<span>Ensurdecer</span></button>
       <button className={audioSettingsOpen ? "active" : ""} onClick={() => setAudioSettingsOpen((current) => !current)} title="Configurações de áudio"><Settings2/><span>Áudio</span></button>
       <button className={localState.camera ? "active" : ""} onClick={() => void call.toggleCamera(roomId)}>{localState.camera ? <Video/> : <VideoOff/>}<span>Câmera</span></button>
       <div className="share-control">
@@ -626,7 +639,6 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
           {Object.entries(QUALITY_PROFILES).map(([value, profile]) => <option key={value} value={value}>{profile.label}</option>)}
         </select>
       </div>
-      {context?.textChannelId && <button className={view === "chat" ? "active" : ""} onClick={() => setView(view === "chat" ? "call" : "chat")}><MessageCircle/><span>{view === "chat" ? "Chamada" : "Chat"}</span></button>}
       <button className="hangup" onClick={() => {
         setAudioSettingsOpen(false);
         setRoom(null);
@@ -637,6 +649,14 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
     </footer>
 
     {audioSettingsOpen && <InCallAudioSettings call={call} onClose={() => setAudioSettingsOpen(false)}/>} 
+    {diagnosticsOpen && <section className="network-diagnostics" role="dialog" aria-label="Diagnóstico da conexão">
+      <header><strong>Diagnóstico da conexão</strong><button onClick={() => setDiagnosticsOpen(false)}><X/></button></header>
+      <p>Signaling: <b>{diagnostics?.signaling?.status ?? "indisponível"}</b></p>
+      <p>Canal Supabase: <b>{diagnostics?.signaling?.channelStatus ?? "indisponível"}</b></p>
+      <p>Peers presentes: <b>{diagnostics?.signaling?.presencePeers.length ?? 0}</b></p>
+      {(diagnostics?.peerConnections ?? []).map((peer) => <article key={peer.peerId}><strong>{peer.peerId.slice(0, 8)}</strong><span>WebRTC {peer.connectionState} · ICE {peer.iceConnectionState}</span><small>RTT {peer.roundTripTimeMs ?? 0} ms · jitter {peer.jitterMs ?? 0} ms · perdas {peer.packetsLost ?? 0}</small></article>)}
+      <button onClick={() => void navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2))}><Copy/> Copiar relatório sanitizado</button>
+    </section>}
     {sourcePickerOpen && <ScreenSourcePicker
       sources={screenSources}
       loading={screenSourcesLoading}

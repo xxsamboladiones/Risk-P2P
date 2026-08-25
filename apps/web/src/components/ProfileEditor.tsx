@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from "react";
-import { Camera, Trash2 } from "lucide-react";
+import { Camera, RefreshCw, Trash2 } from "lucide-react";
 import { avatarFromFile, saveLocalProfile, type LocalProfile } from "../services/offline/profile";
+import { repairLocalIdentityAliases } from "../services/offline/social-storage";
 import { ProfileAvatar } from "./ProfileAvatar";
 
 export function ProfileEditor({ profile, onSaved }: { profile: LocalProfile; onSaved(profile: LocalProfile): void }) {
@@ -8,6 +9,7 @@ export function ProfileEditor({ profile, onSaved }: { profile: LocalProfile; onS
   const [avatar, setAvatar] = useState(profile.avatar);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [repairResult, setRepairResult] = useState("");
 
   async function chooseAvatar(file?: File): Promise<void> {
     if (!file) return;
@@ -16,6 +18,19 @@ export function ProfileEditor({ profile, onSaved }: { profile: LocalProfile; onS
     try { setAvatar(await avatarFromFile(file)); }
     catch (cause) { setError(cause instanceof Error ? cause.message : "Não foi possível usar essa imagem."); }
     finally { setBusy(false); }
+  }
+
+  async function repairAliases(): Promise<void> {
+    if (!window.confirm("Remover dos grupos que você administra as identidades antigas que usam exatamente o seu nome atual?")) return;
+    setBusy(true);
+    setError("");
+    setRepairResult("");
+    try {
+      const count = await repairLocalIdentityAliases();
+      setRepairResult(count ? `${count} identidade(s) antiga(s) removida(s).` : "Nenhuma identidade duplicada foi encontrada.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Não foi possível reparar as identidades.");
+    } finally { setBusy(false); }
   }
 
   async function submit(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -38,6 +53,8 @@ export function ProfileEditor({ profile, onSaved }: { profile: LocalProfile; onS
     <label className="profile-name-field">Nome exibido<input value={displayName} minLength={2} maxLength={80} onChange={(event) => setDisplayName(event.target.value)} required/></label>
     <small>A foto é reduzida no seu dispositivo e enviada aos participantes diretamente pelo WebRTC.</small>
     {error && <div className="invite-notice error">{error}</div>}
+    {repairResult && <div className="invite-notice success">{repairResult}</div>}
     <button disabled={busy}>{busy ? "Salvando…" : "Salvar perfil"}</button>
+    <button type="button" className="secondary" disabled={busy} onClick={() => void repairAliases()}><RefreshCw size={16}/> Reparar identidades duplicadas</button>
   </form>;
 }

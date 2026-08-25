@@ -71,7 +71,7 @@ describe("convites P2P descartáveis", () => {
     const signaling = new InMemorySignalingHub(); const data = new DataTransportHub(); const deps = dependencies(signaling, data);
     const owner = await identity("Admin");
     const creator = new GroupInviteService(owner, [], deps); const joiner = new GroupInviteService(await identity("Convidado"), [], deps);
-    const group = { groupId: crypto.randomUUID(), name: "Jogatina", channels: [{ id: crypto.randomUUID(), name: "geral", kind: "text" as const }], ownerPeerId: owner.peerId, membershipVersion: 1 };
+    const group = { groupId: crypto.randomUUID(), name: "Jogatina", channels: [{ id: crypto.randomUUID(), name: "geral", kind: "text" as const }], ownerPeerId: owner.peerId, membershipVersion: 1, manifestVersion: 1, administratorPeerIds: [], removedPeerIds: [], removedMembers: [] };
     const invite = await creator.createGroupInvite(group); await joiner.joinGroupInvite(invite.code);
     await vi.waitFor(() => expect(creator.state?.status).toBe("approval")); await creator.accept();
     await vi.waitFor(() => expect(joiner.state?.status).toBe("accepted"));

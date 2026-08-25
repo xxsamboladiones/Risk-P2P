@@ -117,9 +117,19 @@ Mensagem wire versão 1:
 
 O receptor valida canal, UUID da mensagem, tamanho, conteúdo, timestamp e assinatura ECDSA. O campo `author` da versão 1 permanece apenas para compatibilidade; sessões autenticadas utilizam a versão 2 assinada e a identidade já confiada localmente.
 
+Na versão 2, mensagens que ainda não receberam `chat.message.ack` permanecem em uma caixa de saída local. Elas são reenviadas quando um DataChannel autenticado abre e só são removidas após a confirmação do peer. IDs repetidos são deduplicados pelo receptor. Nada dessa fila passa pelo banco do Supabase.
+
+O perfil usa `chat.profile.update`, assinado pela identidade P2P. Avatares são limitados e não fazem parte dos snapshots recorrentes de membros, evitando inflar o manifesto do grupo.
+
+## Manifesto de grupo v2
+
+O proprietário e administradores autorizados distribuem pelo DataChannel um snapshot assinado com `manifestVersion`, `membershipVersion`, canais, membros, `administratorPeerIds`, `removedPeerIds` e as identidades públicas revogadas necessárias para entregar o aviso de remoção. Apenas versões monotonicamente maiores e assinadas por uma chave já autorizada são aplicadas. Somente um snapshot do proprietário pode mudar a lista de administradores; administradores podem editar o grupo, os canais, criar convites e remover membros comuns. Perfis conhecidos preservam o avatar armazenado localmente, enquanto remoções são mantidas como tombstones para não ressuscitar identidades antigas durante uma reconciliação.
+
+Quando o peer removido volta a conectar um chat do grupo, um membro autorizado entrega o manifesto de revogação diretamente pelo WebRTC. O receptor apaga a cópia local do grupo e notifica a interface. Esse estado social continua local e P2P; Supabase Realtime é usado apenas para o rendezvous efêmero.
+
 O transporte rejeita payloads acima de 64 KiB. O chat usa limite menor na validação e mensagens de até 4.000 caracteres. Quando `RTCDataChannel.bufferedAmount` ultrapassa o limite local de segurança, novas mensagens deixam de ser enfileiradas e o envio retorna falha ao chamador.
 
-O conteúdo do chat não passa pelo Supabase. No desktop, a cópia recebida é salva no SQLite local do sidecar; no modo web sem sidecar, o fallback usa IndexedDB.
+O conteúdo do chat não passa pelo Supabase. No desktop, a cópia recebida é salva no SQLite local do sidecar; no modo web sem sidecar, o fallback usa IndexedDB. O histórico é lido em páginas de até 100 mensagens pela interface, com limite defensivo de 200 itens por consulta.
 
 ## Convites temporários
 

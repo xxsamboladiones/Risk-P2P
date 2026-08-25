@@ -52,7 +52,7 @@ export function GroupInvitePanel({
             const community = communities.find((group) => group.id === preferredGroupId);
             if (!community) throw new Error("Grupo selecionado não foi encontrado.");
             const identity = await getOrCreateLocalIdentity(displayName);
-            metadata = { groupId: preferredGroupId, name: preferredGroupName ?? community.name, channels: preferredGroupChannels ?? await api.channels(token, preferredGroupId).catch(() => []), ownerPeerId: identity.peerId, membershipVersion: 1 };
+            metadata = { groupId: preferredGroupId, name: preferredGroupName ?? community.name, channels: preferredGroupChannels ?? await api.channels(token, preferredGroupId).catch(() => []), ownerPeerId: identity.peerId, membershipVersion: 1, manifestVersion: 1, administratorPeerIds: [], removedPeerIds: [], removedMembers: [] };
           }
 
           try {
@@ -64,6 +64,10 @@ export function GroupInvitePanel({
               metadata.channels,
               metadata.ownerPeerId,
               metadata.membershipVersion,
+              metadata.manifestVersion,
+              metadata.removedPeerIds,
+              metadata.administratorPeerIds,
+              metadata.removedMembers,
             );
             localGroups = await loadLocalGroups();
             window.dispatchEvent(new Event("risk:social-updated"));
@@ -74,7 +78,7 @@ export function GroupInvitePanel({
       }
 
       if (!alive) return;
-      const ownedGroups = initialMode === "create" ? localGroups.filter((group) => group.ownerPeerId === currentIdentity.peerId) : localGroups;
+      const ownedGroups = initialMode === "create" ? localGroups.filter((group) => group.ownerPeerId === currentIdentity.peerId || (group.administratorPeerIds ?? []).includes(currentIdentity.peerId)) : localGroups;
       const available = preferredGroupId
         ? ownedGroups.filter((group) => group.groupId === preferredGroupId)
         : ownedGroups;
@@ -106,6 +110,11 @@ export function GroupInvitePanel({
         channels: selected.channels,
         ownerPeerId: selected.ownerPeerId,
         membershipVersion: selected.membershipVersion,
+        manifestVersion: selected.manifestVersion,
+        administratorPeerIds: selected.administratorPeerIds ?? [],
+        removedPeerIds: selected.removedPeerIds ?? [],
+        removedMembers: (selected.removedMembers ?? []).map(({ avatar: _avatar, ...member }) => member),
+        ownerIdentity: selected.members.find((member) => member.peerId === selected.ownerPeerId),
       }
     : preferredMetadata && selectedId === preferredMetadata.groupId
       ? preferredMetadata

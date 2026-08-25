@@ -2,7 +2,7 @@
 
 **Risk** é um aplicativo desktop de comunicação P2P com chamadas de voz e vídeo, compartilhamento de tela, chat, grupos e transferência de arquivos usando WebRTC.
 
-> **Versão atual: Alpha 0.1.3**
+> **Versão atual: Alpha 0.2.0**
 >
 > O projeto ainda está em fase Alpha. Recursos, protocolo e persistência podem mudar entre versões.
 
@@ -16,10 +16,18 @@
 - envio P2P de arquivos e anexos pelo DataChannel;
 - previews de imagens, vídeos e áudios;
 - grupos com canais de texto e voz;
+- personalização local do nome e da imagem dos grupos, sincronizada por WebRTC;
 - criação, edição e exclusão de canais locais;
 - amizades e convites P2P por código;
 - armazenamento local no desktop com Rust + SQLite;
 - aplicativo Electron para Windows e Linux.
+- manifesto versionado de grupos com remoções propagadas entre os membros;
+- cargos locais de proprietário/administrador, gerenciamento de membros e revogação assinada via WebRTC;
+- entrega de mensagens P2P com caixa de saída local, confirmação e reenvio;
+- perfil assinado e sincronizado sem acoplar a foto ao manifesto do grupo;
+- busca local, diagnóstico de conexão e estimativa de armazenamento;
+- histórico local paginado, carregado em blocos de 100 mensagens;
+- controle de ensurdecer durante chamadas.
 
 No Windows, o compartilhamento de tela pode capturar o áudio do sistema usando o caminho nativo do Electron. No Linux existe um caminho experimental via PipeWire para compartilhar áudio do sistema sem retransmitir o próprio áudio reproduzido pelo Risk; quando esse caminho não está disponível, o compartilhamento continua somente com vídeo.
 
@@ -266,6 +274,14 @@ Esta versão adiciona e melhora principalmente:
 - melhorias de estabilidade e conexão P2P;
 - suporte experimental a áudio de screen share via PipeWire no Linux;
 - nova identidade visual do aplicativo.
+- manifesto de grupo v2 assinado, com canais, membros e remoções consistentes;
+- reparo manual e seguro de aliases antigos da identidade local;
+- mensagens offline na caixa de saída até outro peer confirmar o recebimento;
+- diagnóstico de Presence, WebRTC, ICE, RTT, jitter e perda sem expor SDP ou candidatos;
+- entrada em salas ativas pela tela de atividade e aviso de limites locais;
+- busca no histórico local e visão de uso do armazenamento;
+- paginação do histórico SQLite/IndexedDB para conversas longas;
+- controle de ensurdecer e sincronização assinada de perfil.
 
 ## Documentação
 

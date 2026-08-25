@@ -23,12 +23,25 @@ describe("protocolo assinado de convites", () => {
     expect(await parseAndVerifyInviteMessage(`{"padding":"${"x".repeat(50_000)}"}`, now)).toBeNull();
   });
 
-  it("aceita manifesto de grupo somente quando o autor é o dono declarado", async () => {
+  it("aceita manifesto de grupo do proprietário e de administrador autorizado", async () => {
     const owner = await identity("Dona"); const now = Date.now();
-    const group = { groupId: crypto.randomUUID(), name: "Clã", channels: [], ownerPeerId: owner.peerId, membershipVersion: 1 };
+    const group = { groupId: crypto.randomUUID(), name: "Clã", channels: [], ownerPeerId: owner.peerId, membershipVersion: 1, manifestVersion: 1, administratorPeerIds: [], removedPeerIds: [], removedMembers: [] };
     const valid = await createSignedInviteMessage(owner, { type: "group.join.accept", requestId: crypto.randomUUID(), timestamp: now, group });
     expect(await parseAndVerifyInviteMessage(JSON.stringify(valid), now)).not.toBeNull();
     const invalid = await createSignedInviteMessage(owner, { type: "group.join.accept", requestId: crypto.randomUUID(), timestamp: now, group: { ...group, ownerPeerId: crypto.randomUUID() } });
     expect(await parseAndVerifyInviteMessage(JSON.stringify(invalid), now)).toBeNull();
+    const invalidAvatar = await createSignedInviteMessage(owner, { type: "group.join.accept", requestId: crypto.randomUUID(), timestamp: now, group: { ...group, avatar: "data:text/html;base64,PHNjcmlwdD4=" } });
+    expect(await parseAndVerifyInviteMessage(JSON.stringify(invalidAvatar), now)).toBeNull();
+
+    const administrator = await identity("Admin");
+    const adminGroup = {
+      ...group,
+      administratorPeerIds: [administrator.peerId],
+      ownerIdentity: { peerId: owner.peerId, displayName: owner.displayName, publicKey: owner.publicKey },
+    };
+    const adminInvite = await createSignedInviteMessage(administrator, { type: "group.join.accept", requestId: crypto.randomUUID(), timestamp: now, group: adminGroup });
+    expect(await parseAndVerifyInviteMessage(JSON.stringify(adminInvite), now)).not.toBeNull();
+    const unauthorized = await createSignedInviteMessage(administrator, { type: "group.join.accept", requestId: crypto.randomUUID(), timestamp: now, group: { ...adminGroup, administratorPeerIds: [] } });
+    expect(await parseAndVerifyInviteMessage(JSON.stringify(unauthorized), now)).toBeNull();
   });
 });

@@ -47,17 +47,19 @@ function isMessage(value: unknown): value is SignedInviteMessage {
   const type = item.type as InviteProtocolType;
   return item.version === 1 && types.includes(type) && validId(item.requestId) &&
     typeof item.timestamp === "number" && Number.isFinite(item.timestamp) && typeof item.signature === "string" && item.signature.length < 512 &&
-    Boolean(identity && validId(identity.peerId) && typeof identity.displayName === "string" && identity.displayName.length >= 1 && identity.displayName.length <= 80 &&
-      identity.publicKey && typeof identity.publicKey === "object" &&
-      (identity.avatar === undefined || validAvatarDataUrl(identity.avatar))) &&
+    Boolean(identity && isPeerIdentity(identity)) &&
     (item.reason === undefined || (typeof item.reason === "string" && item.reason.length <= 200)) &&
-    (type !== "group.join.accept" || (isGroup(item.group) && (item.group as PublicGroupMetadata).ownerPeerId === identity?.peerId));
+    (type !== "group.join.accept" || (isGroup(item.group) && ((item.group as PublicGroupMetadata).ownerPeerId === identity?.peerId || ((item.group as PublicGroupMetadata).administratorPeerIds.includes(String(identity?.peerId)) && Boolean((item.group as PublicGroupMetadata).ownerIdentity)))));
 }
 
 function isGroup(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   const group = value as Record<string, unknown>;
-  if (!validId(group.groupId) || !validId(group.ownerPeerId) || !Number.isSafeInteger(group.membershipVersion) || Number(group.membershipVersion) < 1 || typeof group.name !== "string" || group.name.length < 1 || group.name.length > 80 || !Array.isArray(group.channels) || group.channels.length > 100) return false;
+  if (!validId(group.groupId) || !validId(group.ownerPeerId) || !Number.isSafeInteger(group.membershipVersion) || Number(group.membershipVersion) < 1 || !Number.isSafeInteger(group.manifestVersion) || Number(group.manifestVersion) < 1 || !Array.isArray(group.administratorPeerIds) || group.administratorPeerIds.length > 64 || !group.administratorPeerIds.every(validId) || !Array.isArray(group.removedPeerIds) || group.removedPeerIds.length > 256 || !group.removedPeerIds.every(validId) || !Array.isArray(group.removedMembers) || group.removedMembers.length > 256 || !group.removedMembers.every(isPeerIdentity) || typeof group.name !== "string" || group.name.length < 1 || group.name.length > 80 || (group.avatar !== undefined && !validAvatarDataUrl(group.avatar)) || !Array.isArray(group.channels) || group.channels.length > 100) return false;
+  if (group.ownerIdentity !== undefined) {
+    const owner = group.ownerIdentity as Record<string, unknown>;
+    if (!owner || owner.peerId !== group.ownerPeerId || !isPeerIdentity(owner)) return false;
+  }
   return group.channels.every((value) => {
     if (!value || typeof value !== "object") return false;
     const channel = value as Record<string, unknown>;
@@ -68,6 +70,13 @@ function isGroup(value: unknown): boolean {
 }
 
 function validId(value: unknown): value is string { return typeof value === "string" && /^[a-zA-Z0-9_-]{8,128}$/.test(value); }
+function isPeerIdentity(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const identity = value as Record<string, unknown>;
+  return validId(identity.peerId) && typeof identity.displayName === "string" && identity.displayName.length >= 1 && identity.displayName.length <= 80
+    && Boolean(identity.publicKey && typeof identity.publicKey === "object")
+    && (identity.avatar === undefined || validAvatarDataUrl(identity.avatar));
+}
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
   if (value && typeof value === "object") return `{${Object.entries(value as Record<string, unknown>).filter(([, item]) => item !== undefined).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(",")}}`;

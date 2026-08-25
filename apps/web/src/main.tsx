@@ -476,6 +476,17 @@ function SocialHome() {
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Falha ao conectar o chat"); }
   }
 
+  async function disconnectPrivateChat() {
+    if (!privateChannelId) return;
+    try {
+      await backgroundChats.disconnectPrivate(privateChannelId);
+      setChatStatus("disconnected");
+      setAttachmentProgress({});
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Falha ao desconectar o chat privado");
+    }
+  }
+
   async function submitMessage(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!activeFriend && !activeChannel) return;
@@ -743,7 +754,7 @@ function SocialHome() {
       <section className="content-panel">
         {error && <div className="global-error" onClick={() => setError("")}>{error}</div>}
         {activeFriend ? <>
-          <header className="content-header"><MessageCircle/><strong>{activeFriend.displayName}</strong><span>Mensagem direta P2P</span><input className="message-search" value={messageSearch} onChange={(event) => setMessageSearch(event.target.value)} placeholder="Buscar"/><button className={`chat-connect ${chatStatus}`} disabled={!privateChannelId || chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat privado conectado" : chatStatus === "connected" ? "Aguardando amigo…" : chatStatus === "connecting" ? "Conectando…" : chatStatus === "incompatible" ? "Versão incompatível" : "Conectar P2P"}</button></header>
+          <header className="content-header"><MessageCircle/><strong>{activeFriend.displayName}</strong><span>Mensagem direta P2P</span><input className="message-search" value={messageSearch} onChange={(event) => setMessageSearch(event.target.value)} placeholder="Buscar"/><button className={`chat-connect ${chatStatus}`} disabled={!privateChannelId || chatStatus === "connecting" || chatStatus === "connected" || chatStatus === "ready"} onClick={() => void connectChat()}>{chatStatus === "ready" ? "Chat privado conectado" : chatStatus === "connected" ? "Aguardando amigo…" : chatStatus === "connecting" ? "Conectando…" : chatStatus === "incompatible" ? "Versão incompatível" : "Conectar P2P"}</button>{(chatStatus === "connected" || chatStatus === "ready") && <button className="chat-disconnect" onClick={() => void disconnectPrivateChat()} title="Desconectar somente este chat privado"><PhoneOff size={16}/>Desconectar P2P</button>}</header>
           <div className="messages">
             {hasOlderMessages && <button className="load-older-messages" disabled={loadingOlderMessages} onClick={() => void loadOlderMessages()}>{loadingOlderMessages ? "Carregando…" : "Carregar mensagens anteriores"}</button>}
             {timeline}

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   RISK_ATTACHMENT_PROTOCOL_VERSION,
+  classifyAttachment,
+  inferAttachmentMimeType,
   sanitizeAttachmentFilename,
   validateAttachmentManifest,
   type AttachmentManifest,
@@ -36,5 +38,16 @@ describe("attachment protocol validation", () => {
 
   it("removes path traversal and reserved filename characters", () => {
     expect(sanitizeAttachmentFilename("../../bad<name>.exe")).toBe("bad_name_.exe");
+  });
+
+  it("infers image MIME and kind from extension when the picker omits MIME", () => {
+    expect(inferAttachmentMimeType("", "captura.PNG")).toBe("image/png");
+    expect(inferAttachmentMimeType("application/octet-stream", "foto.jpeg")).toBe("image/jpeg");
+    expect(classifyAttachment("application/octet-stream", "foto.jpeg")).toBe("image");
+  });
+
+  it("keeps a specific MIME supplied by the platform", () => {
+    expect(inferAttachmentMimeType("image/webp", "foto.bin")).toBe("image/webp");
+    expect(classifyAttachment("image/webp", "foto.bin")).toBe("image");
   });
 });

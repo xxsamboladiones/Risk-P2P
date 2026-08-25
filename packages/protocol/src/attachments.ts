@@ -115,8 +115,38 @@ export type AttachmentChunkFrame = {
   payload: ArrayBuffer;
 };
 
+const MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  jfif: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  avif: "image/avif",
+  bmp: "image/bmp",
+  ico: "image/x-icon",
+  mp4: "video/mp4",
+  webm: "video/webm",
+  ogv: "video/ogg",
+  mp3: "audio/mpeg",
+  wav: "audio/wav",
+  ogg: "audio/ogg",
+  opus: "audio/ogg",
+  m4a: "audio/mp4",
+  aac: "audio/aac",
+  flac: "audio/flac",
+  pdf: "application/pdf",
+};
+
+export function inferAttachmentMimeType(mimeType: string, filename = ""): string {
+  const normalized = mimeType.trim().toLowerCase();
+  if (normalized && normalized !== "application/octet-stream") return normalized;
+  const extension = filename.toLowerCase().split(".").pop() ?? "";
+  return MIME_BY_EXTENSION[extension] ?? normalized || "application/octet-stream";
+}
+
 export function classifyAttachment(mimeType: string, filename = ""): AttachmentKind {
-  const mime = mimeType.toLowerCase();
+  const mime = inferAttachmentMimeType(mimeType, filename);
   const extension = filename.toLowerCase().split(".").pop() ?? "";
   if (mime.startsWith("image/")) return "image";
   if (mime.startsWith("video/")) return "video";

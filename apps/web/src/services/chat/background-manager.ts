@@ -6,6 +6,7 @@ const MAX_BACKGROUND_CHANNELS = 8;
 export class BackgroundChatManager {
   private readonly sessions = new Map<string, ChatController>();
   private readonly unread = new Map<string, number>();
+  private desiredChannels = new Set<string>();
   private listener?: (unread: ReadonlyMap<string, number>) => void;
 
   onUnread(listener: (unread: ReadonlyMap<string, number>) => void): () => void {
@@ -20,6 +21,7 @@ export class BackgroundChatManager {
   }
 
   async release(channelId: string): Promise<void> {
+    this.desiredChannels.delete(channelId);
     const controller = this.sessions.get(channelId);
     if (!controller) return;
     this.sessions.delete(channelId);
@@ -38,12 +40,16 @@ export class BackgroundChatManager {
     const desired = groups.flatMap((group) => group.channels.filter((channel) => channel.kind === "text").map((channel) => channel.id))
       .filter((channelId) => !excluded.has(channelId))
       .slice(0, MAX_BACKGROUND_CHANNELS);
-    await Promise.all([...this.sessions].filter(([channelId]) => !desired.includes(channelId)).map(async ([channelId, controller]) => {
+    this.desiredChannels = new Set(desired);
+
+    await Promise.all([...this.sessions].filter(([channelId]) => !this.desiredChannels.has(channelId)).map(async ([channelId, controller]) => {
+      if (this.sessions.get(channelId) !== controller) return;
       this.sessions.delete(channelId);
       await controller.disconnect();
     }));
+
     await Promise.all(desired.map(async (channelId) => {
-      if (this.sessions.has(channelId)) return;
+      if (!this.desiredChannels.has(channelId) || this.sessions.has(channelId)) return;
       const controller = new ChatController();
       this.sessions.set(channelId, controller);
       controller.onMessage((message) => {
@@ -54,14 +60,21 @@ export class BackgroundChatManager {
           new Notification(`Nova mensagem no Risk`, { body: `${message.author}: ${message.content.slice(0, 120)}` });
         }
       });
-      await controller.connect(channelId, displayName, iceServers).catch(() => {
-        this.sessions.delete(channelId);
-        return controller.disconnect();
-      });
+      try {
+        await controller.connect(channelId, displayName, iceServers);
+        if (!this.desiredChannels.has(channelId) || this.sessions.get(channelId) !== controller) {
+          if (this.sessions.get(channelId) === controller) this.sessions.delete(channelId);
+          await controller.disconnect();
+        }
+      } catch {
+        if (this.sessions.get(channelId) === controller) this.sessions.delete(channelId);
+        await controller.disconnect();
+      }
     }));
   }
 
   async disconnect(): Promise<void> {
+    this.desiredChannels.clear();
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
     await Promise.all(sessions.map((session) => session.disconnect()));

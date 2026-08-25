@@ -30,6 +30,10 @@ type RateWindow = { startedAt: number; count: number };
 
 const DEBUG = import.meta.env.VITE_DEBUG_SIGNALING === "true";
 const CLIENT_VERSION = import.meta.env.VITE_RISK_APP_VERSION ?? "0.2.0";
+const PRESENCE_LEAVE_GRACE_MS = 10_000;
+const SIGNALING_MAX_AGE_MS = 30_000;
+const SIGNALING_FUTURE_SKEW_MS = 10_000;
+const SESSION_TIMESTAMP_TOLERANCE_MS = 1_500;
 
 export class SupabaseSignalingProvider implements SignalingProvider {
   private readonly callbacks: CallbackSets = {
@@ -49,10 +53,19 @@ export class SupabaseSignalingProvider implements SignalingProvider {
   private channelName?: string;
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private reconnectAttempts = 0;
+  private sessionStartedAt = 0;
+  private readonly missingPeers = new Set<string>();
+  private readonly peerLeaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly peerDepartedAt = new Map<string, number>();
 
   async connect(roomId: string, peerId: string, namespace: SignalingNamespace = "room"): Promise<void> {
     if (this.channel) await this.disconnect();
     this.disconnecting = false;
+    this.sessionStartedAt = Date.now();
+    this.missingPeers.clear();
+    this.peerDepartedAt.clear();
+    this.peerLeaveTimers.forEach((timer) => clearTimeout(timer));
+    this.peerLeaveTimers.clear();
     this.setStatus("connecting");
     this.client = getSupabaseRealtimeClient();
     this.roomId = await secureRoomId(`${namespace}:${roomId}`);
@@ -77,7 +90,7 @@ export class SupabaseSignalingProvider implements SignalingProvider {
           this.reconnectAttempts = 0;
           this.setStatus("connected");
           try {
-            await activeChannel.track({ peerId, joinedAt: Date.now(), clientVersion: CLIENT_VERSION });
+            await activeChannel.track({ peerId, joinedAt: this.sessionStartedAt, clientVersion: CLIENT_VERSION });
             this.reconcilePresence();
             if (!settled) { settled = true; window.clearTimeout(timeout); resolve(); }
           } catch (error) {
@@ -100,6 +113,10 @@ export class SupabaseSignalingProvider implements SignalingProvider {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
     this.reconnectAttempts = 0;
+    this.peerLeaveTimers.forEach((timer) => clearTimeout(timer));
+    this.peerLeaveTimers.clear();
+    this.missingPeers.clear();
+    this.peerDepartedAt.clear();
     const channel = this.channel;
     this.channel = undefined;
     if (channel) {
@@ -114,6 +131,7 @@ export class SupabaseSignalingProvider implements SignalingProvider {
     this.peerId = undefined;
     this.channelStatus = "CLOSED";
     this.channelName = undefined;
+    this.sessionStartedAt = 0;
     this.setStatus("disconnected");
     this.disconnecting = false;
   }
@@ -176,7 +194,7 @@ export class SupabaseSignalingProvider implements SignalingProvider {
       this.channelStatus = status;
       if (status === "SUBSCRIBED") {
         try {
-          await channel.track({ peerId: this.peerId!, joinedAt: Date.now(), clientVersion: CLIENT_VERSION });
+          await channel.track({ peerId: this.peerId!, joinedAt: this.sessionStartedAt, clientVersion: CLIENT_VERSION });
           this.reconnectAttempts = 0;
           this.reconcilePresence();
           this.setStatus("connected");
@@ -199,11 +217,48 @@ export class SupabaseSignalingProvider implements SignalingProvider {
         if (isValidPeer(entry) && entry.peerId !== ownPeerId) next.set(entry.peerId, entry);
       }
     }
-    for (const [peerId, peer] of next) if (!this.presencePeers.has(peerId)) {
-      this.presencePeers.set(peerId, peer); this.log("peer joined", peerId); this.emit("peerJoined", peer);
+
+    for (const [peerId, peer] of next) {
+      const pendingLeave = this.peerLeaveTimers.get(peerId);
+      if (pendingLeave) clearTimeout(pendingLeave);
+      this.peerLeaveTimers.delete(peerId);
+      this.missingPeers.delete(peerId);
+
+      const existing = this.presencePeers.get(peerId);
+      if (!existing) {
+        this.presencePeers.set(peerId, peer);
+        this.log("peer joined", peerId);
+        this.emit("peerJoined", peer);
+        continue;
+      }
+
+      // joinedAt identifica uma sessão lógica do peer. reconnects internos do
+      // Supabase preservam o valor; uma nova instância do Risk recebe outro.
+      if (Math.abs(existing.joinedAt - peer.joinedAt) > SESSION_TIMESTAMP_TOLERANCE_MS) {
+        this.peerDepartedAt.set(peerId, Math.max(Date.now(), peer.joinedAt));
+        this.presencePeers.set(peerId, peer);
+        this.log("peer session replaced", peerId);
+        this.emit("peerLeft", peerId);
+        this.emit("peerJoined", peer);
+        continue;
+      }
+      this.presencePeers.set(peerId, peer);
     }
-    for (const peerId of this.presencePeers.keys()) if (!next.has(peerId)) {
-      this.presencePeers.delete(peerId); this.log("peer left", peerId); this.emit("peerLeft", peerId);
+
+    for (const peerId of this.presencePeers.keys()) {
+      if (next.has(peerId) || this.peerLeaveTimers.has(peerId)) continue;
+      this.missingPeers.add(peerId);
+      const timer = setTimeout(() => {
+        this.peerLeaveTimers.delete(peerId);
+        if (!this.missingPeers.delete(peerId)) return;
+        const peer = this.presencePeers.get(peerId);
+        if (!peer) return;
+        this.presencePeers.delete(peerId);
+        this.peerDepartedAt.set(peerId, Date.now());
+        this.log("peer left after grace", peerId);
+        this.emit("peerLeft", peerId);
+      }, PRESENCE_LEAVE_GRACE_MS);
+      this.peerLeaveTimers.set(peerId, timer);
     }
   }
 
@@ -216,19 +271,32 @@ export class SupabaseSignalingProvider implements SignalingProvider {
   private acceptMessage(message: OfferMessage | AnswerMessage | IceCandidateMessage | PeerStateMessage): boolean {
     if (!this.peerId || !this.roomId || message.roomId !== this.roomId || message.fromPeerId === this.peerId) return false;
     if (message.targetPeerId !== undefined && message.targetPeerId !== this.peerId) return false;
+    const now = Date.now();
+    if (!Number.isFinite(message.timestamp) || message.timestamp < now - SIGNALING_MAX_AGE_MS || message.timestamp > now + SIGNALING_FUTURE_SKEW_MS) return false;
 
-    if (!this.presencePeers.has(message.fromPeerId)) {
-      this.reconcilePresence();
+    if (!this.presencePeers.has(message.fromPeerId)) this.reconcilePresence();
+    const presentPeer = this.presencePeers.get(message.fromPeerId);
+    if (presentPeer && message.timestamp + SESSION_TIMESTAMP_TOLERANCE_MS < presentPeer.joinedAt) {
+      this.log("discarding signaling from older peer session", message.fromPeerId);
+      return false;
+    }
+    const lastDeparture = this.peerDepartedAt.get(message.fromPeerId);
+    if (!presentPeer && lastDeparture && message.timestamp <= lastDeparture) {
+      this.log("discarding signaling sent before peer departure", message.fromPeerId);
+      return false;
+    }
+
+    if (!presentPeer) {
       const targetedWebRtcMessage = message.targetPeerId === this.peerId
         && (message.type === "webrtc.offer" || message.type === "webrtc.answer" || message.type === "webrtc.ice-candidate");
-      if (!this.presencePeers.has(message.fromPeerId) && !targetedWebRtcMessage) return false;
-      if (!this.presencePeers.has(message.fromPeerId)) this.log("accepting WebRTC signaling before presence sync", message.fromPeerId);
+      if (!targetedWebRtcMessage) return false;
+      this.log("accepting fresh WebRTC signaling before presence sync", message.fromPeerId);
     }
 
     this.pruneCaches();
     if (this.processedMessageIds.has(message.messageId)) return false;
     if (!this.withinRateLimit(message.fromPeerId, message.type)) return false;
-    this.processedMessageIds.set(message.messageId, Date.now());
+    this.processedMessageIds.set(message.messageId, now);
     return true;
   }
 

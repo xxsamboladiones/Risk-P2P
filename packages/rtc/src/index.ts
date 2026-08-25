@@ -103,6 +103,7 @@ export interface TransportEvents {
   onRemoteStream(peerId: string, stream: MediaStream): void;
   onConnectionState(peerId: string, state: RTCPeerConnectionState): void;
   onNegotiationError?(peerId: string, error: unknown): void;
+  onPeerReset?(peerId: string): void;
   onDataMessage?(peerId: string, data: string): void;
   onDataState?(peerId: string, state: RTCDataChannelState): void;
   onTransferMessage?(peerId: string, data: ArrayBuffer): void;
@@ -142,6 +143,8 @@ type PeerEntry = {
   pendingIceCandidates: RTCIceCandidateInit[];
   dataChannel?: RTCDataChannel;
   transferDataChannel?: RTCDataChannel;
+  initiator: boolean;
+  descriptionChain: Promise<void>;
 };
 
 const DEFAULT_MAX_REMOTE_PEERS = 5;
@@ -175,7 +178,7 @@ export class MeshWebRTCTransport implements CallTransport {
 
   async connect(peerId: string, initiator: boolean): Promise<void> {
     const entry = this.peers.get(peerId) ?? this.createPeer(peerId);
-    if (initiator) entry.canNegotiate = true;
+    if (initiator) { entry.canNegotiate = true; entry.initiator = true; }
     if (initiator && this.events.onDataMessage && !entry.dataChannel) {
       this.bindControlDataChannel(peerId, entry, entry.pc.createDataChannel(CONTROL_CHANNEL_LABEL, { ordered: true }));
     }
@@ -457,6 +460,8 @@ export class MeshWebRTCTransport implements CallTransport {
       ignoreOffer: false,
       settingRemoteAnswer: false,
       pendingIceCandidates: [],
+      initiator: false,
+      descriptionChain: Promise.resolve(),
     };
     this.peers.set(peerId, entry);
     if (!this.mediaAuthorizationRequired || this.mediaAuthorizedPeers.has(peerId)) this.localTracks.forEach(({ track, stream }) => pc.addTrack(track, stream));
@@ -561,6 +566,15 @@ export class MeshWebRTCTransport implements CallTransport {
 
   private async acceptDescription(peerId: string, description: RTCSessionDescriptionInit): Promise<void> {
     const entry = this.peers.get(peerId) ?? this.createPeer(peerId);
+    const operation = entry.descriptionChain.then(async () => {
+      if (this.peers.get(peerId) !== entry) return;
+      await this.acceptDescriptionNow(peerId, entry, description);
+    });
+    entry.descriptionChain = operation.catch(() => undefined);
+    await operation;
+  }
+
+  private async acceptDescriptionNow(peerId: string, entry: PeerEntry, description: RTCSessionDescriptionInit): Promise<void> {
     const { pc } = entry;
     const readyForOffer = !entry.makingOffer && (pc.signalingState === "stable" || entry.settingRemoteAnswer);
     const offerCollision = description.type === "offer" && !readyForOffer;
@@ -569,10 +583,18 @@ export class MeshWebRTCTransport implements CallTransport {
     if (entry.ignoreOffer) return;
     entry.settingRemoteAnswer = description.type === "answer";
     try {
-      if (offerCollision && pc.signalingState !== "stable") {
-        await Promise.all([pc.setLocalDescription({ type: "rollback" }), pc.setRemoteDescription(description)]);
-      } else {
-        await pc.setRemoteDescription(description);
+      try {
+        if (offerCollision && pc.signalingState !== "stable") {
+          await Promise.all([pc.setLocalDescription({ type: "rollback" }), pc.setRemoteDescription(description)]);
+        } else {
+          await pc.setRemoteDescription(description);
+        }
+      } catch (error) {
+        if (description.type === "offer" && isMLineOrderMismatch(error) && this.peers.get(peerId) === entry) {
+          await this.recoverPeerFromMLineMismatch(peerId, entry, description);
+          return;
+        }
+        throw error;
       }
     } finally { entry.settingRemoteAnswer = false; }
     await this.flushPendingIce(entry);
@@ -585,6 +607,52 @@ export class MeshWebRTCTransport implements CallTransport {
     } else {
       await this.negotiateIfNeeded(peerId, entry);
     }
+  }
+
+  private async recoverPeerFromMLineMismatch(peerId: string, entry: PeerEntry, offer: RTCSessionDescriptionInit): Promise<void> {
+    logger.warn("Resetting one WebRTC peer after stale SDP m-line order", { peerId });
+    const initiator = entry.initiator;
+    const hadTransferChannel = Boolean(entry.transferDataChannel);
+    this.disposePeerEntry(peerId, entry);
+    const replacement = this.createPeer(peerId);
+    replacement.initiator = initiator;
+    replacement.canNegotiate = true;
+    if (this.events.onDataMessage && !replacement.dataChannel) {
+      this.bindControlDataChannel(peerId, replacement, replacement.pc.createDataChannel(CONTROL_CHANNEL_LABEL, { ordered: true }));
+    }
+    if (hadTransferChannel && this.events.onTransferMessage && !replacement.transferDataChannel) {
+      this.bindTransferDataChannel(peerId, replacement, replacement.pc.createDataChannel(TRANSFER_CHANNEL_LABEL, { ordered: true }));
+    }
+    this.events.onPeerReset?.(peerId);
+    await replacement.pc.setRemoteDescription(offer);
+    await this.flushPendingIce(replacement);
+    replacement.needsNegotiation = false;
+    const answer = await replacement.pc.createAnswer();
+    await replacement.pc.setLocalDescription(answer);
+    if (replacement.pc.localDescription) await this.events.sendAnswer(peerId, replacement.pc.localDescription.toJSON());
+  }
+
+  private disposePeerEntry(peerId: string, entry: PeerEntry): void {
+    if (this.peers.get(peerId) === entry) this.peers.delete(peerId);
+    entry.pc.onicecandidate = null;
+    entry.pc.ontrack = null;
+    entry.pc.onnegotiationneeded = null;
+    entry.pc.onconnectionstatechange = null;
+    entry.pendingIceCandidates.length = 0;
+    entry.dataChannel?.close();
+    entry.transferDataChannel?.close();
+    entry.pc.close();
+    this.mediaAuthorizedPeers.delete(peerId);
+    const pendingStreams = this.pendingRemoteStreams.get(peerId);
+    pendingStreams?.forEach((stream) => stream.getTracks().forEach((track) => { track.enabled = false; }));
+    this.pendingRemoteStreams.delete(peerId);
+    const activeStreams = this.activeRemoteStreams.get(peerId);
+    activeStreams?.forEach((stream) => stream.getTracks().forEach((track) => { track.enabled = false; }));
+    this.activeRemoteStreams.delete(peerId);
+    this.previousOutboundBytes.delete(peerId);
+    const timer = this.disconnectedTimers.get(peerId);
+    if (timer) clearTimeout(timer);
+    this.disconnectedTimers.delete(peerId);
   }
 
   private async flushPendingIce(entry: PeerEntry): Promise<void> {
@@ -635,6 +703,12 @@ export class MeshWebRTCTransport implements CallTransport {
 function exactArrayBuffer(data: ArrayBuffer | ArrayBufferView): ArrayBuffer {
   if (data instanceof ArrayBuffer) return data;
   return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+}
+
+function isMLineOrderMismatch(error: unknown): boolean {
+  if (!(error instanceof DOMException) || error.name !== "InvalidAccessError") return false;
+  const message = error.message.toLocaleLowerCase();
+  return message.includes("order of m-lines") && message.includes("previous offer/answer");
 }
 
 export function defaultPeerState(): PeerState { return { microphone: true, camera: false, screenShare: false }; }

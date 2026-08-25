@@ -391,6 +391,20 @@ export class CallController {
           this.connectionFailureMessage = undefined;
         }
       },
+      onPeerReset: (remotePeerId) => {
+        this.authenticatedPeers.delete(remotePeerId);
+        this.remoteIdentityPeerIds.delete(remotePeerId);
+        this.pendingPeerStates.delete(remotePeerId);
+        this.authChallenges.delete(remotePeerId);
+        const timer = this.authTimers.get(remotePeerId); if (timer) clearTimeout(timer);
+        this.authTimers.delete(remotePeerId);
+        const store = useCallStore.getState();
+        const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
+        Object.values(participant.streams ?? {}).forEach((stream) => stream.getTracks().forEach((track) => { track.enabled = false; }));
+        // Preserva nome/avatar autenticados na UI durante a recuperação, mas o
+        // transporte bloqueia mídia até uma nova prova ECDSA pelo DataChannel.
+        store.upsert({ ...participant, streams: {}, connection: "connecting" });
+      },
       onNegotiationError: (remotePeerId, error) => {
         useCallStore.getState().setError(`Falha ao negociar mídia com ${remotePeerId.slice(0, 8)}: ${error instanceof Error ? error.message : String(error)}`);
       },

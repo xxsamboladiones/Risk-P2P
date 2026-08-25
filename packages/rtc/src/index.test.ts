@@ -6,6 +6,7 @@ class FakePeerConnection {
   static addedIce: RTCIceCandidateInit[] = [];
   static dataChannels: FakeDataChannel[] = [];
   static addedTracks: MediaStreamTrack[] = [];
+  static failMLineOrderOnce = false;
   connectionState: RTCPeerConnectionState = "new";
   iceConnectionState: RTCIceConnectionState = "new";
   signalingState: RTCSignalingState = "stable";
@@ -25,6 +26,10 @@ class FakePeerConnection {
     this.signalingState = description.type === "offer" ? "have-local-offer" : "stable";
   }
   async setRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
+    if (description.type === "offer" && FakePeerConnection.failMLineOrderOnce) {
+      FakePeerConnection.failMLineOrderOnce = false;
+      throw new DOMException("Failed to set remote offer sdp: The order of m-lines in subsequent offer doesn't match order from previous offer/answer.", "InvalidAccessError");
+    }
     this.remoteDescription = descriptionWithJson(description);
     this.signalingState = description.type === "offer" ? "have-remote-offer" : "stable";
   }
@@ -94,6 +99,7 @@ describe("MeshWebRTCTransport", () => {
     FakePeerConnection.addedIce = [];
     FakePeerConnection.dataChannels = [];
     FakePeerConnection.addedTracks = [];
+    FakePeerConnection.failMLineOrderOnce = false;
     vi.stubGlobal("RTCPeerConnection", FakePeerConnection);
   });
   afterEach(() => vi.unstubAllGlobals());
@@ -192,6 +198,20 @@ describe("MeshWebRTCTransport", () => {
 
     await transport.acceptAnswer(peerId, { type: "answer", sdp: "answer-1" });
     expect(callbacks.sendOffer).toHaveBeenCalledTimes(2);
+  });
+
+  it("recria somente o peer quando uma offer antiga viola a ordem de m-lines", async () => {
+    const callbacks = events();
+    const peerId = "00000000-0000-4000-8000-000000000002";
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
+    await transport.connect(peerId, false);
+    FakePeerConnection.failMLineOrderOnce = true;
+
+    await transport.acceptOffer(peerId, { type: "offer", sdp: "stale-generation-offer" });
+
+    expect(FakePeerConnection.instances).toHaveLength(2);
+    expect(callbacks.sendAnswer).toHaveBeenCalledOnce();
+    expect(transport.getDiagnostics()).toHaveLength(1);
   });
 
   it("abre um DataChannel por peer e entrega mensagens sem servidor", async () => {

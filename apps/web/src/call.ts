@@ -364,6 +364,11 @@ export class CallController {
     store.setError(null);
     store.setSelf(this.peerId);
 
+    const networkInterfaces = await window.desktop?.getNetworkInterfaces?.().catch((error) => {
+      console.warn("Não foi possível consultar as interfaces locais para diagnóstico WebRTC.", error);
+      return [];
+    }) ?? [];
+
     const signaling = this.createSignaling();
     this.signaling = signaling;
     const transport = new MeshWebRTCTransport(this.peerId, iceServers, {
@@ -426,7 +431,7 @@ export class CallController {
           else this.sendProfile(remotePeerId);
         }
       },
-    });
+    }, networkInterfaces);
     if (this.mediaAuthenticationRequired) transport.requireMediaAuthorization();
     this.transport = transport;
     this.bindSignaling(signaling, roomId, this.peerId);

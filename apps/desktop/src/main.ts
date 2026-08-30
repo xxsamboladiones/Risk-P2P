@@ -3,8 +3,10 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { accessSync, constants as fsConstants, existsSync, readFileSync } from "node:fs";
 import { access, mkdir, unlink, writeFile } from "node:fs/promises";
+import { networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { collectNetworkInterfaces } from "./network-interfaces.js";
 
 if (process.platform === "linux") {
   // pipewire-pulse pode expor o PID do daemon em vez do PID do cliente. Marcar
@@ -343,6 +345,11 @@ ipcMain.handle("backend:config", async (event) => {
   return backendConfig;
 });
 
+ipcMain.handle("network:interfaces", async (event) => {
+  if (!isTrustedRendererUrl(event.sender.getURL())) throw new Error("Origem do renderer não autorizada.");
+  return collectNetworkInterfaces(networkInterfaces());
+});
+
 ipcMain.handle("window:fullscreen", async (event, enabled: unknown) => {
   if (!isTrustedRendererUrl(event.sender.getURL())) throw new Error("Origem do renderer não autorizada.");
   if (typeof enabled !== "boolean") throw new Error("Estado de tela cheia inválido.");
@@ -460,6 +467,7 @@ function createWindow(): void {
       sandbox: true,
     },
   });
+  window.webContents.setWebRTCIPHandlingPolicy("default");
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   window.webContents.on("will-navigate", (event, targetUrl) => {
     if (!isTrustedRendererUrl(targetUrl)) event.preventDefault();

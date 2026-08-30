@@ -1,5 +1,13 @@
 import type { IceCandidatePayload, PeerState } from "@risk/protocol";
 import { MediaDeviceError, logger } from "@risk/shared";
+import {
+  classifySelectedConnectionPath,
+  resolveSelectedCandidatePair,
+  type NetworkInterfaceDescriptor,
+  type SelectedConnectionPath,
+} from "./connection-path";
+
+export * from "./connection-path";
 
 export type ScreenSource = { id: string; name: string; thumbnail?: string; displayId?: string };
 export interface ScreenShareProvider {
@@ -122,6 +130,7 @@ export type PeerConnectionDiagnostics = {
   packetsLost?: number;
   jitterMs?: number;
   outboundBitrateKbps?: number;
+  selectedConnectionPath: SelectedConnectionPath;
 };
 
 export interface CallTransport {
@@ -166,14 +175,23 @@ export class MeshWebRTCTransport implements CallTransport {
   private readonly disconnectedTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private mediaAuthorizationRequired = false;
   private readonly previousOutboundBytes = new Map<string, { bytes: number; timestamp: number }>();
+  private readonly previousConnectionPaths = new Map<string, string>();
+  private readonly maxRemotePeers: number;
+  private readonly networkInterfaces: readonly NetworkInterfaceDescriptor[];
 
   constructor(
     private readonly localPeerId: string,
     private readonly iceServers: RTCIceServer[],
     private readonly events: TransportEvents,
-    private readonly maxRemotePeers = DEFAULT_MAX_REMOTE_PEERS,
+    maxRemotePeersOrNetworkInterfaces: number | readonly NetworkInterfaceDescriptor[] = DEFAULT_MAX_REMOTE_PEERS,
   ) {
-    if (!Number.isInteger(maxRemotePeers) || maxRemotePeers < 1) throw new Error("maxRemotePeers deve ser maior que zero.");
+    this.maxRemotePeers = typeof maxRemotePeersOrNetworkInterfaces === "number"
+      ? maxRemotePeersOrNetworkInterfaces
+      : DEFAULT_MAX_REMOTE_PEERS;
+    this.networkInterfaces = typeof maxRemotePeersOrNetworkInterfaces === "number"
+      ? []
+      : maxRemotePeersOrNetworkInterfaces;
+    if (!Number.isInteger(this.maxRemotePeers) || this.maxRemotePeers < 1) throw new Error("maxRemotePeers deve ser maior que zero.");
   }
 
   async connect(peerId: string, initiator: boolean): Promise<void> {
@@ -402,6 +420,7 @@ export class MeshWebRTCTransport implements CallTransport {
       this.pendingRemoteStreams.delete(id);
       this.activeRemoteStreams.delete(id);
       this.previousOutboundBytes.delete(id);
+      this.previousConnectionPaths.delete(id);
       const timer = this.disconnectedTimers.get(id);
       if (timer) clearTimeout(timer);
       this.disconnectedTimers.delete(id);
@@ -417,6 +436,7 @@ export class MeshWebRTCTransport implements CallTransport {
       pendingIceCandidates: entry.pendingIceCandidates.length,
       dataChannelState: entry.dataChannel?.readyState ?? "unavailable",
       transferDataChannelState: entry.transferDataChannel?.readyState ?? "unavailable",
+      selectedConnectionPath: classifySelectedConnectionPath(undefined),
     }));
   }
 
@@ -424,12 +444,13 @@ export class MeshWebRTCTransport implements CallTransport {
     return Promise.all([...this.peers].map(async ([peerId, entry]) => {
       const base = this.getDiagnostics().find((item) => item.peerId === peerId)!;
       const reports = await entry.pc.getStats();
+      const selectedPair = resolveSelectedCandidatePair(reports);
+      const selectedConnectionPath = classifySelectedConnectionPath(selectedPair, this.networkInterfaces);
       let roundTripTimeMs: number | undefined;
       let packetsLost: number | undefined;
       let jitterMs: number | undefined;
       let outboundBitrateKbps: number | undefined;
       reports.forEach((report) => {
-        if (report.type === "candidate-pair" && report.state === "succeeded" && typeof report.currentRoundTripTime === "number") roundTripTimeMs = Math.round(report.currentRoundTripTime * 1000);
         if (report.type === "inbound-rtp" && !report.isRemote) {
           if (typeof report.packetsLost === "number") packetsLost = (packetsLost ?? 0) + report.packetsLost;
           if (typeof report.jitter === "number") jitterMs = Math.max(jitterMs ?? 0, Math.round(report.jitter * 1000));
@@ -441,7 +462,20 @@ export class MeshWebRTCTransport implements CallTransport {
           this.previousOutboundBytes.set(peerId, { bytes: report.bytesSent, timestamp: now });
         }
       });
-      return { ...base, roundTripTimeMs, packetsLost, jitterMs, outboundBitrateKbps };
+      if (typeof selectedPair?.pair.currentRoundTripTime === "number") {
+        roundTripTimeMs = Math.round(selectedPair.pair.currentRoundTripTime * 1000);
+      }
+      const pathSignature = `${selectedConnectionPath.kind}:${selectedConnectionPath.provider ?? ""}:${selectedConnectionPath.protocol ?? ""}`;
+      if (this.previousConnectionPaths.get(peerId) !== pathSignature) {
+        this.previousConnectionPaths.set(peerId, pathSignature);
+        logger.info("[rtc] selected connection path", {
+          peerId,
+          kind: selectedConnectionPath.kind,
+          provider: selectedConnectionPath.provider,
+          protocol: selectedConnectionPath.protocol,
+        });
+      }
+      return { ...base, roundTripTimeMs, packetsLost, jitterMs, outboundBitrateKbps, selectedConnectionPath };
     }));
   }
 
@@ -451,7 +485,7 @@ export class MeshWebRTCTransport implements CallTransport {
     if (this.peers.size >= this.maxRemotePeers) {
       throw new Error(`Sala cheia: este cliente aceita no máximo ${this.maxRemotePeers + 1} participantes no Mesh.`);
     }
-    const pc = new RTCPeerConnection({ iceServers: this.iceServers });
+    const pc = new RTCPeerConnection({ iceServers: this.iceServers, iceTransportPolicy: "all" });
     const entry: PeerEntry = {
       pc,
       canNegotiate: false,
@@ -650,6 +684,7 @@ export class MeshWebRTCTransport implements CallTransport {
     activeStreams?.forEach((stream) => stream.getTracks().forEach((track) => { track.enabled = false; }));
     this.activeRemoteStreams.delete(peerId);
     this.previousOutboundBytes.delete(peerId);
+    this.previousConnectionPaths.delete(peerId);
     const timer = this.disconnectedTimers.get(peerId);
     if (timer) clearTimeout(timer);
     this.disconnectedTimers.delete(peerId);

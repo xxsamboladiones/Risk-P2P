@@ -451,6 +451,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
     const update = async () => {
       const diagnostics = await call.getLiveDiagnostics().catch(() => null);
       if (!alive || !diagnostics) return;
+      setDiagnostics(diagnostics);
       const degraded = diagnostics.peerConnections.some((peer) => (peer.roundTripTimeMs ?? 0) > 350 || (peer.jitterMs ?? 0) > 60 || (peer.packetsLost ?? 0) > 20);
       const disconnected = diagnostics.peerConnections.some((peer) => !["connected", "connecting", "new"].includes(peer.connectionState));
       setNetworkQuality(disconnected ? "Instável" : degraded ? "Limitada" : "Boa");
@@ -660,7 +661,20 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
       <p>Canal Supabase: <b>{diagnostics?.signaling?.channelStatus ?? "indisponível"}</b></p>
       <p>Peers presentes: <b>{diagnostics?.signaling?.presencePeers.length ?? 0}</b></p>
       <p>Conectividade: <b>{diagnostics?.connectivity.label ?? "verificando"}</b></p>
-      {(diagnostics?.peerConnections ?? []).map((peer) => <article key={peer.peerId}><strong>{peer.peerId.slice(0, 8)}</strong><span>WebRTC {peer.connectionState} · ICE {peer.iceConnectionState}</span><small>RTT {peer.roundTripTimeMs ?? 0} ms · jitter {peer.jitterMs ?? 0} ms · perdas {peer.packetsLost ?? 0}</small></article>)}
+      {(diagnostics?.peerConnections ?? []).map((peer) => {
+        const path = peer.selectedConnectionPath;
+        const routeLabel = path.kind === "unknown" && ["new", "connecting"].includes(peer.connectionState)
+          ? "Conectando..."
+          : path.label;
+        const candidateTypes = [path.localCandidateType, path.remoteCandidateType].filter(Boolean).join(" → ");
+        return <article key={peer.peerId}>
+          <strong>{participants[peer.peerId]?.displayName ?? peer.peerId.slice(0, 8)}</strong>
+          <span>WebRTC {peer.connectionState} · ICE {peer.iceConnectionState}</span>
+          <span>{routeLabel}{path.protocol ? ` · ${path.protocol.toLocaleUpperCase()}` : ""}</span>
+          {candidateTypes && <small>Candidates {candidateTypes}{path.provider ? ` · VPN ${path.provider}` : ""}</small>}
+          <small>RTT {peer.roundTripTimeMs ?? 0} ms · jitter {peer.jitterMs ?? 0} ms · perdas {peer.packetsLost ?? 0}</small>
+        </article>;
+      })}
       <button onClick={() => void navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2))}><Copy/> Copiar relatório sanitizado</button>
     </section>}
     {sourcePickerOpen && <ScreenSourcePicker

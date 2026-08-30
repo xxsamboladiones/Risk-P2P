@@ -15,7 +15,8 @@
     "build": "tsc && electron-builder",
     "build:win": "tsc && electron-builder --win nsis",
     "build:linux": "tsc && electron-builder --linux AppImage deb",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",
@@ -23,6 +24,7 @@
     "electron": "43.4.0",
     "electron-builder": "^25.1.8",
     "typescript": "^5.7.3",
+    "vitest": "^3.0.5",
     "wait-on": "^8.0.1"
   },
   "build": {
@@ -34,7 +36,8 @@
     },
     "files": [
       "dist/main.js",
-      "dist/preload.cjs"
+      "dist/preload.cjs",
+      "dist/network-interfaces.js"
     ],
     "extraResources": [
       {

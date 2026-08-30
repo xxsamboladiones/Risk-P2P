@@ -7,6 +7,8 @@ class FakePeerConnection {
   static dataChannels: FakeDataChannel[] = [];
   static addedTracks: MediaStreamTrack[] = [];
   static failMLineOrderOnce = false;
+  static configurations: RTCConfiguration[] = [];
+  static stats: Array<Record<string, unknown>> = [];
   connectionState: RTCPeerConnectionState = "new";
   iceConnectionState: RTCIceConnectionState = "new";
   signalingState: RTCSignalingState = "stable";
@@ -18,7 +20,10 @@ class FakePeerConnection {
   onconnectionstatechange: (() => void) | null = null;
   ondatachannel: ((event: RTCDataChannelEvent) => void) | null = null;
 
-  constructor() { FakePeerConnection.instances.push(this); }
+  constructor(configuration: RTCConfiguration) {
+    FakePeerConnection.instances.push(this);
+    FakePeerConnection.configurations.push(configuration);
+  }
   async createOffer(): Promise<RTCSessionDescriptionInit> { return { type: "offer", sdp: "offer" }; }
   async createAnswer(): Promise<RTCSessionDescriptionInit> { return { type: "answer", sdp: "answer" }; }
   async setLocalDescription(description: RTCSessionDescriptionInit): Promise<void> {
@@ -40,6 +45,9 @@ class FakePeerConnection {
   getTransceivers(): RTCRtpTransceiver[] { return []; }
   createDataChannel(label: string): RTCDataChannel { const channel = new FakeDataChannel(label); FakePeerConnection.dataChannels.push(channel); return channel as unknown as RTCDataChannel; }
   restartIce(): void {}
+  async getStats(): Promise<RTCStatsReport> {
+    return new Map(FakePeerConnection.stats.map((stat) => [String(stat.id), stat])) as unknown as RTCStatsReport;
+  }
   close(): void { this.connectionState = "closed"; }
 }
 
@@ -100,6 +108,8 @@ describe("MeshWebRTCTransport", () => {
     FakePeerConnection.dataChannels = [];
     FakePeerConnection.addedTracks = [];
     FakePeerConnection.failMLineOrderOnce = false;
+    FakePeerConnection.configurations = [];
+    FakePeerConnection.stats = [];
     vi.stubGlobal("RTCPeerConnection", FakePeerConnection);
   });
   afterEach(() => vi.unstubAllGlobals());
@@ -110,6 +120,41 @@ describe("MeshWebRTCTransport", () => {
     await transport.connect("00000000-0000-4000-8000-000000000002", false);
     expect(FakePeerConnection.instances).toHaveLength(1);
     await transport.disconnect();
+  });
+
+  it("preserva ICE normal com host, STUN e TURN habilitados", async () => {
+    const iceServers = [{ urls: "stun:stun.example.test" }, { urls: "turn:turn.example.test" }];
+    const transport = new MeshWebRTCTransport("local", iceServers, events());
+    await transport.connect("remote", false);
+    expect(FakePeerConnection.configurations[0]).toEqual({ iceServers, iceTransportPolicy: "all" });
+  });
+
+  it("reavalia a rota selecionada a cada getStats sem expor o endereço", async () => {
+    const transport = new MeshWebRTCTransport("local", [], events(), [{
+      name: "ztabcd1234",
+      address: "10.147.20.5",
+      family: "IPv4",
+      provider: "zerotier",
+    }]);
+    await transport.connect("remote", false);
+    FakePeerConnection.stats = [
+      { id: "transport", type: "transport", selectedCandidatePairId: "pair" },
+      { id: "pair", type: "candidate-pair", state: "succeeded", localCandidateId: "local-candidate", remoteCandidateId: "remote-candidate", currentRoundTripTime: 0.021 },
+      { id: "local-candidate", type: "local-candidate", candidateType: "host", address: "10.147.20.5", protocol: "udp" },
+      { id: "remote-candidate", type: "remote-candidate", candidateType: "host", address: "10.147.20.8", protocol: "udp" },
+    ];
+    const vpn = (await transport.collectDiagnostics())[0]!;
+    expect(vpn.selectedConnectionPath).toMatchObject({ kind: "vpn-direct", provider: "zerotier" });
+    expect(vpn.roundTripTimeMs).toBe(21);
+    expect(JSON.stringify(vpn)).not.toContain("10.147.20.5");
+
+    FakePeerConnection.stats = [
+      { id: "transport", type: "transport", selectedCandidatePairId: "relay-pair" },
+      { id: "relay-pair", type: "candidate-pair", state: "succeeded", localCandidateId: "relay", remoteCandidateId: "remote-candidate" },
+      { id: "relay", type: "local-candidate", candidateType: "relay", protocol: "udp" },
+      { id: "remote-candidate", type: "remote-candidate", candidateType: "host" },
+    ];
+    expect((await transport.collectDiagnostics())[0]?.selectedConnectionPath.kind).toBe("turn-relay");
   });
 
   it("mantém cinco conexões remotas para uma chamada Mesh de seis participantes", async () => {

@@ -99,6 +99,16 @@ describe("WebScreenShareProvider", () => {
 
     expect(getDisplayMedia).toHaveBeenCalledOnce();
   });
+
+  it("não solicita captura de áudio quando o usuário escolhe transmitir somente vídeo", async () => {
+    const getDisplayMedia = vi.fn(async () => ({ getTracks: () => [] }) as unknown as MediaStream);
+    vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia } });
+
+    const provider = new WebScreenShareProvider();
+    await provider.startScreenShare(undefined, false);
+
+    expect(getDisplayMedia).toHaveBeenCalledWith({ video: true, audio: false });
+  });
 });
 
 describe("MeshWebRTCTransport", () => {

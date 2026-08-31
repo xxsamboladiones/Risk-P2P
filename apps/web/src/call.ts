@@ -587,7 +587,7 @@ export class CallController {
     } catch (error) { this.reportError(error, "Não foi possível alterar a câmera."); }
   }
 
-  async toggleScreen(_roomId: string, sourceId?: string): Promise<void> {
+  async toggleScreen(_roomId: string, sourceId?: string, includeAudio = true): Promise<void> {
     if (this.screenStream) { await this.stopScreen(); return; }
     const lifecycle = this.lifecycleId;
     let desktopAudio: DesktopScreenAudioPreparation | null = null;
@@ -597,7 +597,7 @@ export class CallController {
       const voiceSettings = loadVoiceVideoSettings();
       const linuxDesktop = isLinuxDesktop();
 
-      if (linuxDesktop) {
+      if (linuxDesktop && includeAudio) {
         // Não bloqueia o vídeo esperando PipeWire. O áudio é anexado depois, se
         // a fonte virtual ficar disponível, sem interromper microfone/chamada.
         linuxAudioPreparation = prepareDesktopScreenAudio(voiceSettings.excludeRiskAudioFromScreenShare).catch((error) => {
@@ -605,6 +605,10 @@ export class CallController {
           return null;
         });
         stream = await startDesktopVideoShare(sourceId);
+      } else if (linuxDesktop) {
+        stream = await startDesktopVideoShare(sourceId);
+      } else if (!includeAudio) {
+        stream = await this.screen.startScreenShare(sourceId, false);
       } else {
         desktopAudio = await prepareDesktopScreenAudio(voiceSettings.excludeRiskAudioFromScreenShare).catch((error) => {
           console.warn("Não foi possível consultar o backend de áudio de tela; usando captura padrão.", error);
@@ -613,7 +617,7 @@ export class CallController {
         const pipeWireDesktop = desktopAudio?.mode === "pipewire" || desktopAudio?.mode === "unavailable";
         stream = pipeWireDesktop
           ? await startPipeWireDesktopShare(desktopAudio!, sourceId)
-          : await this.screen.startScreenShare(sourceId);
+          : await this.screen.startScreenShare(sourceId, true);
       }
 
       const videoTrack = stream.getVideoTracks()[0];

@@ -12,7 +12,7 @@ export * from "./connection-path";
 export type ScreenSource = { id: string; name: string; thumbnail?: string; displayId?: string };
 export interface ScreenShareProvider {
   getSources(): Promise<ScreenSource[]>;
-  startScreenShare(sourceId?: string): Promise<MediaStream>;
+  startScreenShare(sourceId?: string, includeAudio?: boolean): Promise<MediaStream>;
   stopScreenShare(): Promise<void>;
 }
 
@@ -42,7 +42,7 @@ export class WebScreenShareProvider implements ScreenShareProvider {
     return desktop ? desktop.listScreenSources() : [];
   }
 
-  async startScreenShare(sourceId?: string): Promise<MediaStream> {
+  async startScreenShare(sourceId?: string, includeAudio = true): Promise<MediaStream> {
     const desktop = desktopScreenBridge();
     if (desktop) {
       let selectedSourceId = sourceId;
@@ -60,10 +60,12 @@ export class WebScreenShareProvider implements ScreenShareProvider {
     }
 
     const restrictOwnAudio = riskMediaCaptureOptions()?.restrictOwnAudio === true;
-    const audio: true | DisplayAudioConstraints = restrictOwnAudio ? { restrictOwnAudio: true } : true;
+    const audio: boolean | DisplayAudioConstraints = includeAudio
+      ? restrictOwnAudio ? { restrictOwnAudio: true } : true
+      : false;
     this.stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio });
 
-    if (restrictOwnAudio) {
+    if (includeAudio && restrictOwnAudio) {
       const audioTrack = this.stream.getAudioTracks()[0];
       if (audioTrack) {
         const settings = audioTrack.getSettings() as DisplayAudioSettings;

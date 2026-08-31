@@ -47,6 +47,7 @@ type QualityProfile = {
 };
 
 const SCREEN_QUALITY_KEY = "risk.screenShareQuality";
+const SCREEN_AUDIO_KEY = "risk.screenShareAudio";
 const QUALITY_PROFILES: Record<ScreenQuality, QualityProfile> = {
   "720p30": { label: "720p · 30 FPS", width: 1280, height: 720, fps: 30 },
   "720p60": { label: "720p · 60 FPS", width: 1280, height: 720, fps: 60 },
@@ -61,6 +62,10 @@ function isScreenQuality(value: string | null): value is ScreenQuality {
 function initialScreenQuality(): ScreenQuality {
   const saved = localStorage.getItem(SCREEN_QUALITY_KEY);
   return isScreenQuality(saved) ? saved : "1080p30";
+}
+
+function initialScreenAudio(): boolean {
+  return localStorage.getItem(SCREEN_AUDIO_KEY) !== "false";
 }
 
 async function applyScreenQuality(stream: MediaStream | null, quality: ScreenQuality): Promise<void> {
@@ -284,17 +289,30 @@ function upsertAttachment(current: ChatAttachmentRecord[], record: ChatAttachmen
 function ScreenSourcePicker({
   sources,
   loading,
+  includeAudio,
+  onAudioChange,
   onChoose,
   onClose,
 }: {
   sources: RiskDesktopSource[];
   loading: boolean;
+  includeAudio: boolean;
+  onAudioChange(includeAudio: boolean): void;
   onChoose(source: RiskDesktopSource): void;
   onClose(): void;
 }) {
   return <div className="screen-picker-backdrop" onMouseDown={onClose}>
     <section className="screen-picker" onMouseDown={(event) => event.stopPropagation()}>
-      <header><div><MonitorUp/><span><strong>Compartilhar tela</strong><small>Escolha uma tela ou janela</small></span></div><button onClick={onClose} aria-label="Fechar"><X/></button></header>
+      <header>
+        <div><MonitorUp/><span><strong>Compartilhar tela</strong><small>Escolha uma tela ou janela</small></span></div>
+        <button
+          className={`screen-audio-option ${includeAudio ? "active" : ""}`}
+          onClick={() => onAudioChange(!includeAudio)}
+          aria-pressed={includeAudio}
+          title={includeAudio ? "O áudio do sistema será transmitido" : "Apenas o vídeo da tela será transmitido"}
+        >{includeAudio ? <Volume2 size={17}/> : <VolumeX size={17}/>}<span>{includeAudio ? "Com áudio" : "Sem áudio"}</span></button>
+        <button className="screen-picker-close" onClick={onClose} aria-label="Fechar"><X/></button>
+      </header>
       {loading ? <div className="screen-picker-loading"><Sparkles/><span>Buscando telas e janelas…</span></div> :
         <div className="screen-source-grid">
           {sources.map((source) => <button key={source.id} className="screen-source" onClick={() => onChoose(source)}>
@@ -326,6 +344,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
   const [attachments, setAttachments] = useState<ChatAttachmentRecord[]>([]);
   const [attachmentProgress, setAttachmentProgress] = useState<Record<string, ChatAttachmentProgress | undefined>>({});
   const [quality, setQuality] = useState<ScreenQuality>(initialScreenQuality);
+  const [screenAudioEnabled, setScreenAudioEnabled] = useState(initialScreenAudio);
   const [audioSettingsOpen, setAudioSettingsOpen] = useState(false);
   const [sourcePickerOpen, setSourcePickerOpen] = useState(false);
   const [screenSources, setScreenSources] = useState<RiskDesktopSource[]>([]);
@@ -447,6 +466,10 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
   }, [localPreviews.screen, quality]);
 
   useEffect(() => {
+    localStorage.setItem(SCREEN_AUDIO_KEY, String(screenAudioEnabled));
+  }, [screenAudioEnabled]);
+
+  useEffect(() => {
     let alive = true;
     const update = async () => {
       const diagnostics = await call.getLiveDiagnostics().catch(() => null);
@@ -480,7 +503,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
       return;
     }
     if (!window.desktop?.listScreenSources) {
-      await call.toggleScreen(roomId);
+      await call.toggleScreen(roomId, undefined, screenAudioEnabled);
       return;
     }
     setSourcePickerOpen(true);
@@ -498,7 +521,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
   async function chooseScreen(source: RiskDesktopSource): Promise<void> {
     setSourcePickerOpen(false);
     try {
-      await call.toggleScreen(roomId, source.id);
+      await call.toggleScreen(roomId, source.id, screenAudioEnabled);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Não foi possível iniciar o compartilhamento.");
     }
@@ -641,6 +664,16 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
       <button className={localState.camera ? "active" : ""} onClick={() => void call.toggleCamera(roomId)}>{localState.camera ? <Video/> : <VideoOff/>}<span>Câmera</span></button>
       <div className="share-control">
         <button className={localState.screenShare ? "active" : ""} onClick={() => void showScreenPicker()}><MonitorUp/><span>{localState.screenShare ? "Parar transmissão" : "Compartilhar"}</span></button>
+        <select
+          value={screenAudioEnabled ? "audio" : "silent"}
+          onChange={(event) => setScreenAudioEnabled(event.target.value === "audio")}
+          disabled={localState.screenShare}
+          aria-label="Áudio da transmissão de tela"
+          title={localState.screenShare ? "Pare a transmissão para mudar o áudio" : "Escolha se o áudio do sistema será transmitido"}
+        >
+          <option value="audio">Com áudio</option>
+          <option value="silent">Sem áudio</option>
+        </select>
         <select value={quality} onChange={(event) => setQuality(event.target.value as ScreenQuality)} aria-label="Qualidade da transmissão" title="Qualidade da transmissão">
           {Object.entries(QUALITY_PROFILES).map(([value, profile]) => <option key={value} value={value}>{profile.label}</option>)}
         </select>
@@ -680,6 +713,8 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
     {sourcePickerOpen && <ScreenSourcePicker
       sources={screenSources}
       loading={screenSourcesLoading}
+      includeAudio={screenAudioEnabled}
+      onAudioChange={setScreenAudioEnabled}
       onChoose={(source) => void chooseScreen(source)}
       onClose={() => setSourcePickerOpen(false)}
     />}

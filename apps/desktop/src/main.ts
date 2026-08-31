@@ -24,6 +24,7 @@ function shouldUseLinuxSoftwareRendering(): boolean {
   // caminho de hardware, falha antes de renderizar a janela e deixa a tela preta.
   const gbmDrivers = [
     "/usr/lib/gbm/dri_gbm.so",
+    "/usr/lib64/gbm/dri_gbm.so",
     "/usr/lib/x86_64-linux-gnu/gbm/dri_gbm.so",
   ];
   const hasUnreadableGbmDriver = gbmDrivers.some((file) => {

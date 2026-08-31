@@ -52,6 +52,8 @@ export type PublicGroupMetadata = {
   /** Incluída em convites criados por administradores para ancorar a chave do proprietário. */
   ownerIdentity?: PublicPeerIdentity;
 };
+/** Manifesto compacto usado somente no aceite de convite. */
+export type GroupInviteMetadata = PublicGroupMetadata & { members?: PublicPeerIdentity[] };
 export type LocalGroup = PublicGroupMetadata & { members: PublicPeerIdentity[]; joinedAt: number };
 
 export function nextGroupManifestRevision(group: PublicGroupMetadata, actorPeerId: string): Pick<PublicGroupMetadata, "manifestVersion" | "manifestActorPeerId" | "manifestOperationId"> {

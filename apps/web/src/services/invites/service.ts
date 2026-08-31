@@ -6,8 +6,8 @@ import {
   publicIdentity,
   saveLocalFriend,
   saveLocalGroup,
+  type GroupInviteMetadata,
   type LocalIdentity,
-  type PublicGroupMetadata,
   type PublicPeerIdentity,
 } from "../offline/social-storage";
 import {
@@ -99,7 +99,7 @@ export class InviteService {
   private candidatePeerId?: string;
   private request?: IncomingInviteRequest;
   private requestId?: string;
-  private group?: PublicGroupMetadata;
+  private group?: GroupInviteMetadata;
   private pendingDecision?: "accept" | "reject";
   private expiryTimer?: ReturnType<typeof setTimeout>;
   private availabilityTimer?: ReturnType<typeof setTimeout>;
@@ -135,7 +135,7 @@ export class InviteService {
 
   async createInvite(
     type: InviteType,
-    group?: PublicGroupMetadata,
+    group?: GroupInviteMetadata,
     ttlMs = DEFAULT_INVITE_TTL_MS,
   ): Promise<InviteSnapshot> {
     await this.cancel(false);
@@ -404,7 +404,7 @@ export class InviteService {
       } else if (message.group) {
         const ownerIdentity = message.group.ownerIdentity ?? (message.identity.peerId === message.group.ownerPeerId ? message.identity : undefined);
         if (!ownerIdentity) throw new Error("A identidade do proprietário não veio no convite.");
-        const members = [ownerIdentity, message.identity, publicIdentity(this.identity)]
+        const members = [...(message.group.members ?? []), ownerIdentity, message.identity, publicIdentity(this.identity)]
           .filter((member, index, all) => all.findIndex((candidate) => candidate.peerId === member.peerId) === index);
         await saveLocalGroup({
           ...message.group,
@@ -464,7 +464,7 @@ export class InviteService {
   private async send(
     type: SignedInviteMessage["type"],
     requestId: string,
-    group?: PublicGroupMetadata,
+    group?: GroupInviteMetadata,
   ): Promise<void> {
     if (!this.transport || !this.candidatePeerId) {
       throw new Error("Conexão P2P indisponível.");
@@ -669,7 +669,7 @@ export class FriendInviteService extends InviteService {
 }
 
 export class GroupInviteService extends InviteService {
-  createGroupInvite(group: PublicGroupMetadata, ttlMs?: number): Promise<InviteSnapshot> {
+  createGroupInvite(group: GroupInviteMetadata, ttlMs?: number): Promise<InviteSnapshot> {
     return this.createInvite("group", group, ttlMs);
   }
 

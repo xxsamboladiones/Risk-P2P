@@ -1,17 +1,14 @@
 import type { PublicPeerIdentity } from "./social-storage";
 
 export function dedupeMembersForDisplay(members: PublicPeerIdentity[], preferred?: PublicPeerIdentity): PublicPeerIdentity[] {
-  const unique = new Map<string, PublicPeerIdentity>();
-  const preferredName = preferred ? normalizedDisplayName(preferred.displayName) : "";
+  const unique: PublicPeerIdentity[] = [];
   for (const member of members) {
     const resolved = preferred && sameIdentity(member, preferred) ? preferred : member;
-    const key = normalizedDisplayName(resolved.displayName);
-    if (!key) continue;
-    if (!unique.has(key) || (preferred && key === preferredName)) {
-      unique.set(key, preferred && key === preferredName ? preferred : resolved);
-    }
+    const existing = unique.findIndex((candidate) => sameIdentity(candidate, resolved));
+    if (existing < 0) unique.push(resolved);
+    else if (preferred && sameIdentity(resolved, preferred)) unique[existing] = preferred;
   }
-  return [...unique.values()];
+  return unique;
 }
 
 function sameIdentity(left: PublicPeerIdentity, right: PublicPeerIdentity): boolean {
@@ -20,8 +17,4 @@ function sameIdentity(left: PublicPeerIdentity, right: PublicPeerIdentity): bool
     && left.publicKey.y === right.publicKey.y
     && left.publicKey.crv === right.publicKey.crv
   );
-}
-
-function normalizedDisplayName(displayName: string): string {
-  return displayName.trim().normalize("NFKC").toLocaleLowerCase();
 }

@@ -7,6 +7,7 @@ import {
   groupRendezvousId,
   reconcileIdentityMembership,
   resolveLocalGroupManifest,
+  sameLocalGroupManifestState,
   upsertGroupMemberIdentity,
   verifyGroupRevocationCertificate,
   type LocalGroup,
@@ -47,6 +48,18 @@ describe("permissões de grupo local", () => {
     const stale = { peerId: "member_12345678", displayName: "Perfil antigo", publicKey: { kty: "EC", crv: "P-256", x: "old-x", y: "old-y" } };
     const authenticated = { peerId: stale.peerId, displayName: "Perfil atual", publicKey: { kty: "EC", crv: "P-256", x: "new-x", y: "new-y" } };
     expect(upsertGroupMemberIdentity([stale], authenticated)).toEqual([authenticated]);
+  });
+
+  it("reconhece manifesto idêntico sem depender da ordem dos campos da chave", () => {
+    const member = { peerId: "member_12345678", displayName: "Membro", publicKey: { kty: "EC", crv: "P-256", x: "member-x", y: "member-y", ext: true } };
+    const local = { ...group, members: [member], joinedAt: 1 } satisfies LocalGroup;
+    const reordered = {
+      ...local,
+      members: [{ ...member, publicKey: { y: "member-y", x: "member-x", crv: "P-256", kty: "EC", ext: true } }],
+      joinedAt: 999,
+    };
+    expect(sameLocalGroupManifestState(local, reordered)).toBe(true);
+    expect(sameLocalGroupManifestState(local, { ...reordered, membershipVersion: 2 })).toBe(false);
   });
 
   it("normaliza campos ausentes e recupera o proprietário de uma lista vazia", async () => {

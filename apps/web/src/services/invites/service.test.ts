@@ -1,13 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TransportEvents } from "@risk/rtc";
 import { InMemorySignalingHub, InMemorySignalingProvider } from "../signaling/in-memory";
-import { createGroupAdministratorGrant, type LocalIdentity } from "../offline/social-storage";
+import { createGroupAdministratorGrant, loadLocalGroups, mergeLocalGroupManifest, type LocalGroup, type LocalIdentity } from "../offline/social-storage";
 import { FriendInviteService, GroupInviteService, type InviteDependencies, type InviteTransport } from "./service";
 
 const savedFriends: unknown[] = []; const savedGroups: unknown[] = []; const members: unknown[] = [];
 vi.mock("../offline/social-storage", async (original) => {
   const actual = await original<typeof import("../offline/social-storage")>();
-  return { ...actual, saveLocalFriend: vi.fn(async (value) => { savedFriends.push(value); }), saveLocalGroup: vi.fn(async (value) => { savedGroups.push(value); }), addLocalGroupMember: vi.fn(async (...value) => { members.push(value); }) };
+  return {
+    ...actual,
+    loadLocalGroups: vi.fn(async () => []),
+    mergeLocalGroupManifest: vi.fn(async (value) => value),
+    saveLocalFriend: vi.fn(async (value) => { savedFriends.push(value); }),
+    saveLocalGroup: vi.fn(async (value) => { savedGroups.push(value); }),
+    addLocalGroupMember: vi.fn(async (...value) => { members.push(value); }),
+  };
 });
 
 async function identity(name: string): Promise<LocalIdentity> {
@@ -52,7 +59,12 @@ function dependencies(signalingHub: InMemorySignalingHub, dataHub: DataTransport
 }
 
 describe("convites P2P descartáveis", () => {
-  beforeEach(() => { savedFriends.length = 0; savedGroups.length = 0; members.length = 0; });
+  beforeEach(() => {
+    savedFriends.length = 0; savedGroups.length = 0; members.length = 0;
+    vi.clearAllMocks();
+    vi.mocked(loadLocalGroups).mockResolvedValue([]);
+    vi.mocked(mergeLocalGroupManifest).mockImplementation(async (value) => value);
+  });
   afterEach(() => { vi.useRealTimers(); });
 
   it("conclui pedido e aceite de amizade pelo DataChannel e limpa o rendezvous", async () => {
@@ -96,6 +108,31 @@ describe("convites P2P descartáveis", () => {
     await vi.waitFor(() => expect(joiner2.state?.status).toBe("rejected")); expect(savedFriends).toHaveLength(0);
   });
 
+  it("mescla o aceite com um grupo local existente sem sobrescrever o manifesto", async () => {
+    const signaling = new InMemorySignalingHub(); const data = new DataTransportHub(); const deps = dependencies(signaling, data);
+    const owner = await identity("Proprietário");
+    const invited = await identity("Convidado");
+    const publicOwner = (({ privateKey: _privateKey, id: _id, ...member }) => member)(owner);
+    const existing: LocalGroup = {
+      groupId: crypto.randomUUID(), name: "Grupo existente", channels: [], members: [publicOwner], ownerPeerId: owner.peerId,
+      membershipVersion: 7, manifestVersion: 7, manifestActorPeerId: owner.peerId, manifestOperationId: crypto.randomUUID(),
+      administratorEpoch: 3, administratorPeerIds: [], administratorGrants: [], removedPeerIds: [], removedMembers: [], revocations: [],
+      rendezvousVersion: 2, rendezvousSecret: crypto.randomUUID(), joinedAt: 1,
+    };
+    vi.mocked(loadLocalGroups).mockResolvedValue([existing]);
+    const creator = new GroupInviteService(owner, [], deps);
+    const joiner = new GroupInviteService(invited, [], deps);
+    const invite = await creator.createGroupInvite(existing);
+    await joiner.joinGroupInvite(invite.code);
+    await vi.waitFor(() => expect(creator.state?.status).toBe("approval"));
+    await creator.accept();
+    await vi.waitFor(() => expect(joiner.state?.status).toBe("accepted"));
+
+    expect(mergeLocalGroupManifest).toHaveBeenCalledOnce();
+    expect(mergeLocalGroupManifest).toHaveBeenCalledWith(expect.objectContaining({ groupId: existing.groupId }), owner.peerId);
+    expect(savedGroups).toEqual([]);
+  });
+
   it("não fica preso quando o DataChannel fecha depois de abrir", async () => {
     const signaling = new InMemorySignalingHub(); const data = new DataTransportHub(); const deps = dependencies(signaling, data);
     const creator = new FriendInviteService(await identity("Ana"), [], deps); const joiner = new FriendInviteService(await identity("Beto"), [], deps);
@@ -124,6 +161,20 @@ describe("convites P2P descartáveis", () => {
     expect(creator.state?.status).toBe("approval");
     expect(creator.state?.message).toContain("tentar novamente");
     vi.useRealTimers();
+    await Promise.all([creator.cancel(false), joiner.cancel(false)]);
+  });
+
+  it("registra a aprovação do membro antes de entregar o aceite do grupo", async () => {
+    const signaling = new InMemorySignalingHub(); const data = new DataTransportHub(); const deps = dependencies(signaling, data);
+    const owner = await identity("Proprietário");
+    const creator = new GroupInviteService(owner, [], deps); const joiner = new GroupInviteService(await identity("Convidado"), [], deps);
+    const group = { groupId: crypto.randomUUID(), name: "Grupo", channels: [], ownerPeerId: owner.peerId, membershipVersion: 1, manifestVersion: 1, administratorPeerIds: [], removedPeerIds: [], removedMembers: [] };
+    const invite = await creator.createGroupInvite(group); await joiner.joinGroupInvite(invite.code);
+    await vi.waitFor(() => expect(creator.state?.status).toBe("approval"));
+    [...data.transports.values()][0]!.dropTypes.add("group.join.accept");
+    await creator.accept();
+    expect(members).toHaveLength(1);
+    expect(joiner.state?.status).not.toBe("accepted");
     await Promise.all([creator.cancel(false), joiner.cancel(false)]);
   });
 

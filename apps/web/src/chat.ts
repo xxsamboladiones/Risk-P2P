@@ -20,6 +20,7 @@ import {
   getOrCreateLocalIdentity,
   loadLocalGroups,
   mergeLocalGroupManifest,
+  sameLocalGroupManifestState,
   updateKnownPeerProfile,
   validGroupAdministratorGrant,
   validGroupRevocationCertificate,
@@ -45,6 +46,8 @@ export type ChatConnectionOptions = {
   rendezvousId?: string;
   namespace?: SignalingNamespace;
   maxRemotePeers?: number;
+  /** Sessão de controle do grupo: sincroniza manifesto sem histórico/anexos. */
+  membershipOnly?: boolean;
 };
 
 type LegacyChatWireMessage = {
@@ -211,6 +214,7 @@ export class ChatController {
   private unsubscribers: Array<() => void> = [];
   private refreshingMembers?: Promise<void>;
   private pendingMemberRefreshBroadcast = false;
+  private membershipOnly = false;
   private sessionToken?: object;
   private readyTimer?: ReturnType<typeof setTimeout>;
 
@@ -253,6 +257,7 @@ export class ChatController {
       this.groupId = options.groupId ?? inferred?.groupId;
       this.rendezvousId = rendezvousId;
       this.signalingNamespace = namespace;
+      this.membershipOnly = options.membershipOnly === true;
       this.identity = identity;
       this.peerId = localPeerId;
       this.displayName = displayName.trim();
@@ -317,18 +322,20 @@ export class ChatController {
       }, options.maxRemotePeers);
       this.transport = transport;
 
-      const attachmentStorage = await createAttachmentStorage();
+      const attachmentStorage = this.membershipOnly ? undefined : await createAttachmentStorage();
       if (this.sessionToken !== sessionToken || this.transport !== transport) {
         await transport.disconnect().catch(() => undefined);
         throw new DOMException("Conexão do chat substituída por outra sessão.", "AbortError");
       }
-      this.installAttachmentService(new AttachmentService(
-        transport,
-        channelId,
-        localPeerId,
-        () => this.sessionToken === sessionToken ? [...this.openDataPeers] : [],
-        attachmentStorage,
-      ));
+      if (attachmentStorage) {
+        this.installAttachmentService(new AttachmentService(
+          transport,
+          channelId,
+          localPeerId,
+          () => this.sessionToken === sessionToken ? [...this.openDataPeers] : [],
+          attachmentStorage,
+        ));
+      }
       this.bindSignaling(signaling, localPeerId);
       if (this.groupId && typeof window !== "undefined") {
         const refresh = () => { if (this.sessionToken === sessionToken) void this.refreshGroupMembership(true); };
@@ -373,6 +380,7 @@ export class ChatController {
     this.signalingNamespace = "chat";
     this.peerId = undefined;
     this.identity = undefined;
+    this.membershipOnly = false;
     this.pendingMemberRefreshBroadcast = false;
     this.refreshingMembers = undefined;
     this.clearReadyTimeout();
@@ -770,6 +778,7 @@ export class ChatController {
       await this.sendProfileUpdate(remotePeerId);
       if (!this.isSessionPeerActive(sessionToken, remotePeerId)) return;
       await this.sendGroupMembership(remotePeerId);
+      if (this.membershipOnly) return;
       if (!this.isSessionPeerActive(sessionToken, remotePeerId)) return;
       await this.flushOutbox(remotePeerId);
       if (!this.isSessionPeerActive(sessionToken, remotePeerId)) return;
@@ -883,7 +892,7 @@ export class ChatController {
       if (remotePeerId !== current.ownerPeerId
         && (envelope.administratorEpoch !== (current.administratorEpoch ?? 1)
           || JSON.stringify([...envelope.administratorPeerIds].sort()) !== JSON.stringify([...(current.administratorPeerIds ?? [])].sort()))) return;
-      const merged = await mergeLocalGroupManifest({
+      const incoming = {
         ...current,
         name: envelope.name,
         avatar: envelope.avatar,
@@ -902,9 +911,15 @@ export class ChatController {
         revocations: envelope.revocations,
         rendezvousVersion: envelope.rendezvousVersion,
         rendezvousSecret: envelope.rendezvousSecret,
-      }, remotePeerId);
+      };
+      const merged = await mergeLocalGroupManifest(incoming, remotePeerId);
       this.installGroupPeers(merged.members ?? [], merged.removedMembers ?? [], merged.revocations ?? []);
       await this.connectPresentTrustedPeers();
+      const localCanAnswer = merged.ownerPeerId === this.identity.peerId
+        || (merged.administratorPeerIds ?? []).includes(this.identity.peerId);
+      if (localCanAnswer && !sameLocalGroupManifestState(incoming, merged)) {
+        await this.sendGroupMembership(remotePeerId);
+      }
       return;
     }
     if (envelope.type === "chat.profile.update") {

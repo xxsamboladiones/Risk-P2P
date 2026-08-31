@@ -5,7 +5,8 @@ import type { TransportEvents } from "@risk/rtc";
 const runtime = vi.hoisted(() => ({
   transports: new Map<string, {
     peerId: string;
-    remote?: string;
+    remotes: Set<string>;
+    openPeers: Set<string>;
     events: TransportEvents;
     closed: boolean;
   }>(),
@@ -18,6 +19,8 @@ vi.mock("./services/offline/social-storage", async () => {
   return {
     ...actual,
     loadLocalGroups: vi.fn(async () => []),
+    mergeLocalGroupManifest: vi.fn(async (group: LocalGroup) => group),
+    updateKnownPeerProfile: vi.fn(async () => undefined),
     applyGroupRevocationCertificate: vi.fn(async (certificate: { targetPeerId: string }) => {
       runtime.appliedRevocations.push(certificate.targetPeerId);
       return true;
@@ -29,20 +32,23 @@ vi.mock("@risk/rtc", () => ({
   MeshWebRTCTransport: class FakeMeshWebRTCTransport {
     private readonly entry: {
       peerId: string;
-      remote?: string;
+      remotes: Set<string>;
+      openPeers: Set<string>;
       events: TransportEvents;
       closed: boolean;
     };
 
     constructor(peerId: string, _iceServers: RTCIceServer[], events: TransportEvents) {
-      this.entry = { peerId, events, closed: false };
+      this.entry = { peerId, remotes: new Set(), openPeers: new Set(), events, closed: false };
       runtime.transports.set(peerId, this.entry);
     }
 
     async connect(remotePeerId: string): Promise<void> {
-      this.entry.remote = remotePeerId;
+      this.entry.remotes.add(remotePeerId);
       const remote = runtime.transports.get(remotePeerId);
-      if (remote?.remote === this.entry.peerId && !remote.closed) {
+      if (remote?.remotes.has(this.entry.peerId) && !remote.closed && !this.entry.openPeers.has(remotePeerId)) {
+        this.entry.openPeers.add(remotePeerId);
+        remote.openPeers.add(this.entry.peerId);
         queueMicrotask(() => {
           this.entry.events.onDataState?.(remotePeerId, "open");
           remote.events.onDataState?.(this.entry.peerId, "open");
@@ -55,16 +61,21 @@ vi.mock("@risk/rtc", () => ({
     async addIceCandidate(): Promise<void> {}
 
     sendData(data: string, targetPeerId?: string): number {
-      const remotePeerId = targetPeerId ?? this.entry.remote;
-      const remote = remotePeerId ? runtime.transports.get(remotePeerId) : undefined;
-      if (!remote || remote.closed) return 0;
-      queueMicrotask(() => remote.events.onDataMessage?.(this.entry.peerId, data));
-      return 1;
+      const targets = targetPeerId ? [targetPeerId] : [...this.entry.openPeers];
+      let sent = 0;
+      for (const remotePeerId of targets) {
+        const remote = runtime.transports.get(remotePeerId);
+        if (!remote || remote.closed || !this.entry.openPeers.has(remotePeerId)) continue;
+        queueMicrotask(() => remote.events.onDataMessage?.(this.entry.peerId, data));
+        sent += 1;
+      }
+      return sent;
     }
 
     async disconnect(remotePeerId?: string): Promise<void> {
       if (remotePeerId) {
-        if (this.entry.remote === remotePeerId) this.entry.remote = undefined;
+        this.entry.remotes.delete(remotePeerId);
+        this.entry.openPeers.delete(remotePeerId);
         return;
       }
       this.entry.closed = true;
@@ -185,6 +196,65 @@ describe("ciclo de conexão do ChatController", () => {
     expect(runtime.messages).toHaveLength(2);
 
     await Promise.all([first.disconnect(), second.disconnect()]);
+  });
+
+  it("forma uma malha autenticada completa entre A, B e C", async () => {
+    const hub = new InMemorySignalingHub();
+    const a = await identity("Alice");
+    const b = await identity("Bruno");
+    const c = await identity("Carla");
+    const group: LocalGroup = {
+      groupId: "group_mesh_abc_12345678",
+      name: "Grupo ABC",
+      channels: [],
+      members: [a, b, c].map(publicIdentity).sort((left, right) => left.peerId.localeCompare(right.peerId)),
+      ownerPeerId: a.peerId,
+      membershipVersion: 3,
+      manifestVersion: 3,
+      manifestActorPeerId: a.peerId,
+      manifestOperationId: "operation_mesh_abc_12345678",
+      administratorEpoch: 1,
+      administratorPeerIds: [],
+      administratorGrants: [],
+      removedPeerIds: [],
+      removedMembers: [],
+      revocations: [],
+      rendezvousVersion: 1,
+      rendezvousSecret: "rendezvous_mesh_abc_12345678",
+      joinedAt: Date.now(),
+    };
+    vi.mocked(loadLocalGroups).mockResolvedValue([group]);
+    const controllers = [a, b, c].map(() => new ChatController(() => new InMemorySignalingProvider(hub)));
+    const receivedByA: string[] = [];
+    const receivedByC: string[] = [];
+    controllers[0]!.onMessage((message) => receivedByA.push(message.content));
+    controllers[2]!.onMessage((message) => receivedByC.push(message.content));
+    const options = (local: LocalIdentity) => ({
+      identity: local,
+      trustedPeers: group.members,
+      groupId: group.groupId,
+      rendezvousId: group.groupId,
+      namespace: "group" as const,
+      requireIdentityAuthentication: true,
+      membershipOnly: true,
+    });
+
+    await controllers[0]!.connect(group.groupId, a.displayName, [], options(a));
+    await controllers[1]!.connect(group.groupId, b.displayName, [], options(b));
+    await controllers[2]!.connect(group.groupId, c.displayName, [], options(c));
+
+    await vi.waitFor(() => {
+      for (const controller of controllers) {
+        expect((controller as unknown as { openDataPeers: Set<string> }).openDataPeers.size).toBe(2);
+      }
+    });
+    await controllers[1]!.send("B alcança A e C");
+    await vi.waitFor(() => {
+      expect(receivedByA).toEqual(["B alcança A e C"]);
+      expect(receivedByC).toEqual(["B alcança A e C"]);
+    });
+
+    await Promise.all(controllers.map((controller) => controller.disconnect()));
   });
 
   it("preserva a transmissão de membros pedida durante uma atualização em andamento", async () => {

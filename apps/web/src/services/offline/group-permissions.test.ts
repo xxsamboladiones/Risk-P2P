@@ -7,6 +7,7 @@ import {
   groupRendezvousId,
   reconcileIdentityMembership,
   resolveLocalGroupManifest,
+  upsertGroupMemberIdentity,
   verifyGroupRevocationCertificate,
   type LocalGroup,
   type LocalIdentity,
@@ -40,6 +41,12 @@ describe("permissões de grupo local", () => {
     const legacy = { ...group, administratorPeerIds: undefined } as unknown as PublicGroupMetadata;
     expect(() => canManageLocalGroup(legacy, "member_12345678")).not.toThrow();
     expect(canManageLocalGroup(legacy, "owner_12345678")).toBe(true);
+  });
+
+  it("substitui um perfil parcial antigo pela identidade autenticada no novo convite", () => {
+    const stale = { peerId: "member_12345678", displayName: "Perfil antigo", publicKey: { kty: "EC", crv: "P-256", x: "old-x", y: "old-y" } };
+    const authenticated = { peerId: stale.peerId, displayName: "Perfil atual", publicKey: { kty: "EC", crv: "P-256", x: "new-x", y: "new-y" } };
+    expect(upsertGroupMemberIdentity([stale], authenticated)).toEqual([authenticated]);
   });
 
   it("normaliza campos ausentes e recupera o proprietário de uma lista vazia", async () => {

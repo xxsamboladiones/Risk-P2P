@@ -12,6 +12,7 @@ vi.mock("./services/offline/social-storage", async () => {
 type ReconcileRemoteMediaState = typeof import("./call")["reconcileRemoteMediaState"];
 let reconcileRemoteMediaState: ReconcileRemoteMediaState;
 let parseCallProfileMessage: typeof import("./call")["parseCallProfileMessage"];
+let sameCallPublicKey: typeof import("./call")["sameCallPublicKey"];
 let CallController: typeof import("./call")["CallController"];
 
 function fakeStream(id: string, video = true): MediaStream {
@@ -32,7 +33,7 @@ beforeAll(async () => {
   vi.stubGlobal("MediaStream", class {
     getTracks(): MediaStreamTrack[] { return []; }
   });
-  ({ CallController, reconcileRemoteMediaState, parseCallProfileMessage } = await import("./call"));
+  ({ CallController, reconcileRemoteMediaState, parseCallProfileMessage, sameCallPublicKey } = await import("./call"));
 });
 
 afterAll(() => vi.unstubAllGlobals());
@@ -73,6 +74,13 @@ describe("reconcileRemoteMediaState", () => {
 });
 
 describe("perfil da chamada via DataChannel", () => {
+  it("reconhece a mesma chave pública independentemente da ordem dos campos", () => {
+    const stored: JsonWebKey = { kty: "EC", crv: "P-256", x: "abc", y: "def", ext: true, key_ops: ["verify"] };
+    const received: JsonWebKey = { key_ops: ["verify"], y: "def", x: "abc", crv: "P-256", kty: "EC", ext: true };
+    expect(JSON.stringify(stored)).not.toBe(JSON.stringify(received));
+    expect(sameCallPublicKey(stored, received)).toBe(true);
+  });
+
   it("aceita nome e avatar de imagem com envelope válido", () => {
     const avatar = "data:image/png;base64,AA==";
     expect(parseCallProfileMessage(JSON.stringify({

@@ -404,8 +404,13 @@ export class InviteService {
       } else if (message.group) {
         const ownerIdentity = message.group.ownerIdentity ?? (message.identity.peerId === message.group.ownerPeerId ? message.identity : undefined);
         if (!ownerIdentity) throw new Error("A identidade do proprietário não veio no convite.");
-        const members = [...(message.group.members ?? []), ownerIdentity, message.identity, publicIdentity(this.identity)]
-          .filter((member, index, all) => all.findIndex((candidate) => candidate.peerId === member.peerId) === index);
+        const membersByPeerId = new Map<string, PublicPeerIdentity>();
+        // O snapshot pode conter um perfil antigo do proprietário ou do
+        // administrador. As identidades autenticadas pelo convite prevalecem.
+        for (const member of [...(message.group.members ?? []), ownerIdentity, message.identity, publicIdentity(this.identity)]) {
+          membersByPeerId.set(member.peerId, member);
+        }
+        const members = [...membersByPeerId.values()];
         await saveLocalGroup({
           ...message.group,
           members,

@@ -300,11 +300,11 @@ export async function addLocalGroupMember(group: PublicGroupMetadata, member: Pu
     || (base.removedMembers ?? []).some((candidate) => samePeerIdentity(candidate, member))) {
     throw new Error("Esta identidade foi revogada neste grupo e não pode ser reutilizada. Crie uma nova identidade P2P para um novo ingresso.");
   }
-  const members = [...base.members];
-  if (!members.some((item) => samePeerIdentity(item, member)) && members.length >= MAX_GROUP_MEMBERS) {
+  const existingMember = base.members.some((item) => samePeerIdentity(item, member));
+  if (!existingMember && base.members.length >= MAX_GROUP_MEMBERS) {
     throw new Error(`Este grupo atingiu o limite local de ${MAX_GROUP_MEMBERS} membros da versão Alpha.`);
   }
-  if (!members.some((item) => samePeerIdentity(item, member))) members.push(member);
+  const members = upsertGroupMemberIdentity(base.members, member);
   await saveLocalGroup({
     ...base,
     members,
@@ -312,6 +312,14 @@ export async function addLocalGroupMember(group: PublicGroupMetadata, member: Pu
     ...nextGroupManifestRevision({ ...base, manifestVersion: Math.max(group.manifestVersion, base.manifestVersion) }, owner.peerId),
   });
   if (typeof window !== "undefined") window.dispatchEvent(new Event("risk:social-updated"));
+}
+
+export function upsertGroupMemberIdentity(members: PublicPeerIdentity[], member: PublicPeerIdentity): PublicPeerIdentity[] {
+  const next = [...members];
+  const index = next.findIndex((candidate) => samePeerIdentity(candidate, member));
+  if (index < 0) next.push(member);
+  else next[index] = member;
+  return next;
 }
 
 export async function updateLocalGroupProfile(groupId: string, name: string, avatar?: string): Promise<LocalGroup> {

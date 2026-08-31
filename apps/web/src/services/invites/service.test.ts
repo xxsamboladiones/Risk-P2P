@@ -71,12 +71,13 @@ describe("convites P2P descartáveis", () => {
     const signaling = new InMemorySignalingHub(); const data = new DataTransportHub(); const deps = dependencies(signaling, data);
     const owner = await identity("Proprietário A");
     const administrator = await identity("Administrador B");
+    const staleAdministrator = await identity("Perfil antigo de B");
     const invitedMember = await identity("Convidado");
     const publicOwner = (({ privateKey: _privateKey, id: _id, ...member }) => member)(owner);
     const publicAdministrator = (({ privateKey: _privateKey, id: _id, ...member }) => member)(administrator);
     const baseGroup = { groupId: crypto.randomUUID(), name: "Jogatina", channels: [{ id: crypto.randomUUID(), name: "geral", kind: "text" as const }], ownerPeerId: owner.peerId, membershipVersion: 2, manifestVersion: 2, administratorEpoch: 1, administratorPeerIds: [administrator.peerId], administratorGrants: [], removedPeerIds: [], removedMembers: [], ownerIdentity: publicOwner };
     const grant = await createGroupAdministratorGrant(baseGroup, publicAdministrator, owner, 1);
-    const group = { ...baseGroup, administratorGrants: [grant], members: [publicOwner, publicAdministrator] };
+    const group = { ...baseGroup, administratorGrants: [grant], members: [publicOwner, { ...publicAdministrator, displayName: staleAdministrator.displayName, publicKey: staleAdministrator.publicKey }] };
     const creator = new GroupInviteService(administrator, [], deps); const joiner = new GroupInviteService(invitedMember, [], deps);
     const invite = await creator.createGroupInvite(group); await joiner.joinGroupInvite(invite.code);
     await vi.waitFor(() => expect(creator.state?.status).toBe("approval")); await creator.accept();
@@ -88,6 +89,8 @@ describe("convites P2P descartáveis", () => {
       administrator.peerId,
       invitedMember.peerId,
     ]));
+    expect((savedGroups[0] as { members: Array<{ peerId: string; publicKey: JsonWebKey }> }).members
+      .find((member) => member.peerId === administrator.peerId)?.publicKey).toEqual(administrator.publicKey);
     const creator2 = new FriendInviteService(await identity("C"), [], deps); const joiner2 = new FriendInviteService(await identity("D"), [], deps);
     const second = await creator2.createFriendInvite(); await joiner2.joinFriendInvite(second.code); await vi.waitFor(() => expect(creator2.state?.status).toBe("approval")); await creator2.reject();
     await vi.waitFor(() => expect(joiner2.state?.status).toBe("rejected")); expect(savedFriends).toHaveLength(0);

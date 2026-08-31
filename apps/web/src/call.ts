@@ -97,6 +97,13 @@ export function parseCallProfileMessage(value: string): CallProfileMessage | nul
   return { version: 1, type: "call.profile", payload: { displayName, avatar: payload.avatar as string | undefined } };
 }
 
+export function sameCallPublicKey(left: JsonWebKey, right: JsonWebKey): boolean {
+  return left.kty === right.kty
+    && left.crv === right.crv
+    && left.x === right.x
+    && left.y === right.y;
+}
+
 function placeholderParticipant(peerId: string): Participant {
   return {
     peerId,
@@ -777,7 +784,7 @@ export class CallController {
     if (!transport || !identity || !expectedNonce || message.nonce !== expectedNonce || !remoteIdentity || typeof message.signature !== "string" || !validRiskPeerCapabilities(message.capabilities) || !compatibleCallPeer(message.capabilities)) return;
     if (remoteIdentity.peerId !== remotePeerId || !/^[A-Za-z0-9_-]{8,128}$/.test(remoteIdentity.peerId) || remoteIdentity.displayName.trim().length < 2 || remoteIdentity.displayName.length > 80 || (remoteIdentity.avatar !== undefined && !validAvatarDataUrl(remoteIdentity.avatar))) return;
     const trusted = this.trustedPeers.get(remoteIdentity.peerId) ?? this.revokedPeers.get(remoteIdentity.peerId);
-    if (!trusted || JSON.stringify(trusted.publicKey) !== JSON.stringify(remoteIdentity.publicKey)) return;
+    if (!trusted || !sameCallPublicKey(trusted.publicKey, remoteIdentity.publicKey)) return;
     try {
       const key = await crypto.subtle.importKey("jwk", trusted.publicKey, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
       const canonical = this.authCanonical(remotePeerId, expectedNonce, remoteIdentity, message.capabilities);

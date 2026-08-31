@@ -1,9 +1,18 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { PeerState } from "@risk/protocol";
+import type { LocalGroup } from "./services/offline/social-storage";
+
+const callRuntime = vi.hoisted(() => ({ groups: [] as LocalGroup[] }));
+
+vi.mock("./services/offline/social-storage", async () => {
+  const actual = await vi.importActual<typeof import("./services/offline/social-storage")>("./services/offline/social-storage");
+  return { ...actual, loadLocalGroups: vi.fn(async () => callRuntime.groups) };
+});
 
 type ReconcileRemoteMediaState = typeof import("./call")["reconcileRemoteMediaState"];
 let reconcileRemoteMediaState: ReconcileRemoteMediaState;
 let parseCallProfileMessage: typeof import("./call")["parseCallProfileMessage"];
+let CallController: typeof import("./call")["CallController"];
 
 function fakeStream(id: string, video = true): MediaStream {
   return {
@@ -20,7 +29,10 @@ beforeAll(async () => {
     removeItem: (key: string) => { values.delete(key); },
     clear: () => { values.clear(); },
   });
-  ({ reconcileRemoteMediaState, parseCallProfileMessage } = await import("./call"));
+  vi.stubGlobal("MediaStream", class {
+    getTracks(): MediaStreamTrack[] { return []; }
+  });
+  ({ CallController, reconcileRemoteMediaState, parseCallProfileMessage } = await import("./call"));
 });
 
 afterAll(() => vi.unstubAllGlobals());
@@ -79,5 +91,61 @@ describe("perfil da chamada via DataChannel", () => {
       type: "call.profile",
       payload: { displayName: "Maria", avatar: `data:image/png;base64,${"A".repeat(70_000)}` },
     }))).toBeNull();
+  });
+});
+
+describe("sincronização de membros durante a chamada", () => {
+  it("conecta peers presentes que se tornaram confiáveis após atualizar o grupo", async () => {
+    const localPeerId = "00000000-0000-4000-8000-000000000001";
+    const peerB = "00000000-0000-4000-8000-000000000002";
+    const peerC = "00000000-0000-4000-8000-000000000003";
+    const groupId = "group_call_members_12345678";
+    const roomId = "room_call_members_12345678";
+    callRuntime.groups = [{
+      groupId,
+      name: "Grupo da chamada",
+      channels: [],
+      members: [localPeerId, peerB, peerC].map((peerId) => ({ peerId, displayName: peerId, publicKey: { kty: "EC" } })),
+      ownerPeerId: localPeerId,
+      membershipVersion: 3,
+      manifestVersion: 3,
+      administratorPeerIds: [],
+      removedPeerIds: [],
+      removedMembers: [],
+      joinedAt: Date.now(),
+    }];
+    const connect = vi.fn(async () => undefined);
+    const reconnectSignaling = vi.fn(async () => undefined);
+    const sendPeerState = vi.fn(async () => undefined);
+    const signaling = {
+      connect: reconnectSignaling,
+      getDiagnostics: () => ({ presencePeers: [peerB, peerC] }),
+      sendPeerState,
+    };
+    const controller = new CallController();
+    const internals = controller as unknown as {
+      lifecycleId: number;
+      roomId: string;
+      rendezvousId: string;
+      groupId: string;
+      peerId: string;
+      signaling: typeof signaling;
+      transport: { connect: typeof connect };
+      refreshGroupSecurity(): Promise<void>;
+    };
+    internals.lifecycleId = 1;
+    internals.roomId = roomId;
+    internals.rendezvousId = roomId;
+    internals.groupId = groupId;
+    internals.peerId = localPeerId;
+    internals.signaling = signaling;
+    internals.transport = { connect };
+
+    await internals.refreshGroupSecurity();
+
+    expect(connect).toHaveBeenCalledTimes(2);
+    expect(connect).toHaveBeenCalledWith(peerB, true);
+    expect(connect).toHaveBeenCalledWith(peerC, true);
+    expect(sendPeerState).toHaveBeenCalledOnce();
   });
 });

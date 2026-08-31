@@ -874,6 +874,24 @@ export class CallController {
       await signaling.connect(nextRendezvousId, peerId);
       if (!this.isActive(lifecycle) || this.signaling !== signaling) return;
     }
+    await this.connectPresentAdmittedCallPeers(lifecycle);
+  }
+
+  private async connectPresentAdmittedCallPeers(lifecycle: number): Promise<void> {
+    const signaling = this.signaling;
+    const transport = this.transport;
+    const localPeerId = this.peerId;
+    if (!signaling || !transport || !localPeerId || !this.isActive(lifecycle)) return;
+    const remotePeerIds = signaling.getDiagnostics().presencePeers
+      .filter((remotePeerId) => remotePeerId !== localPeerId && this.isAdmittedCallPeer(remotePeerId));
+    const store = useCallStore.getState();
+    await Promise.all(remotePeerIds.map(async (remotePeerId) => {
+      const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
+      store.upsert({ ...participant, connection: participant.connection ?? "new" });
+      await transport.connect(remotePeerId, localPeerId < remotePeerId).catch((error) => store.setError(String(error)));
+    }));
+    if (!this.isActive(lifecycle) || this.signaling !== signaling) return;
+    if (remotePeerIds.length) void signaling.sendPeerState(this.state).catch((error) => store.setError(String(error)));
   }
 
   private rejectIncompatibleCallPeer(remotePeerId: string, remoteVersion?: string): void {

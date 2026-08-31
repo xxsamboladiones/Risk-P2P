@@ -210,6 +210,7 @@ export class ChatController {
   private readonly attachmentProgressCallbacks = new Set<(progress: AttachmentRuntimeState) => void>();
   private unsubscribers: Array<() => void> = [];
   private refreshingMembers?: Promise<void>;
+  private pendingMemberRefreshBroadcast = false;
   private sessionToken?: object;
   private readyTimer?: ReturnType<typeof setTimeout>;
 
@@ -372,6 +373,7 @@ export class ChatController {
     this.signalingNamespace = "chat";
     this.peerId = undefined;
     this.identity = undefined;
+    this.pendingMemberRefreshBroadcast = false;
     this.refreshingMembers = undefined;
     this.clearReadyTimeout();
     this.dataChannelPeers.clear();
@@ -990,29 +992,34 @@ export class ChatController {
     const groupId = this.groupId;
     const identity = this.identity;
     if (!sessionToken || !groupId || !identity) return;
+    if (broadcast) this.pendingMemberRefreshBroadcast = true;
     if (this.refreshingMembers) return this.refreshingMembers;
     let task: Promise<void>;
     task = (async () => {
-      const group = (await loadLocalGroups()).find((item) => item.groupId === groupId);
-      if (!group || this.sessionToken !== sessionToken || this.groupId !== groupId || this.identity !== identity) return;
-      const channelId = this.channelId;
-      const nextRendezvousId = channelId ? groupRendezvousId(group, "chat", channelId) : undefined;
-      const rendezvousChanged = Boolean(nextRendezvousId && this.rendezvousId && nextRendezvousId !== this.rendezvousId);
-      this.installGroupPeers(group.members ?? [], group.removedMembers ?? [], group.revocations ?? []);
-      await this.connectPresentTrustedPeers();
-      if (this.sessionToken !== sessionToken) return;
-      if (broadcast) await Promise.all([...this.openDataPeers].map((peerId) => this.sendGroupMembership(peerId)));
-      if (this.sessionToken !== sessionToken) return;
-      const signaling = this.signaling;
-      const peerId = this.peerId;
-      if (rendezvousChanged && nextRendezvousId && signaling && peerId) {
-        this.rendezvousId = nextRendezvousId;
-        this.setStatus("connecting");
-        await signaling.connect(nextRendezvousId, peerId, this.signalingNamespace);
-        if (this.sessionToken !== sessionToken || this.signaling !== signaling) return;
-        this.setStatus("connected");
+      do {
+        const shouldBroadcast = this.pendingMemberRefreshBroadcast;
+        this.pendingMemberRefreshBroadcast = false;
+        const group = (await loadLocalGroups()).find((item) => item.groupId === groupId);
+        if (!group || this.sessionToken !== sessionToken || this.groupId !== groupId || this.identity !== identity) return;
+        const channelId = this.channelId;
+        const nextRendezvousId = channelId ? groupRendezvousId(group, "chat", channelId) : undefined;
+        const rendezvousChanged = Boolean(nextRendezvousId && this.rendezvousId && nextRendezvousId !== this.rendezvousId);
+        this.installGroupPeers(group.members ?? [], group.removedMembers ?? [], group.revocations ?? []);
         await this.connectPresentTrustedPeers();
-      }
+        if (this.sessionToken !== sessionToken) return;
+        if (shouldBroadcast) await Promise.all([...this.openDataPeers].map((peerId) => this.sendGroupMembership(peerId)));
+        if (this.sessionToken !== sessionToken) return;
+        const signaling = this.signaling;
+        const peerId = this.peerId;
+        if (rendezvousChanged && nextRendezvousId && signaling && peerId) {
+          this.rendezvousId = nextRendezvousId;
+          this.setStatus("connecting");
+          await signaling.connect(nextRendezvousId, peerId, this.signalingNamespace);
+          if (this.sessionToken !== sessionToken || this.signaling !== signaling) return;
+          this.setStatus("connected");
+          await this.connectPresentTrustedPeers();
+        }
+      } while (this.pendingMemberRefreshBroadcast && this.sessionToken === sessionToken);
     })().finally(() => {
       if (this.refreshingMembers === task) this.refreshingMembers = undefined;
     });

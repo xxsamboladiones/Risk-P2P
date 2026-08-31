@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { LocalIdentity, PublicPeerIdentity } from "./services/offline/social-storage";
+import { loadLocalGroups, type LocalGroup, type LocalIdentity, type PublicPeerIdentity } from "./services/offline/social-storage";
 import type { TransportEvents } from "@risk/rtc";
 
 const runtime = vi.hoisted(() => ({
@@ -124,6 +124,7 @@ describe("ciclo de conexão do ChatController", () => {
     runtime.transports.clear();
     runtime.messages.length = 0;
     runtime.appliedRevocations.length = 0;
+    vi.mocked(loadLocalGroups).mockReset().mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -184,6 +185,57 @@ describe("ciclo de conexão do ChatController", () => {
     expect(runtime.messages).toHaveLength(2);
 
     await Promise.all([first.disconnect(), second.disconnect()]);
+  });
+
+  it("preserva a transmissão de membros pedida durante uma atualização em andamento", async () => {
+    const local = await identity("Dona do grupo");
+    const remote = await identity("Membro antigo");
+    const group: LocalGroup = {
+      groupId: "group_members_refresh_12345678",
+      name: "Grupo local",
+      channels: [{ id: "channel_members_refresh_12345678", name: "geral", kind: "text" }],
+      members: [publicIdentity(local), publicIdentity(remote)],
+      ownerPeerId: local.peerId,
+      membershipVersion: 2,
+      manifestVersion: 2,
+      manifestActorPeerId: local.peerId,
+      manifestOperationId: crypto.randomUUID(),
+      administratorPeerIds: [],
+      removedPeerIds: [],
+      removedMembers: [],
+      joinedAt: Date.now(),
+    };
+    let releaseFirstLoad!: (groups: LocalGroup[]) => void;
+    vi.mocked(loadLocalGroups)
+      .mockImplementationOnce(() => new Promise((resolve) => { releaseFirstLoad = resolve; }))
+      .mockResolvedValue([group]);
+
+    const controller = new ChatController();
+    const internals = controller as unknown as {
+      sessionToken: object;
+      groupId: string;
+      channelId: string;
+      identity: LocalIdentity;
+      openDataPeers: Set<string>;
+      refreshGroupMembership(broadcast: boolean): Promise<void>;
+      sendGroupMembership(remotePeerId: string): Promise<void>;
+    };
+    internals.sessionToken = {};
+    internals.groupId = group.groupId;
+    internals.channelId = group.channels[0]!.id;
+    internals.identity = local;
+    internals.openDataPeers.add(remote.peerId);
+    const sendMembership = vi.spyOn(internals, "sendGroupMembership").mockResolvedValue();
+
+    const initialRefresh = internals.refreshGroupMembership(false);
+    await vi.waitFor(() => expect(loadLocalGroups).toHaveBeenCalledTimes(1));
+    const broadcastRefresh = internals.refreshGroupMembership(true);
+    releaseFirstLoad([group]);
+    await Promise.all([initialRefresh, broadcastRefresh]);
+
+    expect(loadLocalGroups).toHaveBeenCalledTimes(2);
+    expect(sendMembership).toHaveBeenCalledOnce();
+    expect(sendMembership).toHaveBeenCalledWith(remote.peerId);
   });
 
   it("recusa um peer de versão antiga antes de autenticar o DataChannel", async () => {

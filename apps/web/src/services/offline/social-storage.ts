@@ -309,6 +309,7 @@ export async function addLocalGroupMember(group: PublicGroupMetadata, member: Pu
     membershipVersion: Math.max(group.membershipVersion, base.membershipVersion) + 1,
     ...nextGroupManifestRevision({ ...base, manifestVersion: Math.max(group.manifestVersion, base.manifestVersion) }, owner.peerId),
   });
+  if (typeof window !== "undefined") window.dispatchEvent(new Event("risk:social-updated"));
 }
 
 export async function updateLocalGroupProfile(groupId: string, name: string, avatar?: string): Promise<LocalGroup> {

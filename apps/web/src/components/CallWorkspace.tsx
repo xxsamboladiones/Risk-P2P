@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type RefObject } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type RefObject } from "react";
 import {
   Activity,
   Copy,
@@ -31,6 +31,7 @@ import { loadLocalGroups } from "../services/offline/social-storage";
 import { incompatiblePeerMessage } from "../services/protocol-compatibility";
 import { useCallStore, type Participant } from "../store";
 import { ConversationTimeline } from "./ConversationTimeline";
+import { responsiveCallGrid } from "./call-layout";
 import { InCallAudioSettings } from "./InCallAudioSettings";
 import { MessageComposer } from "./MessageComposer";
 import { ProfileAvatar } from "./ProfileAvatar";
@@ -554,6 +555,13 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
   }
 
   const focused = focusedTile && tileIds.includes(focusedTile) ? focusedTile : null;
+  const responsiveGrid = responsiveCallGrid(tileIds.length);
+  const stageStyle = {
+    "--call-portrait-columns": responsiveGrid.portrait.columns,
+    "--call-portrait-rows": responsiveGrid.portrait.rows,
+    "--call-compact-columns": responsiveGrid.compactLandscape.columns,
+    "--call-compact-rows": responsiveGrid.compactLandscape.rows,
+  } as CSSProperties;
   const timeline = <ConversationTimeline
     messages={messages}
     attachments={attachments}
@@ -578,8 +586,8 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
           onMinimize();
         }} title="Voltar para o Risk"><PanelLeft size={17}/><span>Voltar ao menu</span></button>
         <div className="call-view-tabs">
-          <button className={view === "call" ? "active" : ""} onClick={() => setView("call")}><Video size={16}/> Chamada</button>
-          <button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")} disabled={!context?.textChannelId}><MessageCircle size={16}/> Chat</button>
+          <button className={view === "call" ? "active" : ""} onClick={() => setView("call")}><Video size={16}/><span>Chamada</span></button>
+          <button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")} disabled={!context?.textChannelId}><MessageCircle size={16}/><span>Chat</span></button>
         </div>
         <button
           className={`network-header-button network-${networkQuality.toLocaleLowerCase()}`}
@@ -592,7 +600,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
     {callError && <div className="global-error" onClick={() => setError(null)}>{callError}</div>}
 
     <section className={`call-view ${view === "call" ? "" : "is-hidden"}`}>
-      <section className={`stage ${focused ? "stage-focused" : ""}`} onMouseDown={(event) => {
+      <section className={`stage ${focused ? "stage-focused" : ""}`} style={stageStyle} onMouseDown={(event) => {
         if (event.target === event.currentTarget) setFocusedTile(null);
       }}>
         {!localPreviews.camera && <LocalProfileTile

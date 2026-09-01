@@ -1,6 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MeshWebRTCTransport, WebScreenShareProvider } from "./index";
 
+class FakeRtpSender {
+  parameters = {
+    transactionId: "fake",
+    encodings: [{}],
+    codecs: [],
+    headerExtensions: [],
+    rtcp: {},
+  } as unknown as RTCRtpSendParameters;
+
+  constructor(public track: MediaStreamTrack | null) {}
+  getParameters(): RTCRtpSendParameters { return this.parameters; }
+  async setParameters(parameters: RTCRtpSendParameters): Promise<void> { this.parameters = parameters; }
+  async replaceTrack(track: MediaStreamTrack | null): Promise<void> { this.track = track; }
+}
+
 class FakePeerConnection {
   static instances: FakePeerConnection[] = [];
   static addedIce: RTCIceCandidateInit[] = [];
@@ -21,6 +36,7 @@ class FakePeerConnection {
   onnegotiationneeded: (() => void) | null = null;
   onconnectionstatechange: (() => void) | null = null;
   ondatachannel: ((event: RTCDataChannelEvent) => void) | null = null;
+  readonly senders: FakeRtpSender[] = [];
 
   constructor(configuration: RTCConfiguration) {
     FakePeerConnection.instances.push(this);
@@ -44,9 +60,17 @@ class FakePeerConnection {
     this.signalingState = description.type === "offer" ? "have-remote-offer" : "stable";
   }
   async addIceCandidate(candidate: RTCIceCandidateInit): Promise<void> { FakePeerConnection.addedIce.push(candidate); }
-  addTrack(track: MediaStreamTrack): RTCRtpSender { FakePeerConnection.addedTracks.push(track); return {} as RTCRtpSender; }
-  removeTrack(): void {}
-  getSenders(): RTCRtpSender[] { return []; }
+  addTrack(track: MediaStreamTrack): RTCRtpSender {
+    FakePeerConnection.addedTracks.push(track);
+    const sender = new FakeRtpSender(track);
+    this.senders.push(sender);
+    return sender as unknown as RTCRtpSender;
+  }
+  removeTrack(sender: RTCRtpSender): void {
+    const index = this.senders.indexOf(sender as unknown as FakeRtpSender);
+    if (index >= 0) this.senders.splice(index, 1);
+  }
+  getSenders(): RTCRtpSender[] { return this.senders as unknown as RTCRtpSender[]; }
   getTransceivers(): RTCRtpTransceiver[] { return []; }
   createDataChannel(label: string): RTCDataChannel { const channel = new FakeDataChannel(label); FakePeerConnection.dataChannels.push(channel); return channel as unknown as RTCDataChannel; }
   restartIce(): void { FakePeerConnection.restartIceCalls += 1; }
@@ -215,6 +239,53 @@ describe("MeshWebRTCTransport", () => {
     await transport.publishTrack(track, stream);
 
     expect(callbacks.sendOffer).toHaveBeenCalledTimes(2);
+  });
+
+  it("aplica no sender a política de alta movimentação e permite atualizá-la ao vivo", async () => {
+    const callbacks = events();
+    const peerId = "00000000-0000-4000-8000-000000000002";
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
+    await transport.connect(peerId, true);
+    await transport.acceptAnswer(peerId, { type: "answer", sdp: "answer-1" });
+
+    const track = {
+      id: "screen-track",
+      kind: "video",
+      getSettings: () => ({ width: 3840, height: 2160 }),
+    } as unknown as MediaStreamTrack;
+    await transport.publishTrack(track, { id: "screen-stream" } as MediaStream, {
+      source: "screen",
+      maxBitrate: 9_000_000,
+      maxFramerate: 60,
+      targetWidth: 1920,
+      targetHeight: 1080,
+      degradationPreference: "balanced",
+    });
+
+    const sender = FakePeerConnection.instances[0]!.senders[0]!;
+    expect(sender.parameters.encodings[0]).toMatchObject({
+      maxBitrate: 9_000_000,
+      maxFramerate: 60,
+      scaleResolutionDownBy: 2,
+      priority: "high",
+      networkPriority: "high",
+    });
+    expect(sender.parameters.degradationPreference).toBe("balanced");
+
+    await transport.configurePublishedVideoTrack(track, {
+      source: "screen",
+      maxBitrate: 3_500_000,
+      maxFramerate: 30,
+      targetWidth: 1280,
+      targetHeight: 720,
+      degradationPreference: "maintain-resolution",
+    });
+    expect(sender.parameters.encodings[0]).toMatchObject({
+      maxBitrate: 3_500_000,
+      maxFramerate: 30,
+      scaleResolutionDownBy: 3,
+    });
+    expect(sender.parameters.degradationPreference).toBe("maintain-resolution");
   });
 
   it("não publica mídia antes da autorização criptográfica do peer", async () => {

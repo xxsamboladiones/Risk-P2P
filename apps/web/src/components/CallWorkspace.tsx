@@ -30,6 +30,11 @@ import type {
 import { loadLocalGroups } from "../services/offline/social-storage";
 import { incompatiblePeerMessage } from "../services/protocol-compatibility";
 import { observeVoiceActivity } from "../services/audio/voice-activity";
+import {
+  isScreenQuality,
+  SCREEN_QUALITY_PROFILES as QUALITY_PROFILES,
+  type ScreenQuality,
+} from "../services/rtc/screen-quality";
 import { useCallStore, type Participant } from "../store";
 import { ConversationTimeline } from "./ConversationTimeline";
 import { responsiveCallGrid } from "./call-layout";
@@ -39,27 +44,9 @@ import { ProfileAvatar } from "./ProfileAvatar";
 import "./call-workspace.css";
 
 type ViewMode = "call" | "chat";
-type ScreenQuality = "720p30" | "720p60" | "1080p30" | "1080p60";
-
-type QualityProfile = {
-  label: string;
-  width: number;
-  height: number;
-  fps: number;
-};
 
 const SCREEN_QUALITY_KEY = "risk.screenShareQuality";
 const SCREEN_AUDIO_KEY = "risk.screenShareAudio";
-const QUALITY_PROFILES: Record<ScreenQuality, QualityProfile> = {
-  "720p30": { label: "720p · 30 FPS", width: 1280, height: 720, fps: 30 },
-  "720p60": { label: "720p · 60 FPS", width: 1280, height: 720, fps: 60 },
-  "1080p30": { label: "1080p · 30 FPS", width: 1920, height: 1080, fps: 30 },
-  "1080p60": { label: "1080p · 60 FPS", width: 1920, height: 1080, fps: 60 },
-};
-
-function isScreenQuality(value: string | null): value is ScreenQuality {
-  return Boolean(value && value in QUALITY_PROFILES);
-}
 
 function initialScreenQuality(): ScreenQuality {
   const saved = localStorage.getItem(SCREEN_QUALITY_KEY);
@@ -68,24 +55,6 @@ function initialScreenQuality(): ScreenQuality {
 
 function initialScreenAudio(): boolean {
   return localStorage.getItem(SCREEN_AUDIO_KEY) !== "false";
-}
-
-async function applyScreenQuality(stream: MediaStream | null, quality: ScreenQuality): Promise<void> {
-  const track = stream?.getVideoTracks()[0];
-  if (!track) return;
-  const profile = QUALITY_PROFILES[quality];
-  try { track.contentHint = "detail"; } catch { /* contentHint é opcional */ }
-  try {
-    await track.applyConstraints({
-      width: { ideal: profile.width, max: profile.width },
-      height: { ideal: profile.height, max: profile.height },
-      frameRate: { ideal: profile.fps, max: profile.fps },
-    });
-  } catch {
-    // Alguns capturadores não permitem reduzir resolução via constraints, mas
-    // normalmente aceitam limitar FPS. Não interrompemos a transmissão por isso.
-    await track.applyConstraints({ frameRate: { ideal: profile.fps, max: profile.fps } }).catch(() => undefined);
-  }
 }
 
 function RemoteAudio({ stream, volume }: { stream: MediaStream; volume: number }) {
@@ -483,8 +452,10 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
 
   useEffect(() => {
     localStorage.setItem(SCREEN_QUALITY_KEY, quality);
-    void applyScreenQuality(localPreviews.screen, quality);
-  }, [localPreviews.screen, quality]);
+    void call.updateScreenQuality(QUALITY_PROFILES[quality]).catch((cause) => {
+      setError(cause instanceof Error ? cause.message : "Não foi possível atualizar a qualidade da transmissão.");
+    });
+  }, [call, quality, setError]);
 
   useEffect(() => {
     localStorage.setItem(SCREEN_AUDIO_KEY, String(screenAudioEnabled));
@@ -524,7 +495,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
       return;
     }
     if (!window.desktop?.listScreenSources) {
-      await call.toggleScreen(roomId, undefined, screenAudioEnabled);
+      await call.toggleScreen(roomId, undefined, screenAudioEnabled, QUALITY_PROFILES[quality]);
       return;
     }
     setSourcePickerOpen(true);
@@ -542,7 +513,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
   async function chooseScreen(source: RiskDesktopSource): Promise<void> {
     setSourcePickerOpen(false);
     try {
-      await call.toggleScreen(roomId, source.id, screenAudioEnabled);
+      await call.toggleScreen(roomId, source.id, screenAudioEnabled, QUALITY_PROFILES[quality]);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Não foi possível iniciar o compartilhamento.");
     }

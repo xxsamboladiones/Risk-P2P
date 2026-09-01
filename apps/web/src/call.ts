@@ -27,6 +27,12 @@ import {
   validRiskPeerCapabilities,
   type RiskPeerCapabilities,
 } from "./services/protocol-compatibility";
+import {
+  applyScreenCaptureQuality,
+  SCREEN_QUALITY_PROFILES,
+  screenVideoPublication,
+  type ScreenQualityProfile,
+} from "./services/rtc/screen-quality";
 
 export type CallDiagnostics = {
   signaling: SignalingDiagnostics | null;
@@ -320,6 +326,8 @@ export class CallController {
   private rnnoiseMicrophone?: RnnoiseMicrophone;
   private cameraTrack?: MediaStreamTrack;
   private screenStream?: MediaStream;
+  private screenQualityProfile: ScreenQualityProfile = SCREEN_QUALITY_PROFILES["1080p30"];
+  private screenQualityRevision = 0;
   private roomId?: string;
   private rendezvousId?: string;
   private peerId?: string;
@@ -597,7 +605,7 @@ export class CallController {
         this.updateLocalPreview();
         void this.signaling?.sendPeerState(this.state).catch((error) => this.reportError(error, "Não foi possível atualizar a câmera."));
         try {
-          await this.transport?.publishTrack(cameraTrack, this.local);
+          await this.transport?.publishTrack(cameraTrack, this.local, { source: "camera" });
         } catch (error) {
           if (this.cameraTrack === cameraTrack) this.cameraTrack = undefined;
           this.local.removeTrack(cameraTrack);
@@ -615,8 +623,14 @@ export class CallController {
     } catch (error) { this.reportError(error, "Não foi possível alterar a câmera."); }
   }
 
-  async toggleScreen(_roomId: string, sourceId?: string, includeAudio = true): Promise<void> {
+  async toggleScreen(
+    _roomId: string,
+    sourceId?: string,
+    includeAudio = true,
+    qualityProfile?: ScreenQualityProfile,
+  ): Promise<void> {
     if (this.screenStream) { await this.stopScreen(); return; }
+    if (qualityProfile) this.setScreenQualityProfile(qualityProfile);
     const lifecycle = this.lifecycleId;
     let desktopAudio: DesktopScreenAudioPreparation | null = null;
     let linuxAudioPreparation: Promise<DesktopScreenAudioPreparation | null> | undefined;
@@ -653,6 +667,10 @@ export class CallController {
         stream.getTracks().forEach((track) => track.stop());
         throw new Error("A fonte selecionada não forneceu vídeo");
       }
+
+      // Aplica resolução, FPS e contentHint antes de criar os senders. Assim o
+      // encoder não começa em 4K/sem limite para ser reconfigurado logo depois.
+      const publicationProfile = await this.applyLatestScreenCaptureQuality(videoTrack);
 
       if (desktopAudio?.mode === "unavailable") {
         const message = `PipeWire indisponível para áudio da tela: ${desktopAudio.reason ?? "ferramentas PipeWire não encontradas"}. A tela continuará sem áudio do sistema.`;
@@ -713,7 +731,11 @@ export class CallController {
 
       // No Linux o stream começa somente com vídeo. Isso faz a transmissão aparecer
       // imediatamente; o áudio PipeWire entra depois por uma renegociação separada.
-      await Promise.all(stream.getTracks().map((track) => transport.publishTrack(track, stream!)));
+      await Promise.all(stream.getTracks().map((track) => transport.publishTrack(
+        track,
+        stream!,
+        track.kind === "video" ? screenVideoPublication(publicationProfile) : undefined,
+      )));
       if (!this.isActive(lifecycle)) {
         stream.getTracks().forEach((track) => track.stop());
         await stopDesktopScreenAudio();
@@ -736,6 +758,20 @@ export class CallController {
       else if (desktopAudio?.mode === "pipewire") await stopDesktopScreenAudio();
       if (!(error instanceof DOMException && error.name === "NotAllowedError")) this.reportError(error, "Não foi possível compartilhar a tela.");
     }
+  }
+
+  async updateScreenQuality(profile: ScreenQualityProfile): Promise<void> {
+    this.setScreenQualityProfile(profile);
+    const stream = this.screenStream;
+    const track = stream?.getVideoTracks()[0];
+    const transport = this.transport;
+    if (!stream || !track || !transport) return;
+
+    const lifecycle = this.lifecycleId;
+    const publicationProfile = await this.applyLatestScreenCaptureQuality(track);
+    if (!this.isActive(lifecycle) || this.screenStream !== stream || track.readyState !== "live") return;
+    await transport.configurePublishedVideoTrack(track, screenVideoPublication(publicationProfile));
+    this.updateLocalPreview();
   }
 
   async leave(_roomId: string): Promise<void> { await this.cleanup(); }
@@ -1085,6 +1121,20 @@ export class CallController {
     stream.getTracks().forEach((track) => track.stop());
     await this.screen.stopScreenShare().catch(() => undefined);
     await stopDesktopScreenAudio();
+  }
+
+  private setScreenQualityProfile(profile: ScreenQualityProfile): void {
+    this.screenQualityProfile = profile;
+    this.screenQualityRevision += 1;
+  }
+
+  private async applyLatestScreenCaptureQuality(track: MediaStreamTrack): Promise<ScreenQualityProfile> {
+    for (;;) {
+      const revision = this.screenQualityRevision;
+      const profile = this.screenQualityProfile;
+      await applyScreenCaptureQuality(track, profile);
+      if (revision === this.screenQualityRevision) return profile;
+    }
   }
 
   private updateLocalPreview(): void {

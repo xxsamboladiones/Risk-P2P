@@ -6,8 +6,10 @@ import {
   type NetworkInterfaceDescriptor,
   type SelectedConnectionPath,
 } from "./connection-path";
+import { resolveVideoSenderPolicy, type VideoPublicationOptions } from "./video-encoding";
 
 export * from "./connection-path";
+export * from "./video-encoding";
 
 export type ScreenSource = { id: string; name: string; thumbnail?: string; displayId?: string };
 export interface ScreenShareProvider {
@@ -138,7 +140,8 @@ export type PeerConnectionDiagnostics = {
 export interface CallTransport {
   connect(peerId: string, initiator: boolean): Promise<void>;
   disconnect(peerId?: string): Promise<void>;
-  publishTrack(track: MediaStreamTrack, stream: MediaStream): Promise<void>;
+  publishTrack(track: MediaStreamTrack, stream: MediaStream, options?: VideoPublicationOptions): Promise<void>;
+  configurePublishedVideoTrack(track: MediaStreamTrack, options: VideoPublicationOptions): Promise<void>;
   unpublishTrack(track: MediaStreamTrack): Promise<void>;
   replaceTrack(kind: "audio" | "video", track: MediaStreamTrack | null): Promise<void>;
   replacePublishedTrack(previousTrack: MediaStreamTrack, nextTrack: MediaStreamTrack, stream: MediaStream): Promise<void>;
@@ -174,7 +177,7 @@ const RECREATE_PEER_EVERY_ATTEMPTS = 3;
 
 export class MeshWebRTCTransport implements CallTransport {
   private readonly peers = new Map<string, PeerEntry>();
-  private readonly localTracks = new Map<string, { track: MediaStreamTrack; stream: MediaStream }>();
+  private readonly localTracks = new Map<string, { track: MediaStreamTrack; stream: MediaStream; video?: VideoPublicationOptions }>();
   private readonly mediaAuthorizedPeers = new Set<string>();
   private readonly pendingRemoteStreams = new Map<string, Map<string, MediaStream>>();
   private readonly activeRemoteStreams = new Map<string, Map<string, MediaStream>>();
@@ -185,6 +188,7 @@ export class MeshWebRTCTransport implements CallTransport {
   private readonly previousConnectionPaths = new Map<string, string>();
   private readonly maxRemotePeers: number;
   private readonly networkInterfaces: readonly NetworkInterfaceDescriptor[];
+  private videoParameterUpdate: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly localPeerId: string,
@@ -211,6 +215,7 @@ export class MeshWebRTCTransport implements CallTransport {
       entry.needsNegotiation = true;
       await this.negotiateIfNeeded(peerId, entry);
     }
+    await this.applyAdaptiveVideoParameters();
   }
 
   requireMediaAuthorization(): void {
@@ -249,16 +254,19 @@ export class MeshWebRTCTransport implements CallTransport {
         if (sender.track) entry.pc.removeTrack(sender);
       }
     }
+    void this.applyAdaptiveVideoParameters();
   }
 
   async acceptOffer(peerId: string, description: RTCSessionDescriptionInit): Promise<void> {
     if (description.type !== "offer") throw new Error("Descrição WebRTC não é uma offer.");
     await this.acceptDescription(peerId, description);
+    await this.applyAdaptiveVideoParameters();
   }
 
   async acceptAnswer(peerId: string, description: RTCSessionDescriptionInit): Promise<void> {
     if (description.type !== "answer") throw new Error("Descrição WebRTC não é uma answer.");
     await this.acceptDescription(peerId, description);
+    await this.applyAdaptiveVideoParameters();
   }
 
   async addIceCandidate(peerId: string, candidate: RTCIceCandidateInit): Promise<void> {
@@ -271,8 +279,8 @@ export class MeshWebRTCTransport implements CallTransport {
     await entry.pc.addIceCandidate(candidate);
   }
 
-  async publishTrack(track: MediaStreamTrack, stream: MediaStream): Promise<void> {
-    this.localTracks.set(track.id, { track, stream });
+  async publishTrack(track: MediaStreamTrack, stream: MediaStream, options?: VideoPublicationOptions): Promise<void> {
+    this.localTracks.set(track.id, { track, stream, video: track.kind === "video" ? options : undefined });
     const negotiations: Promise<void>[] = [];
     for (const [peerId, entry] of this.peers) {
       if (this.mediaAuthorizationRequired && !this.mediaAuthorizedPeers.has(peerId)) continue;
@@ -282,6 +290,14 @@ export class MeshWebRTCTransport implements CallTransport {
       negotiations.push(this.negotiateIfNeeded(peerId, entry));
     }
     await Promise.all(negotiations);
+    await this.applyAdaptiveVideoParameters();
+  }
+
+  async configurePublishedVideoTrack(track: MediaStreamTrack, options: VideoPublicationOptions): Promise<void> {
+    if (track.kind !== "video") throw new Error("Somente faixas de vídeo aceitam parâmetros de codificação.");
+    const published = this.localTracks.get(track.id);
+    if (!published) throw new Error(`Track publicada não encontrada: ${track.id}`);
+    this.localTracks.set(track.id, { ...published, video: options });
     await this.applyAdaptiveVideoParameters();
   }
 
@@ -296,6 +312,7 @@ export class MeshWebRTCTransport implements CallTransport {
       negotiations.push(this.negotiateIfNeeded(peerId, entry));
     }
     await Promise.all(negotiations);
+    await this.applyAdaptiveVideoParameters();
   }
 
   async replaceTrack(kind: "audio" | "video", track: MediaStreamTrack | null): Promise<void> {
@@ -323,8 +340,10 @@ export class MeshWebRTCTransport implements CallTransport {
       throw error;
     }
 
+    const previousPublication = this.localTracks.get(previousTrack.id);
     this.localTracks.delete(previousTrack.id);
-    this.localTracks.set(nextTrack.id, { track: nextTrack, stream });
+    this.localTracks.set(nextTrack.id, { track: nextTrack, stream, video: previousPublication?.video });
+    if (nextTrack.kind === "video") await this.applyAdaptiveVideoParameters();
   }
 
   sendData(data: string, targetPeerId?: string): number {
@@ -434,6 +453,7 @@ export class MeshWebRTCTransport implements CallTransport {
       this.recoveryTimers.delete(id);
       this.recoveryAttempts.delete(id);
     });
+    await this.applyAdaptiveVideoParameters();
   }
 
   getDiagnostics(): PeerConnectionDiagnostics[] {
@@ -618,6 +638,7 @@ export class MeshWebRTCTransport implements CallTransport {
     replacement.needsIceRestart = true;
     replacement.pc.restartIce();
     await this.negotiateIfNeeded(peerId, replacement);
+    await this.applyAdaptiveVideoParameters();
   }
 
   private clearPeerRecovery(peerId: string): void {
@@ -627,15 +648,41 @@ export class MeshWebRTCTransport implements CallTransport {
     this.recoveryAttempts.delete(peerId);
   }
 
-  private async applyAdaptiveVideoParameters(): Promise<void> {
+  private applyAdaptiveVideoParameters(): Promise<void> {
+    const operation = this.videoParameterUpdate.then(() => this.applyAdaptiveVideoParametersNow());
+    this.videoParameterUpdate = operation.catch(() => undefined);
+    return operation;
+  }
+
+  private async applyAdaptiveVideoParametersNow(): Promise<void> {
     const activePeers = Math.max(1, this.mediaAuthorizationRequired ? this.mediaAuthorizedPeers.size : this.peers.size);
-    const maxBitrate = activePeers <= 1 ? 2_500_000 : activePeers <= 3 ? 1_200_000 : 700_000;
+    const screenPublished = [...this.localTracks.values()].some(({ track, video }) => track.kind === "video" && video?.source === "screen");
     await Promise.all([...this.peers.values()].flatMap(({ pc }) => pc.getSenders().filter((sender) => sender.track?.kind === "video").map(async (sender) => {
-      const parameters = sender.getParameters();
-      parameters.encodings = parameters.encodings?.length ? parameters.encodings : [{}];
-      parameters.encodings[0]!.maxBitrate = maxBitrate;
-      parameters.degradationPreference = "maintain-framerate";
-      await sender.setParameters(parameters).catch(() => undefined);
+      const track = sender.track;
+      if (!track) return;
+      const publication = this.localTracks.get(track.id);
+      const capture = typeof track.getSettings === "function" ? track.getSettings() : {};
+      const policy = resolveVideoSenderPolicy(publication?.video, activePeers, capture, screenPublished);
+      try {
+        const parameters = sender.getParameters();
+        parameters.encodings = parameters.encodings?.length ? parameters.encodings : [{}];
+        const encoding = parameters.encodings[0]!;
+        encoding.maxBitrate = policy.maxBitrate;
+        encoding.priority = policy.priority;
+        encoding.networkPriority = policy.priority;
+        if (policy.maxFramerate !== undefined) encoding.maxFramerate = policy.maxFramerate;
+        else delete encoding.maxFramerate;
+        if (policy.scaleResolutionDownBy !== undefined) encoding.scaleResolutionDownBy = policy.scaleResolutionDownBy;
+        else delete encoding.scaleResolutionDownBy;
+        parameters.degradationPreference = policy.degradationPreference;
+        await sender.setParameters(parameters);
+      } catch (error) {
+        logger.warn("Não foi possível aplicar os parâmetros adaptativos de vídeo", {
+          trackId: track.id,
+          source: publication?.video?.source ?? "camera",
+          error: String(error),
+        });
+      }
     })));
   }
 

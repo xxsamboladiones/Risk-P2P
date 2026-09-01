@@ -1,0 +1,53 @@
+import type { VideoPublicationOptions } from "@risk/rtc";
+
+export type ScreenQuality = "720p30" | "720p60" | "1080p30" | "1080p60";
+
+export type ScreenQualityProfile = {
+  label: string;
+  width: number;
+  height: number;
+  fps: number;
+  maxBitrate: number;
+  contentHint: "detail" | "motion";
+};
+
+type ScreenCaptureConstraints = MediaTrackConstraints & { resizeMode?: "crop-and-scale" };
+
+export const SCREEN_QUALITY_PROFILES: Record<ScreenQuality, ScreenQualityProfile> = {
+  "720p30": { label: "720p · 30 FPS", width: 1280, height: 720, fps: 30, maxBitrate: 3_500_000, contentHint: "detail" },
+  "720p60": { label: "720p · 60 FPS", width: 1280, height: 720, fps: 60, maxBitrate: 5_000_000, contentHint: "motion" },
+  "1080p30": { label: "1080p · 30 FPS", width: 1920, height: 1080, fps: 30, maxBitrate: 6_000_000, contentHint: "motion" },
+  "1080p60": { label: "1080p · 60 FPS", width: 1920, height: 1080, fps: 60, maxBitrate: 9_000_000, contentHint: "motion" },
+};
+
+export function isScreenQuality(value: string | null): value is ScreenQuality {
+  return Boolean(value && value in SCREEN_QUALITY_PROFILES);
+}
+
+export function screenVideoPublication(profile: ScreenQualityProfile): VideoPublicationOptions {
+  return {
+    source: "screen",
+    maxBitrate: profile.maxBitrate,
+    maxFramerate: profile.fps,
+    targetWidth: profile.width,
+    targetHeight: profile.height,
+    degradationPreference: profile.contentHint === "motion" ? "balanced" : "maintain-resolution",
+  };
+}
+
+export async function applyScreenCaptureQuality(track: MediaStreamTrack, profile: ScreenQualityProfile): Promise<void> {
+  try { track.contentHint = profile.contentHint; } catch { /* contentHint é opcional */ }
+  try {
+    const constraints: ScreenCaptureConstraints = {
+      width: { ideal: profile.width, max: profile.width },
+      height: { ideal: profile.height, max: profile.height },
+      frameRate: { ideal: profile.fps, max: profile.fps },
+      resizeMode: "crop-and-scale",
+    };
+    await track.applyConstraints(constraints);
+  } catch {
+    // Capturadores PipeWire podem recusar dimensões, mas normalmente permitem
+    // limitar FPS. O sender ainda aplica scaleResolutionDownBy como salvaguarda.
+    await track.applyConstraints({ frameRate: { ideal: profile.fps, max: profile.fps } }).catch(() => undefined);
+  }
+}

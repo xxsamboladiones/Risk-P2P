@@ -9,6 +9,8 @@ class FakePeerConnection {
   static failMLineOrderOnce = false;
   static configurations: RTCConfiguration[] = [];
   static stats: Array<Record<string, unknown>> = [];
+  static restartIceCalls = 0;
+  static offerOptions: RTCOfferOptions[] = [];
   connectionState: RTCPeerConnectionState = "new";
   iceConnectionState: RTCIceConnectionState = "new";
   signalingState: RTCSignalingState = "stable";
@@ -24,7 +26,10 @@ class FakePeerConnection {
     FakePeerConnection.instances.push(this);
     FakePeerConnection.configurations.push(configuration);
   }
-  async createOffer(): Promise<RTCSessionDescriptionInit> { return { type: "offer", sdp: "offer" }; }
+  async createOffer(options: RTCOfferOptions = {}): Promise<RTCSessionDescriptionInit> {
+    FakePeerConnection.offerOptions.push(options);
+    return { type: "offer", sdp: "offer" };
+  }
   async createAnswer(): Promise<RTCSessionDescriptionInit> { return { type: "answer", sdp: "answer" }; }
   async setLocalDescription(description: RTCSessionDescriptionInit): Promise<void> {
     this.localDescription = descriptionWithJson(description);
@@ -44,7 +49,7 @@ class FakePeerConnection {
   getSenders(): RTCRtpSender[] { return []; }
   getTransceivers(): RTCRtpTransceiver[] { return []; }
   createDataChannel(label: string): RTCDataChannel { const channel = new FakeDataChannel(label); FakePeerConnection.dataChannels.push(channel); return channel as unknown as RTCDataChannel; }
-  restartIce(): void {}
+  restartIce(): void { FakePeerConnection.restartIceCalls += 1; }
   async getStats(): Promise<RTCStatsReport> {
     return new Map(FakePeerConnection.stats.map((stat) => [String(stat.id), stat])) as unknown as RTCStatsReport;
   }
@@ -120,9 +125,14 @@ describe("MeshWebRTCTransport", () => {
     FakePeerConnection.failMLineOrderOnce = false;
     FakePeerConnection.configurations = [];
     FakePeerConnection.stats = [];
+    FakePeerConnection.restartIceCalls = 0;
+    FakePeerConnection.offerOptions = [];
     vi.stubGlobal("RTCPeerConnection", FakePeerConnection);
   });
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
 
   it("mantém no máximo uma RTCPeerConnection por peer", async () => {
     const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], events());
@@ -253,6 +263,57 @@ describe("MeshWebRTCTransport", () => {
 
     await transport.acceptAnswer(peerId, { type: "answer", sdp: "answer-1" });
     expect(callbacks.sendOffer).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserva o ICE restart quando a queda ocorre com uma offer em andamento", async () => {
+    vi.useFakeTimers();
+    const callbacks = events();
+    const peerId = "00000000-0000-4000-8000-000000000002";
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
+    await transport.connect(peerId, true);
+    const connection = FakePeerConnection.instances[0]!;
+    connection.connectionState = "failed";
+    connection.onconnectionstatechange?.();
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(FakePeerConnection.restartIceCalls).toBe(1);
+    expect(callbacks.sendOffer).toHaveBeenCalledTimes(1);
+
+    await transport.acceptAnswer(peerId, { type: "answer", sdp: "answer-inicial-atrasada" });
+    expect(callbacks.sendOffer).toHaveBeenCalledTimes(2);
+    expect(FakePeerConnection.offerOptions.at(-1)).toMatchObject({ iceRestart: true });
+
+    connection.connectionState = "connected";
+    connection.onconnectionstatechange?.();
+    await transport.disconnect();
+    vi.useRealTimers();
+  });
+
+  it("repete a recuperação e recria um peer que continua travado", async () => {
+    vi.useFakeTimers();
+    const callbacks = { ...events(), onDataMessage: vi.fn(), onPeerReset: vi.fn() };
+    const peerId = "00000000-0000-4000-8000-000000000002";
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
+    await transport.connect(peerId, true);
+    await transport.acceptAnswer(peerId, { type: "answer", sdp: "answer" });
+    const stalled = FakePeerConnection.instances[0]!;
+    stalled.connectionState = "failed";
+    stalled.onconnectionstatechange?.();
+
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(4_000);
+    await vi.advanceTimersByTimeAsync(8_000);
+
+    expect(FakePeerConnection.restartIceCalls).toBe(3);
+    expect(FakePeerConnection.instances).toHaveLength(2);
+    expect(callbacks.onPeerReset).toHaveBeenCalledWith(peerId);
+    expect(callbacks.sendOffer).toHaveBeenCalledTimes(3);
+
+    const replacement = FakePeerConnection.instances[1]!;
+    replacement.connectionState = "connected";
+    replacement.onconnectionstatechange?.();
+    await transport.disconnect();
+    vi.useRealTimers();
   });
 
   it("recria somente o peer quando uma offer antiga viola a ordem de m-lines", async () => {

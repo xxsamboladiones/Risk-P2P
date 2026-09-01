@@ -13,6 +13,7 @@ type ReconcileRemoteMediaState = typeof import("./call")["reconcileRemoteMediaSt
 let reconcileRemoteMediaState: ReconcileRemoteMediaState;
 let parseCallProfileMessage: typeof import("./call")["parseCallProfileMessage"];
 let sameCallPublicKey: typeof import("./call")["sameCallPublicKey"];
+let callConnectionRecoveryMessage: typeof import("./call")["callConnectionRecoveryMessage"];
 let CallController: typeof import("./call")["CallController"];
 
 function fakeStream(id: string, video = true): MediaStream {
@@ -33,7 +34,7 @@ beforeAll(async () => {
   vi.stubGlobal("MediaStream", class {
     getTracks(): MediaStreamTrack[] { return []; }
   });
-  ({ CallController, reconcileRemoteMediaState, parseCallProfileMessage, sameCallPublicKey } = await import("./call"));
+  ({ CallController, reconcileRemoteMediaState, parseCallProfileMessage, sameCallPublicKey, callConnectionRecoveryMessage } = await import("./call"));
 });
 
 afterAll(() => vi.unstubAllGlobals());
@@ -99,6 +100,19 @@ describe("perfil da chamada via DataChannel", () => {
       type: "call.profile",
       payload: { displayName: "Maria", avatar: `data:image/png;base64,${"A".repeat(70_000)}` },
     }))).toBeNull();
+  });
+});
+
+describe("recuperação da conexão da chamada", () => {
+  it("não diagnostica falta de TURN quando existe uma interface ZeroTier", () => {
+    const message = callConnectionRecoveryMessage(false, [{ provider: "zerotier" }]);
+    expect(message).toContain("ZeroTier");
+    expect(message).toContain("Tentando restabelecer automaticamente");
+    expect(message).not.toContain("configure TURN");
+  });
+
+  it("mantém a recomendação de TURN somente para conexões sem VPN privada", () => {
+    expect(callConnectionRecoveryMessage(false, [{ provider: "unknown" }])).toContain("configure TURN");
   });
 });
 

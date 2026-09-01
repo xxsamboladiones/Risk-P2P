@@ -121,6 +121,27 @@ function hasTurnServer(iceServers: RTCIceServer[]): boolean {
   });
 }
 
+export function callConnectionRecoveryMessage(
+  turnAvailable: boolean,
+  networkInterfaces: readonly { provider: string }[],
+): string {
+  const vpn = networkInterfaces.find((networkInterface) => networkInterface.provider !== "unknown");
+  if (vpn) {
+    const label = vpn.provider === "zerotier"
+      ? "ZeroTier"
+      : vpn.provider === "tailscale"
+        ? "Tailscale"
+        : vpn.provider === "wireguard"
+          ? "WireGuard"
+          : "VPN";
+    return `A conexão WebRTC foi interrompida com ${label} disponível. Tentando restabelecer automaticamente pela rede privada…`;
+  }
+  if (turnAvailable) {
+    return "A conexão WebRTC foi interrompida. Tentando restabelecer automaticamente com ICE/TURN…";
+  }
+  return "A conexão WebRTC foi interrompida. Tentando restabelecer automaticamente. Se ela não recuperar, configure TURN para redes NAT/CGNAT ou firewalls restritivos.";
+}
+
 async function createMicrophoneSession(settings: VoiceVideoSettings): Promise<MicrophoneSession> {
   const inputStream = await openConfiguredMicrophone(settings);
   const inputTrack = inputStream.getAudioTracks()[0];
@@ -309,6 +330,7 @@ export class CallController {
   private lifecycleId = 0;
   private turnAvailable = false;
   private connectionFailureMessage?: string;
+  private readonly recoveringPeers = new Set<string>();
   private identity?: LocalIdentity;
   private readonly trustedPeers = new Map<string, PublicPeerIdentity>();
   private readonly revokedPeers = new Map<string, PublicPeerIdentity>();
@@ -342,6 +364,7 @@ export class CallController {
     this.screenStream = undefined;
     this.turnAvailable = hasTurnServer(iceServers);
     this.connectionFailureMessage = undefined;
+    this.recoveringPeers.clear();
     this.identity = undefined;
     this.trustedPeers.clear();
     this.revokedPeers.clear();
@@ -394,13 +417,11 @@ export class CallController {
         const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
         store.upsert({ ...participant, connection });
         if (connection === "failed") {
-          this.connectionFailureMessage = this.turnAvailable
-            ? "A conexão WebRTC falhou mesmo com TURN configurado. Verifique o servidor TURN e as portas 3478 e 49160–49200."
-            : "A conexão WebRTC foi bloqueada pela rede. Este pacote está usando somente STUN; configure um servidor TURN para chamadas entre NAT/CGNAT ou firewalls restritivos.";
+          this.recoveringPeers.add(remotePeerId);
+          this.connectionFailureMessage = callConnectionRecoveryMessage(this.turnAvailable, networkInterfaces);
           store.setError(this.connectionFailureMessage);
-        } else if (connection === "connected" && store.error === this.connectionFailureMessage) {
-          store.setError(null);
-          this.connectionFailureMessage = undefined;
+        } else if (connection === "connected" || connection === "closed") {
+          this.finishPeerRecovery(remotePeerId);
         }
       },
       onPeerReset: (remotePeerId) => {
@@ -1010,6 +1031,7 @@ export class CallController {
         void signaling.sendPeerState(this.state).catch((error) => store.setError(String(error)));
       }),
       signaling.onPeerLeft((remotePeerId) => {
+        this.finishPeerRecovery(remotePeerId);
         useCallStore.getState().remove(remotePeerId);
         this.authenticatedPeers.delete(remotePeerId);
         this.pendingPeerStates.delete(remotePeerId);
@@ -1081,6 +1103,15 @@ export class CallController {
     useCallStore.getState().setError(message || fallback);
   }
 
+  private finishPeerRecovery(remotePeerId: string): void {
+    this.recoveringPeers.delete(remotePeerId);
+    const store = useCallStore.getState();
+    if (this.recoveringPeers.size === 0 && store.error === this.connectionFailureMessage) {
+      store.setError(null);
+      this.connectionFailureMessage = undefined;
+    }
+  }
+
   private async cleanup(): Promise<void> {
     this.lifecycleId += 1;
     const signaling = this.signaling;
@@ -1108,6 +1139,7 @@ export class CallController {
     this.avatar = undefined;
     this.turnAvailable = false;
     this.connectionFailureMessage = undefined;
+    this.recoveringPeers.clear();
     this.identity = undefined;
     this.trustedPeers.clear();
     this.revokedPeers.clear();

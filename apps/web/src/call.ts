@@ -1089,6 +1089,7 @@ export class CallController {
 
   private updateLocalPreview(): void {
     useCallStore.getState().setLocalMedia({
+      microphone: this.microphoneTrack ? new MediaStream([this.microphoneTrack]) : null,
       camera: this.cameraTrack ? new MediaStream([this.cameraTrack]) : null,
       screen: this.screenStream ? new MediaStream(this.screenStream.getVideoTracks()) : null,
     }, this.state);
@@ -1165,7 +1166,7 @@ export class CallController {
 
     const store = useCallStore.getState();
     store.clearParticipants();
-    store.setLocalMedia({ camera: null, screen: null }, this.state);
+    store.setLocalMedia({ microphone: null, camera: null, screen: null }, this.state);
 
     await signaling?.disconnect().catch(() => undefined);
     await transport?.disconnect().catch(() => undefined);

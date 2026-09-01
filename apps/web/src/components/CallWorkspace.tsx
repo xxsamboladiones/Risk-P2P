@@ -29,6 +29,7 @@ import type {
 } from "../chat";
 import { loadLocalGroups } from "../services/offline/social-storage";
 import { incompatiblePeerMessage } from "../services/protocol-compatibility";
+import { observeVoiceActivity } from "../services/audio/voice-activity";
 import { useCallStore, type Participant } from "../store";
 import { ConversationTimeline } from "./ConversationTimeline";
 import { responsiveCallGrid } from "./call-layout";
@@ -118,6 +119,19 @@ function RemoteAudio({ stream, volume }: { stream: MediaStream; volume: number }
   return null;
 }
 
+function useVoiceActivity(stream: MediaStream | null | undefined, enabled: boolean): boolean {
+  const [speaking, setSpeaking] = useState(false);
+  const audioTrackKey = stream?.getAudioTracks().map((track) => `${track.id}:${track.readyState}`).join(":") ?? "";
+
+  useEffect(() => {
+    setSpeaking(false);
+    if (!enabled || !stream || !audioTrackKey) return;
+    return observeVoiceActivity(stream, setSpeaking);
+  }, [audioTrackKey, enabled, stream]);
+
+  return enabled && speaking;
+}
+
 function VolumeControl({ label, value, onChange }: { label: string; value: number; onChange(value: number): void }) {
   return <label className="volume-control" title={`${label}: ${value}%`}>
     {value === 0 ? <VolumeX size={15}/> : <Volume2 size={15}/>}<span>{label}</span>
@@ -188,10 +202,11 @@ function VideoTile({
   const canSwitch = participant.state.camera && Boolean(cameraStream && screenStream);
   const userHasAudio = Boolean(microphoneStream?.getAudioTracks().some((track) => track.readyState === "live"));
   const screenHasAudio = Boolean(screenStream?.getAudioTracks().some((track) => track.readyState === "live"));
+  const speaking = useVoiceActivity(microphoneStream, participant.state.microphone && userHasAudio);
 
   return <article
     ref={articleRef}
-    className={`tile ${source} ${participant.connection === "connected" ? "online" : ""} ${focused ? "focused" : ""} ${compact ? "thumbnail" : ""}`}
+    className={`tile ${source} ${participant.connection === "connected" ? "online" : ""} ${speaking ? "speaking" : ""} ${focused ? "focused" : ""} ${compact ? "thumbnail" : ""}`}
     onClick={(event) => {
       if ((event.target as HTMLElement).closest("button,input")) return;
       onFocus(tileId);
@@ -215,17 +230,19 @@ function VideoTile({
   </article>;
 }
 
-function LocalProfileTile({ displayName, avatar, microphone, tileId, focused, compact, onFocus }: {
+function LocalProfileTile({ displayName, avatar, microphone, microphoneStream, tileId, focused, compact, onFocus }: {
   displayName: string;
   avatar?: string;
   microphone: boolean;
+  microphoneStream: MediaStream | null;
   tileId: string;
   focused: boolean;
   compact: boolean;
   onFocus(tileId: string): void;
 }) {
+  const speaking = useVoiceActivity(microphoneStream, microphone);
   return <article
-    className={`tile local online profile-only ${focused ? "focused" : ""} ${compact ? "thumbnail" : ""}`}
+    className={`tile local online profile-only ${speaking ? "speaking" : ""} ${focused ? "focused" : ""} ${compact ? "thumbnail" : ""}`}
     onClick={() => onFocus(tileId)}
   >
     <div className="video-off"><ProfileAvatar displayName={displayName} avatar={avatar} className="call-profile-avatar"/></div>
@@ -239,6 +256,7 @@ function LocalVideoTile({
   label,
   mirrored,
   microphone,
+  microphoneStream,
   focused,
   compact,
   onFocus,
@@ -248,6 +266,7 @@ function LocalVideoTile({
   label: string;
   mirrored: boolean;
   microphone: boolean;
+  microphoneStream?: MediaStream | null;
   focused: boolean;
   compact: boolean;
   onFocus(tileId: string): void;
@@ -255,6 +274,7 @@ function LocalVideoTile({
   const videoRef = useRef<HTMLVideoElement>(null);
   const articleRef = useRef<HTMLElement>(null);
   const source = mirrored ? "camera" : "screen";
+  const speaking = useVoiceActivity(microphoneStream, microphone && Boolean(microphoneStream));
   useEffect(() => {
     if (videoRef.current) {
       videoRef.current.srcObject = stream;
@@ -264,7 +284,7 @@ function LocalVideoTile({
 
   return <article
     ref={articleRef}
-    className={`tile local online ${source} ${focused ? "focused" : ""} ${compact ? "thumbnail" : ""}`}
+    className={`tile local online ${source} ${speaking ? "speaking" : ""} ${focused ? "focused" : ""} ${compact ? "thumbnail" : ""}`}
     onClick={(event) => {
       if ((event.target as HTMLElement).closest("button")) return;
       onFocus(tileId);
@@ -607,6 +627,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
           displayName={context?.displayName ?? "Você"}
           avatar={context?.avatar}
           microphone={localState.microphone}
+          microphoneStream={localPreviews.microphone}
           tileId="local-profile"
           focused={focused === "local-profile"}
           compact={Boolean(focused && focused !== "local-profile")}
@@ -618,6 +639,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
           label="Câmera"
           mirrored
           microphone={localState.microphone}
+          microphoneStream={localPreviews.microphone}
           focused={focused === "local-camera"}
           compact={Boolean(focused && focused !== "local-camera")}
           onFocus={(id) => setFocusedTile((current) => current === id ? null : id)}

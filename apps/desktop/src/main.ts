@@ -1,4 +1,4 @@
-import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, net, protocol, session } from "electron";
+import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, Menu, nativeImage, net, protocol, session, Tray } from "electron";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { accessSync, constants as fsConstants, existsSync, readFileSync } from "node:fs";
@@ -6,6 +6,7 @@ import { access, mkdir, unlink, writeFile } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { shouldHideWindowOnClose } from "./desktop-lifecycle.js";
 import { collectNetworkInterfaces } from "./network-interfaces.js";
 
 if (process.platform === "linux") {
@@ -122,6 +123,8 @@ let backendWebOrigin = PACKAGED_ORIGIN;
 let backendRestartAttempts = 0;
 let backendRestarting = false;
 let isQuitting = false;
+let mainWindow: BrowserWindow | undefined;
+let tray: Tray | undefined;
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) app.quit();
@@ -133,6 +136,49 @@ function isTrustedRendererUrl(value: string): boolean {
     return DEVELOPMENT_ORIGINS.has(parsed.origin);
   } catch {
     return false;
+  }
+}
+
+function hasTray(): boolean {
+  return Boolean(tray && !tray.isDestroyed());
+}
+
+function showMainWindow(): void {
+  const window = mainWindow && !mainWindow.isDestroyed() ? mainWindow : createWindow();
+  if (window.isMinimized()) window.restore();
+  if (!window.isVisible()) window.show();
+  window.focus();
+}
+
+function quitApplication(): void {
+  isQuitting = true;
+  app.quit();
+}
+
+function restartApplication(): void {
+  isQuitting = true;
+  app.relaunch();
+  app.quit();
+}
+
+function createTray(): void {
+  if (hasTray()) return;
+  try {
+    const source = nativeImage.createFromPath(APP_ICON_PATH);
+    if (source.isEmpty()) throw new Error(`Ícone da bandeja não encontrado em ${APP_ICON_PATH}`);
+    const icon = source.resize({ width: process.platform === "darwin" ? 18 : 22, height: process.platform === "darwin" ? 18 : 22, quality: "best" });
+    tray = new Tray(icon);
+    tray.setToolTip("Risk");
+    tray.setContextMenu(Menu.buildFromTemplate([
+      { label: "Abrir app", click: showMainWindow },
+      { label: "Reiniciar app", click: restartApplication },
+      { type: "separator" },
+      { label: "Fechar o app", click: quitApplication },
+    ]));
+    tray.on("click", showMainWindow);
+  } catch (error) {
+    tray = undefined;
+    console.error("Não foi possível criar o ícone da bandeja; fechar a janela encerrará o Risk.", error);
   }
 }
 
@@ -449,7 +495,7 @@ ipcMain.handle("screen:select", async (event, sourceId: unknown) => {
   pendingDisplaySelection = known ?? { id: sourceId };
 });
 
-function createWindow(): void {
+function createWindow(): BrowserWindow {
   const reportingPackagedOrigin = app.isPackaged && Boolean(PACKAGED_ORIGIN_REPORT_FILE);
   let rendererRecoveryAttempted = false;
   const window = new BrowserWindow({
@@ -466,7 +512,17 @@ function createWindow(): void {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      backgroundThrottling: false,
     },
+  });
+  mainWindow = window;
+  window.on("close", (event) => {
+    if (!shouldHideWindowOnClose({ isQuitting, trayAvailable: hasTray(), automatedRun: reportingPackagedOrigin })) return;
+    event.preventDefault();
+    window.hide();
+  });
+  window.on("closed", () => {
+    if (mainWindow === window) mainWindow = undefined;
   });
   window.webContents.setWebRTCIPHandlingPolicy("default");
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
@@ -573,14 +629,12 @@ function createWindow(): void {
     if (!reportingPackagedOrigin) window.show();
     else app.exit(1);
   });
+  return window;
 }
 
 if (hasSingleInstanceLock) {
   app.on("second-instance", () => {
-    const window = BrowserWindow.getAllWindows()[0];
-    if (!window) return;
-    if (window.isMinimized()) window.restore();
-    window.focus();
+    if (app.isReady()) showMainWindow();
   });
 
   app.whenReady().then(async () => {
@@ -636,9 +690,10 @@ if (hasSingleInstanceLock) {
         callback({});
       }
     });
+    createTray();
     createWindow();
     app.on("activate", () => {
-      if (!BrowserWindow.getAllWindows().length) createWindow();
+      showMainWindow();
     });
   }).catch((error) => {
     console.error("Falha ao iniciar o Risk", error);
@@ -651,11 +706,13 @@ if (hasSingleInstanceLock) {
 
 app.on("before-quit", () => {
   isQuitting = true;
+  tray?.destroy();
+  tray = undefined;
   pendingDisplaySelection = undefined;
   knownDisplaySources.clear();
   void clearDevBackendBridge();
   stopBackend();
 });
 app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") app.quit();
+  if (process.platform !== "darwin" && (!hasTray() || Boolean(PACKAGED_ORIGIN_REPORT_FILE))) app.quit();
 });

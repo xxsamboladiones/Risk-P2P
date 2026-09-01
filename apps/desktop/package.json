@@ -37,6 +37,7 @@
     "files": [
       "dist/main.js",
       "dist/preload.cjs",
+      "dist/desktop-lifecycle.js",
       "dist/network-interfaces.js"
     ],
     "extraResources": [

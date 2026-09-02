@@ -56,6 +56,10 @@ type MicrophoneSession = {
   rnnoise?: RnnoiseMicrophone;
 };
 
+const AUTH_CHALLENGE_TIMEOUT_MS = 8_000;
+const AUTH_CONNECTION_WATCHDOG_MS = 20_000;
+const MAX_AUTH_CHALLENGES_PER_CONNECTION = 3;
+
 type CallProfileMessage = {
   version: 1;
   type: "call.profile";
@@ -347,6 +351,7 @@ export class CallController {
   private groupId?: string;
   private readonly authChallenges = new Map<string, string>();
   private readonly authTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly authChallengeAttempts = new Map<string, number>();
   private readonly authenticatedPeers = new Set<string>();
   private readonly pendingPeerStates = new Map<string, PeerState>();
   private readonly remoteIdentityPeerIds = new Map<string, string>();
@@ -384,6 +389,7 @@ export class CallController {
     this.authChallenges.clear();
     this.authTimers.forEach((timer) => clearTimeout(timer));
     this.authTimers.clear();
+    this.authChallengeAttempts.clear();
     this.authenticatedPeers.clear();
     this.pendingPeerStates.clear();
     this.remoteIdentityPeerIds.clear();
@@ -442,6 +448,10 @@ export class CallController {
         this.authChallenges.delete(remotePeerId);
         const timer = this.authTimers.get(remotePeerId); if (timer) clearTimeout(timer);
         this.authTimers.delete(remotePeerId);
+        this.authChallengeAttempts.delete(remotePeerId);
+        if (this.mediaAuthenticationRequired && this.isAdmittedCallPeer(remotePeerId)) {
+          this.schedulePeerAuthenticationCheck(remotePeerId, AUTH_CONNECTION_WATCHDOG_MS);
+        }
         const store = useCallStore.getState();
         const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
         Object.values(participant.streams ?? {}).forEach((stream) => stream.getTracks().forEach((track) => { track.enabled = false; }));
@@ -466,8 +476,16 @@ export class CallController {
       },
       onDataState: (remotePeerId, state) => {
         if (state === "open") {
-          if (this.mediaAuthenticationRequired) void this.sendAuthChallenge(remotePeerId);
+          if (this.mediaAuthenticationRequired) this.sendAuthChallenge(remotePeerId);
           else this.sendProfile(remotePeerId);
+          // Uma conexão recriada não gera novo evento de presença. Reenvia o
+          // estado para que câmera/tela/microfone sejam restaurados junto com a
+          // identidade, sem depender de o usuário alternar algum controle.
+          void this.signaling?.sendPeerState(this.state).catch((error) => {
+            console.warn("Não foi possível reenviar o estado após reabrir o DataChannel.", { remotePeerId, error });
+          });
+        } else if (this.mediaAuthenticationRequired && !this.authenticatedPeers.has(remotePeerId)) {
+          this.schedulePeerAuthenticationCheck(remotePeerId, AUTH_CHALLENGE_TIMEOUT_MS);
         }
       },
     }, networkInterfaces);
@@ -789,20 +807,73 @@ export class CallController {
     this.sendProfile();
   }
 
-  private async sendAuthChallenge(remotePeerId: string): Promise<void> {
-    if (!this.identity || !this.transport) return;
+  private sendAuthChallenge(remotePeerId: string): boolean {
+    if (!this.identity || !this.transport || this.authenticatedPeers.has(remotePeerId)) return false;
     const nonce = crypto.randomUUID();
     this.authChallenges.set(remotePeerId, nonce);
-    const prior = this.authTimers.get(remotePeerId); if (prior) clearTimeout(prior);
-    this.authTimers.set(remotePeerId, setTimeout(() => {
-      this.authTimers.delete(remotePeerId);
-      if (!this.authChallenges.delete(remotePeerId)) return;
-      this.pendingRevokedPeers.delete(remotePeerId);
-      useCallStore.getState().remove(remotePeerId);
-      void this.transport?.disconnect(remotePeerId);
-    }, 12_000));
     const message: CallAuthMessage = { version: 1, type: "call.auth.challenge", identityPeerId: this.identity.peerId, nonce, timestamp: Date.now(), capabilities: LOCAL_RISK_CAPABILITIES };
-    this.transport.sendData(JSON.stringify(message), remotePeerId);
+    const sent = this.transport.sendData(JSON.stringify(message), remotePeerId);
+    if (sent < 1) {
+      if (this.authChallenges.get(remotePeerId) === nonce) this.authChallenges.delete(remotePeerId);
+      return false;
+    }
+    this.authChallengeAttempts.set(remotePeerId, (this.authChallengeAttempts.get(remotePeerId) ?? 0) + 1);
+    this.schedulePeerAuthenticationCheck(remotePeerId, AUTH_CHALLENGE_TIMEOUT_MS);
+    return true;
+  }
+
+  private schedulePeerAuthenticationCheck(remotePeerId: string, delayMs: number, replace = true): void {
+    if (!this.mediaAuthenticationRequired || this.authenticatedPeers.has(remotePeerId)) return;
+    const existing = this.authTimers.get(remotePeerId);
+    if (existing && !replace) return;
+    if (existing) clearTimeout(existing);
+    const lifecycle = this.lifecycleId;
+    const timer = setTimeout(() => {
+      if (this.authTimers.get(remotePeerId) !== timer) return;
+      this.authTimers.delete(remotePeerId);
+      if (!this.isActive(lifecycle)) return;
+      void this.recoverPeerAuthentication(remotePeerId);
+    }, delayMs);
+    this.authTimers.set(remotePeerId, timer);
+  }
+
+  private async recoverPeerAuthentication(remotePeerId: string): Promise<void> {
+    const lifecycle = this.lifecycleId;
+    const signaling = this.signaling;
+    const transport = this.transport;
+    const localPeerId = this.peerId;
+    if (!signaling || !transport || !localPeerId || !this.isActive(lifecycle)
+      || this.authenticatedPeers.has(remotePeerId)
+      || !this.isAdmittedCallPeer(remotePeerId)
+      || !signaling.getDiagnostics().presencePeers.includes(remotePeerId)) return;
+
+    const attempts = this.authChallengeAttempts.get(remotePeerId) ?? 0;
+    if (attempts < MAX_AUTH_CHALLENGES_PER_CONNECTION && this.sendAuthChallenge(remotePeerId)) return;
+
+    this.authChallenges.delete(remotePeerId);
+    this.authChallengeAttempts.delete(remotePeerId);
+    console.warn("Autenticação do peer não foi concluída; recriando somente esta conexão.", {
+      remotePeerId,
+      challengesSent: attempts,
+    });
+    const store = useCallStore.getState();
+    const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
+    store.upsert({ ...participant, streams: {}, connection: "connecting" });
+    try {
+      await transport.recoverPeer(remotePeerId);
+    } catch (error) {
+      console.warn("Falha ao recriar peer após timeout de autenticação; tentando uma nova conexão.", { remotePeerId, error });
+      await transport.disconnect(remotePeerId).catch(() => undefined);
+      if (this.isActive(lifecycle) && this.transport === transport) {
+        await transport.connect(remotePeerId, true).catch((cause) => {
+          console.warn("Falha ao reconectar peer ainda presente na chamada.", { remotePeerId, error: cause });
+        });
+      }
+    } finally {
+      if (this.isActive(lifecycle) && this.transport === transport && !this.authenticatedPeers.has(remotePeerId)) {
+        this.schedulePeerAuthenticationCheck(remotePeerId, AUTH_CONNECTION_WATCHDOG_MS);
+      }
+    }
   }
 
   private handleAuthMessage(remotePeerId: string, raw: string): boolean {
@@ -854,6 +925,7 @@ export class CallController {
       this.authChallenges.delete(remotePeerId);
       const timer = this.authTimers.get(remotePeerId); if (timer) clearTimeout(timer);
       this.authTimers.delete(remotePeerId);
+      this.authChallengeAttempts.delete(remotePeerId);
       this.remoteIdentityPeerIds.set(remotePeerId, remoteIdentity.peerId);
       this.authenticatedPeers.add(remotePeerId);
       if (this.revokedPeers.has(remoteIdentity.peerId)) {
@@ -959,6 +1031,7 @@ export class CallController {
       // sincronização do grupo; nesse caso ele também precisa entrar no ciclo
       // normal de autenticação e sons.
       this.presenceSounds.observe(remotePeerId);
+      this.schedulePeerAuthenticationCheck(remotePeerId, AUTH_CONNECTION_WATCHDOG_MS, false);
       const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
       store.upsert({ ...participant, connection: participant.connection ?? "new" });
       await transport.connect(remotePeerId, localPeerId < remotePeerId).catch((error) => store.setError(String(error)));
@@ -972,6 +1045,10 @@ export class CallController {
     console.warn(message, { remotePeerId });
     useCallStore.getState().setError(message);
     this.pendingRevokedPeers.delete(remotePeerId);
+    this.authChallenges.delete(remotePeerId);
+    this.authChallengeAttempts.delete(remotePeerId);
+    const timer = this.authTimers.get(remotePeerId); if (timer) clearTimeout(timer);
+    this.authTimers.delete(remotePeerId);
     useCallStore.getState().remove(remotePeerId);
     void this.transport?.disconnect(remotePeerId);
   }
@@ -1071,6 +1148,7 @@ export class CallController {
         if (this.mediaAuthenticationRequired && !this.isAdmittedCallPeer(peer.peerId)) return;
         this.presenceSounds.observe(peer.peerId);
         if (!this.mediaAuthenticationRequired) this.playPresenceSound(this.presenceSounds.accept(peer.peerId));
+        else this.schedulePeerAuthenticationCheck(peer.peerId, AUTH_CONNECTION_WATCHDOG_MS, false);
         const store = useCallStore.getState();
         const participant = store.participants[peer.peerId] ?? placeholderParticipant(peer.peerId);
         store.upsert({ ...participant, connection: participant.connection ?? "new" });
@@ -1089,6 +1167,7 @@ export class CallController {
         this.authChallenges.delete(remotePeerId);
         const timer = this.authTimers.get(remotePeerId); if (timer) clearTimeout(timer);
         this.authTimers.delete(remotePeerId);
+        this.authChallengeAttempts.delete(remotePeerId);
         void this.transport?.disconnect(remotePeerId);
       }),
       signaling.onOffer((message) => {
@@ -1215,6 +1294,7 @@ export class CallController {
     this.authChallenges.clear();
     this.authTimers.forEach((timer) => clearTimeout(timer));
     this.authTimers.clear();
+    this.authChallengeAttempts.clear();
     this.authenticatedPeers.clear();
     this.pendingPeerStates.clear();
     this.remoteIdentityPeerIds.clear();

@@ -139,6 +139,7 @@ export type PeerConnectionDiagnostics = {
 
 export interface CallTransport {
   connect(peerId: string, initiator: boolean): Promise<void>;
+  recoverPeer(peerId: string): Promise<void>;
   disconnect(peerId?: string): Promise<void>;
   publishTrack(track: MediaStreamTrack, stream: MediaStream, options?: VideoPublicationOptions): Promise<void>;
   configurePublishedVideoTrack(track: MediaStreamTrack, options: VideoPublicationOptions): Promise<void>;
@@ -425,6 +426,16 @@ export class MeshWebRTCTransport implements CallTransport {
     entry.needsIceRestart = true;
     entry.pc.restartIce();
     await this.negotiateIfNeeded(peerId, entry);
+  }
+
+  /**
+   * Recria somente a conexão de um peer que ficou parcialmente conectado
+   * (por exemplo, mídia/ICE ativos mas DataChannel de controle travado).
+   */
+  async recoverPeer(peerId: string): Promise<void> {
+    const entry = this.requirePeer(peerId);
+    const attempt = (this.recoveryAttempts.get(peerId) ?? 0) + 1;
+    await this.recreatePeerForRecovery(peerId, entry, attempt);
   }
 
   async disconnect(peerId?: string): Promise<void> {

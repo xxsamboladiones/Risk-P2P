@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { PeerState } from "@risk/protocol";
 import type { LocalGroup } from "./services/offline/social-storage";
 
@@ -38,6 +38,7 @@ beforeAll(async () => {
 });
 
 afterAll(() => vi.unstubAllGlobals());
+afterEach(() => vi.useRealTimers());
 
 describe("reconcileRemoteMediaState", () => {
   it("mapeia screen share quando o MediaStream.id remoto difere do id anunciado", () => {
@@ -169,5 +170,96 @@ describe("sincronização de membros durante a chamada", () => {
     expect(connect).toHaveBeenCalledWith(peerB, true);
     expect(connect).toHaveBeenCalledWith(peerC, true);
     expect(sendPeerState).toHaveBeenCalledOnce();
+  });
+
+  it("recupera separadamente os três peers de uma chamada de quatro pessoas quando o DataChannel não abre", async () => {
+    vi.useFakeTimers();
+    const localPeerId = "00000000-0000-4000-8000-000000000001";
+    const remotePeerIds = [
+      "00000000-0000-4000-8000-000000000002",
+      "00000000-0000-4000-8000-000000000003",
+      "00000000-0000-4000-8000-000000000004",
+    ];
+    const recoverPeer = vi.fn(async () => undefined);
+    const transport = {
+      sendData: vi.fn(() => 0),
+      recoverPeer,
+      disconnect: vi.fn(async () => undefined),
+      connect: vi.fn(async () => undefined),
+    };
+    const signaling = {
+      getDiagnostics: () => ({ presencePeers: remotePeerIds }),
+    };
+    const controller = new CallController();
+    const internals = controller as unknown as {
+      lifecycleId: number;
+      roomId: string;
+      peerId: string;
+      signaling: typeof signaling;
+      transport: typeof transport;
+      identity: { peerId: string };
+      mediaAuthenticationRequired: boolean;
+      trustedPeers: Map<string, { peerId: string }>;
+      authTimers: Map<string, ReturnType<typeof setTimeout>>;
+      schedulePeerAuthenticationCheck(peerId: string, delayMs: number): void;
+    };
+    internals.lifecycleId = 1;
+    internals.roomId = "room-four-peers";
+    internals.peerId = localPeerId;
+    internals.signaling = signaling;
+    internals.transport = transport;
+    internals.identity = { peerId: localPeerId };
+    internals.mediaAuthenticationRequired = true;
+    remotePeerIds.forEach((peerId) => internals.trustedPeers.set(peerId, { peerId }));
+    remotePeerIds.forEach((peerId) => internals.schedulePeerAuthenticationCheck(peerId, 20_000));
+
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(recoverPeer).toHaveBeenCalledTimes(3);
+    remotePeerIds.forEach((peerId) => expect(recoverPeer).toHaveBeenCalledWith(peerId));
+    internals.authTimers.forEach((timer) => clearTimeout(timer));
+  });
+
+  it("repete o desafio antes de recriar uma conexão autenticada incompleta", async () => {
+    vi.useFakeTimers();
+    const localPeerId = "00000000-0000-4000-8000-000000000001";
+    const remotePeerId = "00000000-0000-4000-8000-000000000002";
+    const recoverPeer = vi.fn(async () => undefined);
+    const transport = {
+      sendData: vi.fn(() => 1),
+      recoverPeer,
+      disconnect: vi.fn(async () => undefined),
+      connect: vi.fn(async () => undefined),
+    };
+    const signaling = { getDiagnostics: () => ({ presencePeers: [remotePeerId] }) };
+    const controller = new CallController();
+    const internals = controller as unknown as {
+      lifecycleId: number;
+      roomId: string;
+      peerId: string;
+      signaling: typeof signaling;
+      transport: typeof transport;
+      identity: { peerId: string };
+      mediaAuthenticationRequired: boolean;
+      trustedPeers: Map<string, { peerId: string }>;
+      authTimers: Map<string, ReturnType<typeof setTimeout>>;
+      sendAuthChallenge(peerId: string): boolean;
+    };
+    internals.lifecycleId = 1;
+    internals.roomId = "room-auth-retry";
+    internals.peerId = localPeerId;
+    internals.signaling = signaling;
+    internals.transport = transport;
+    internals.identity = { peerId: localPeerId };
+    internals.mediaAuthenticationRequired = true;
+    internals.trustedPeers.set(remotePeerId, { peerId: remotePeerId });
+
+    expect(internals.sendAuthChallenge(remotePeerId)).toBe(true);
+    await vi.advanceTimersByTimeAsync(24_000);
+
+    expect(transport.sendData).toHaveBeenCalledTimes(3);
+    expect(recoverPeer).toHaveBeenCalledOnce();
+    expect(recoverPeer).toHaveBeenCalledWith(remotePeerId);
+    internals.authTimers.forEach((timer) => clearTimeout(timer));
   });
 });

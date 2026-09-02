@@ -387,6 +387,22 @@ describe("MeshWebRTCTransport", () => {
     vi.useRealTimers();
   });
 
+  it("permite recriar explicitamente um peer cujo DataChannel ficou travado", async () => {
+    const callbacks = { ...events(), onDataMessage: vi.fn(), onDataState: vi.fn(), onPeerReset: vi.fn() };
+    const peerId = "00000000-0000-4000-8000-000000000002";
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
+    await transport.connect(peerId, true);
+
+    expect(FakePeerConnection.instances).toHaveLength(1);
+    expect(FakePeerConnection.dataChannels).toHaveLength(1);
+    await transport.recoverPeer(peerId);
+
+    expect(FakePeerConnection.instances).toHaveLength(2);
+    expect(FakePeerConnection.dataChannels).toHaveLength(2);
+    expect(callbacks.onPeerReset).toHaveBeenCalledWith(peerId);
+    expect(callbacks.sendOffer).toHaveBeenCalledTimes(2);
+  });
+
   it("recria somente o peer quando uma offer antiga viola a ordem de m-lines", async () => {
     const callbacks = events();
     const peerId = "00000000-0000-4000-8000-000000000002";

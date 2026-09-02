@@ -5,6 +5,7 @@ import {
   getOrCreateLocalIdentity,
   loadLocalGroups,
   publicIdentity,
+  type GroupInviteMetadata,
   type LocalGroup,
   type LocalGroupChannel,
   type PublicGroupMetadata,
@@ -113,7 +114,7 @@ export function GroupInvitePanel({
   }, [displayName, initialMode, preferredGroupChannels, preferredGroupId, preferredGroupName, token]);
 
   const selected = groups.find((group) => group.groupId === selectedId);
-  const metadata: PublicGroupMetadata | undefined = selected
+  const metadata: GroupInviteMetadata | undefined = selected
     ? {
         groupId: selected.groupId,
         name: selected.name,
@@ -132,7 +133,8 @@ export function GroupInvitePanel({
         revocations: selected.revocations ?? [],
         rendezvousVersion: selected.rendezvousVersion ?? 1,
         rendezvousSecret: selected.rendezvousSecret ?? selected.groupId,
-        ownerIdentity: selected.members.find((member) => member.peerId === selected.ownerPeerId),
+        ownerIdentity: selected.members.find((member) => member.peerId === selected.ownerPeerId) ?? selected.ownerIdentity,
+        members: selected.members,
       }
     : preferredMetadata && selectedId === preferredMetadata.groupId
       ? preferredMetadata

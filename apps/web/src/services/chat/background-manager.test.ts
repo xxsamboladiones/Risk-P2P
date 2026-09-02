@@ -3,12 +3,28 @@ import type { LocalGroup } from "../offline/social-storage";
 
 const runtime = vi.hoisted(() => ({
   connected: [] as string[],
+  membershipConnected: [] as string[],
   disconnected: [] as string[],
 }));
+
+vi.mock("../offline/social-storage", async () => {
+  const actual = await vi.importActual<typeof import("../offline/social-storage")>("../offline/social-storage");
+  return {
+    ...actual,
+    getOrCreateLocalIdentity: vi.fn(async (displayName: string) => ({
+      id: "self" as const,
+      peerId: "owner-background-test",
+      displayName,
+      publicKey: { kty: "EC", crv: "P-256", x: "owner-x", y: "owner-y" },
+      privateKey: {} as CryptoKey,
+    })),
+  };
+});
 
 vi.mock("../../chat", () => ({
   ChatController: class FakeChatController {
     private channelId?: string;
+    private membershipOnly = false;
     private readonly statusListeners = new Set<(status: string) => void>();
 
     onMessage(): () => void { return () => undefined; }
@@ -17,15 +33,17 @@ vi.mock("../../chat", () => ({
       return () => this.statusListeners.delete(listener);
     }
 
-    async connect(channelId: string): Promise<void> {
+    async connect(channelId: string, _displayName?: string, _iceServers?: RTCIceServer[], options?: { membershipOnly?: boolean }): Promise<void> {
       this.channelId = channelId;
-      runtime.connected.push(channelId);
+      this.membershipOnly = options?.membershipOnly === true;
+      if (this.membershipOnly) runtime.membershipConnected.push(channelId);
+      else runtime.connected.push(channelId);
       this.statusListeners.forEach((listener) => listener("connected"));
       this.statusListeners.forEach((listener) => listener("ready"));
     }
 
     async disconnect(): Promise<void> {
-      if (this.channelId) runtime.disconnected.push(this.channelId);
+      if (this.channelId && !this.membershipOnly) runtime.disconnected.push(this.channelId);
       this.channelId = undefined;
       this.statusListeners.forEach((listener) => listener("disconnected"));
     }
@@ -62,6 +80,7 @@ function groupWithTextChannels(...ids: string[]): LocalGroup {
 describe("BackgroundChatManager", () => {
   beforeEach(() => {
     runtime.connected.length = 0;
+    runtime.membershipConnected.length = 0;
     runtime.disconnected.length = 0;
   });
 
@@ -70,7 +89,17 @@ describe("BackgroundChatManager", () => {
     const group = groupWithTextChannels("foreground", "call-chat", "background");
     await manager.sync([group], "Ana", [], "foreground", ["call-chat"]);
     expect(runtime.connected).toEqual(["background"]);
+    expect(runtime.membershipConnected).toEqual([group.groupId]);
     expect(runtime.disconnected).toEqual([]);
+    await manager.disconnect();
+  });
+
+  it("mantém sincronização de membros mesmo quando o grupo não possui canal de texto", async () => {
+    const manager = new BackgroundChatManager();
+    const group = groupWithTextChannels();
+    await manager.sync([group], "Ana", []);
+    expect(runtime.connected).toEqual([]);
+    expect(runtime.membershipConnected).toEqual([group.groupId]);
     await manager.disconnect();
   });
 

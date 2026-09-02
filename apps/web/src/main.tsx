@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Hash,
@@ -67,6 +67,7 @@ import {
 import { useCallStore } from "./store";
 import { BackgroundChatManager } from "./services/chat/background-manager";
 import { VoiceActivityDirectory, type VoiceActivity } from "./services/supabase/voice-activity";
+import { callSoundForRoomTransition, playCallSound, preloadCallSounds } from "./services/audio/call-sounds";
 import "./styles.css";
 
 const call = new CallController();
@@ -885,6 +886,15 @@ function App() {
   const callWorkspaceOpen = useCallStore((state) => state.callWorkspaceOpen);
   const setSession = useCallStore((state) => state.setSession);
   const [checkingSession, setCheckingSession] = useState(!token);
+  const previousSoundRoom = useRef(room);
+
+  useEffect(() => preloadCallSounds(), []);
+
+  useEffect(() => {
+    const sound = callSoundForRoomTransition(previousSoundRoom.current, room);
+    previousSoundRoom.current = room;
+    if (sound) playCallSound(sound);
+  }, [room]);
 
   useEffect(() => {
     if (token) { setCheckingSession(false); return; }

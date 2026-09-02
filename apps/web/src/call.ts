@@ -27,6 +27,12 @@ import {
   validRiskPeerCapabilities,
   type RiskPeerCapabilities,
 } from "./services/protocol-compatibility";
+import {
+  applyScreenCaptureQuality,
+  SCREEN_QUALITY_PROFILES,
+  screenVideoPublication,
+  type ScreenQualityProfile,
+} from "./services/rtc/screen-quality";
 
 export type CallDiagnostics = {
   signaling: SignalingDiagnostics | null;
@@ -97,6 +103,13 @@ export function parseCallProfileMessage(value: string): CallProfileMessage | nul
   return { version: 1, type: "call.profile", payload: { displayName, avatar: payload.avatar as string | undefined } };
 }
 
+export function sameCallPublicKey(left: JsonWebKey, right: JsonWebKey): boolean {
+  return left.kty === right.kty
+    && left.crv === right.crv
+    && left.x === right.x
+    && left.y === right.y;
+}
+
 function placeholderParticipant(peerId: string): Participant {
   return {
     peerId,
@@ -112,6 +125,27 @@ function hasTurnServer(iceServers: RTCIceServer[]): boolean {
     const values = typeof urls === "string" ? [urls] : urls;
     return values.some((url) => /^turns?:/i.test(url));
   });
+}
+
+export function callConnectionRecoveryMessage(
+  turnAvailable: boolean,
+  networkInterfaces: readonly { provider: string }[],
+): string {
+  const vpn = networkInterfaces.find((networkInterface) => networkInterface.provider !== "unknown");
+  if (vpn) {
+    const label = vpn.provider === "zerotier"
+      ? "ZeroTier"
+      : vpn.provider === "tailscale"
+        ? "Tailscale"
+        : vpn.provider === "wireguard"
+          ? "WireGuard"
+          : "VPN";
+    return `A conexão WebRTC foi interrompida com ${label} disponível. Tentando restabelecer automaticamente pela rede privada…`;
+  }
+  if (turnAvailable) {
+    return "A conexão WebRTC foi interrompida. Tentando restabelecer automaticamente com ICE/TURN…";
+  }
+  return "A conexão WebRTC foi interrompida. Tentando restabelecer automaticamente. Se ela não recuperar, configure TURN para redes NAT/CGNAT ou firewalls restritivos.";
 }
 
 async function createMicrophoneSession(settings: VoiceVideoSettings): Promise<MicrophoneSession> {
@@ -292,6 +326,8 @@ export class CallController {
   private rnnoiseMicrophone?: RnnoiseMicrophone;
   private cameraTrack?: MediaStreamTrack;
   private screenStream?: MediaStream;
+  private screenQualityProfile: ScreenQualityProfile = SCREEN_QUALITY_PROFILES["1080p30"];
+  private screenQualityRevision = 0;
   private roomId?: string;
   private rendezvousId?: string;
   private peerId?: string;
@@ -302,6 +338,7 @@ export class CallController {
   private lifecycleId = 0;
   private turnAvailable = false;
   private connectionFailureMessage?: string;
+  private readonly recoveringPeers = new Set<string>();
   private identity?: LocalIdentity;
   private readonly trustedPeers = new Map<string, PublicPeerIdentity>();
   private readonly revokedPeers = new Map<string, PublicPeerIdentity>();
@@ -335,6 +372,7 @@ export class CallController {
     this.screenStream = undefined;
     this.turnAvailable = hasTurnServer(iceServers);
     this.connectionFailureMessage = undefined;
+    this.recoveringPeers.clear();
     this.identity = undefined;
     this.trustedPeers.clear();
     this.revokedPeers.clear();
@@ -364,6 +402,11 @@ export class CallController {
     store.setError(null);
     store.setSelf(this.peerId);
 
+    const networkInterfaces = await window.desktop?.getNetworkInterfaces?.().catch((error) => {
+      console.warn("Não foi possível consultar as interfaces locais para diagnóstico WebRTC.", error);
+      return [];
+    }) ?? [];
+
     const signaling = this.createSignaling();
     this.signaling = signaling;
     const transport = new MeshWebRTCTransport(this.peerId, iceServers, {
@@ -382,13 +425,11 @@ export class CallController {
         const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
         store.upsert({ ...participant, connection });
         if (connection === "failed") {
-          this.connectionFailureMessage = this.turnAvailable
-            ? "A conexão WebRTC falhou mesmo com TURN configurado. Verifique o servidor TURN e as portas 3478 e 49160–49200."
-            : "A conexão WebRTC foi bloqueada pela rede. Este pacote está usando somente STUN; configure um servidor TURN para chamadas entre NAT/CGNAT ou firewalls restritivos.";
+          this.recoveringPeers.add(remotePeerId);
+          this.connectionFailureMessage = callConnectionRecoveryMessage(this.turnAvailable, networkInterfaces);
           store.setError(this.connectionFailureMessage);
-        } else if (connection === "connected" && store.error === this.connectionFailureMessage) {
-          store.setError(null);
-          this.connectionFailureMessage = undefined;
+        } else if (connection === "connected" || connection === "closed") {
+          this.finishPeerRecovery(remotePeerId);
         }
       },
       onPeerReset: (remotePeerId) => {
@@ -426,7 +467,7 @@ export class CallController {
           else this.sendProfile(remotePeerId);
         }
       },
-    });
+    }, networkInterfaces);
     if (this.mediaAuthenticationRequired) transport.requireMediaAuthorization();
     this.transport = transport;
     this.bindSignaling(signaling, roomId, this.peerId);
@@ -564,7 +605,7 @@ export class CallController {
         this.updateLocalPreview();
         void this.signaling?.sendPeerState(this.state).catch((error) => this.reportError(error, "Não foi possível atualizar a câmera."));
         try {
-          await this.transport?.publishTrack(cameraTrack, this.local);
+          await this.transport?.publishTrack(cameraTrack, this.local, { source: "camera" });
         } catch (error) {
           if (this.cameraTrack === cameraTrack) this.cameraTrack = undefined;
           this.local.removeTrack(cameraTrack);
@@ -582,8 +623,14 @@ export class CallController {
     } catch (error) { this.reportError(error, "Não foi possível alterar a câmera."); }
   }
 
-  async toggleScreen(_roomId: string, sourceId?: string): Promise<void> {
+  async toggleScreen(
+    _roomId: string,
+    sourceId?: string,
+    includeAudio = true,
+    qualityProfile?: ScreenQualityProfile,
+  ): Promise<void> {
     if (this.screenStream) { await this.stopScreen(); return; }
+    if (qualityProfile) this.setScreenQualityProfile(qualityProfile);
     const lifecycle = this.lifecycleId;
     let desktopAudio: DesktopScreenAudioPreparation | null = null;
     let linuxAudioPreparation: Promise<DesktopScreenAudioPreparation | null> | undefined;
@@ -592,7 +639,7 @@ export class CallController {
       const voiceSettings = loadVoiceVideoSettings();
       const linuxDesktop = isLinuxDesktop();
 
-      if (linuxDesktop) {
+      if (linuxDesktop && includeAudio) {
         // Não bloqueia o vídeo esperando PipeWire. O áudio é anexado depois, se
         // a fonte virtual ficar disponível, sem interromper microfone/chamada.
         linuxAudioPreparation = prepareDesktopScreenAudio(voiceSettings.excludeRiskAudioFromScreenShare).catch((error) => {
@@ -600,6 +647,10 @@ export class CallController {
           return null;
         });
         stream = await startDesktopVideoShare(sourceId);
+      } else if (linuxDesktop) {
+        stream = await startDesktopVideoShare(sourceId);
+      } else if (!includeAudio) {
+        stream = await this.screen.startScreenShare(sourceId, false);
       } else {
         desktopAudio = await prepareDesktopScreenAudio(voiceSettings.excludeRiskAudioFromScreenShare).catch((error) => {
           console.warn("Não foi possível consultar o backend de áudio de tela; usando captura padrão.", error);
@@ -608,7 +659,7 @@ export class CallController {
         const pipeWireDesktop = desktopAudio?.mode === "pipewire" || desktopAudio?.mode === "unavailable";
         stream = pipeWireDesktop
           ? await startPipeWireDesktopShare(desktopAudio!, sourceId)
-          : await this.screen.startScreenShare(sourceId);
+          : await this.screen.startScreenShare(sourceId, true);
       }
 
       const videoTrack = stream.getVideoTracks()[0];
@@ -616,6 +667,10 @@ export class CallController {
         stream.getTracks().forEach((track) => track.stop());
         throw new Error("A fonte selecionada não forneceu vídeo");
       }
+
+      // Aplica resolução, FPS e contentHint antes de criar os senders. Assim o
+      // encoder não começa em 4K/sem limite para ser reconfigurado logo depois.
+      const publicationProfile = await this.applyLatestScreenCaptureQuality(videoTrack);
 
       if (desktopAudio?.mode === "unavailable") {
         const message = `PipeWire indisponível para áudio da tela: ${desktopAudio.reason ?? "ferramentas PipeWire não encontradas"}. A tela continuará sem áudio do sistema.`;
@@ -676,7 +731,11 @@ export class CallController {
 
       // No Linux o stream começa somente com vídeo. Isso faz a transmissão aparecer
       // imediatamente; o áudio PipeWire entra depois por uma renegociação separada.
-      await Promise.all(stream.getTracks().map((track) => transport.publishTrack(track, stream!)));
+      await Promise.all(stream.getTracks().map((track) => transport.publishTrack(
+        track,
+        stream!,
+        track.kind === "video" ? screenVideoPublication(publicationProfile) : undefined,
+      )));
       if (!this.isActive(lifecycle)) {
         stream.getTracks().forEach((track) => track.stop());
         await stopDesktopScreenAudio();
@@ -699,6 +758,20 @@ export class CallController {
       else if (desktopAudio?.mode === "pipewire") await stopDesktopScreenAudio();
       if (!(error instanceof DOMException && error.name === "NotAllowedError")) this.reportError(error, "Não foi possível compartilhar a tela.");
     }
+  }
+
+  async updateScreenQuality(profile: ScreenQualityProfile): Promise<void> {
+    this.setScreenQualityProfile(profile);
+    const stream = this.screenStream;
+    const track = stream?.getVideoTracks()[0];
+    const transport = this.transport;
+    if (!stream || !track || !transport) return;
+
+    const lifecycle = this.lifecycleId;
+    const publicationProfile = await this.applyLatestScreenCaptureQuality(track);
+    if (!this.isActive(lifecycle) || this.screenStream !== stream || track.readyState !== "live") return;
+    await transport.configurePublishedVideoTrack(track, screenVideoPublication(publicationProfile));
+    this.updateLocalPreview();
   }
 
   async leave(_roomId: string): Promise<void> { await this.cleanup(); }
@@ -768,7 +841,7 @@ export class CallController {
     if (!transport || !identity || !expectedNonce || message.nonce !== expectedNonce || !remoteIdentity || typeof message.signature !== "string" || !validRiskPeerCapabilities(message.capabilities) || !compatibleCallPeer(message.capabilities)) return;
     if (remoteIdentity.peerId !== remotePeerId || !/^[A-Za-z0-9_-]{8,128}$/.test(remoteIdentity.peerId) || remoteIdentity.displayName.trim().length < 2 || remoteIdentity.displayName.length > 80 || (remoteIdentity.avatar !== undefined && !validAvatarDataUrl(remoteIdentity.avatar))) return;
     const trusted = this.trustedPeers.get(remoteIdentity.peerId) ?? this.revokedPeers.get(remoteIdentity.peerId);
-    if (!trusted || JSON.stringify(trusted.publicKey) !== JSON.stringify(remoteIdentity.publicKey)) return;
+    if (!trusted || !sameCallPublicKey(trusted.publicKey, remoteIdentity.publicKey)) return;
     try {
       const key = await crypto.subtle.importKey("jwk", trusted.publicKey, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
       const canonical = this.authCanonical(remotePeerId, expectedNonce, remoteIdentity, message.capabilities);
@@ -865,6 +938,24 @@ export class CallController {
       await signaling.connect(nextRendezvousId, peerId);
       if (!this.isActive(lifecycle) || this.signaling !== signaling) return;
     }
+    await this.connectPresentAdmittedCallPeers(lifecycle);
+  }
+
+  private async connectPresentAdmittedCallPeers(lifecycle: number): Promise<void> {
+    const signaling = this.signaling;
+    const transport = this.transport;
+    const localPeerId = this.peerId;
+    if (!signaling || !transport || !localPeerId || !this.isActive(lifecycle)) return;
+    const remotePeerIds = signaling.getDiagnostics().presencePeers
+      .filter((remotePeerId) => remotePeerId !== localPeerId && this.isAdmittedCallPeer(remotePeerId));
+    const store = useCallStore.getState();
+    await Promise.all(remotePeerIds.map(async (remotePeerId) => {
+      const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
+      store.upsert({ ...participant, connection: participant.connection ?? "new" });
+      await transport.connect(remotePeerId, localPeerId < remotePeerId).catch((error) => store.setError(String(error)));
+    }));
+    if (!this.isActive(lifecycle) || this.signaling !== signaling) return;
+    if (remotePeerIds.length) void signaling.sendPeerState(this.state).catch((error) => store.setError(String(error)));
   }
 
   private rejectIncompatibleCallPeer(remotePeerId: string, remoteVersion?: string): void {
@@ -976,6 +1067,7 @@ export class CallController {
         void signaling.sendPeerState(this.state).catch((error) => store.setError(String(error)));
       }),
       signaling.onPeerLeft((remotePeerId) => {
+        this.finishPeerRecovery(remotePeerId);
         useCallStore.getState().remove(remotePeerId);
         this.authenticatedPeers.delete(remotePeerId);
         this.pendingPeerStates.delete(remotePeerId);
@@ -1031,8 +1123,23 @@ export class CallController {
     await stopDesktopScreenAudio();
   }
 
+  private setScreenQualityProfile(profile: ScreenQualityProfile): void {
+    this.screenQualityProfile = profile;
+    this.screenQualityRevision += 1;
+  }
+
+  private async applyLatestScreenCaptureQuality(track: MediaStreamTrack): Promise<ScreenQualityProfile> {
+    for (;;) {
+      const revision = this.screenQualityRevision;
+      const profile = this.screenQualityProfile;
+      await applyScreenCaptureQuality(track, profile);
+      if (revision === this.screenQualityRevision) return profile;
+    }
+  }
+
   private updateLocalPreview(): void {
     useCallStore.getState().setLocalMedia({
+      microphone: this.microphoneTrack ? new MediaStream([this.microphoneTrack]) : null,
       camera: this.cameraTrack ? new MediaStream([this.cameraTrack]) : null,
       screen: this.screenStream ? new MediaStream(this.screenStream.getVideoTracks()) : null,
     }, this.state);
@@ -1045,6 +1152,15 @@ export class CallController {
   private reportError(error: unknown, fallback: string): void {
     const message = error instanceof Error ? error.message : fallback;
     useCallStore.getState().setError(message || fallback);
+  }
+
+  private finishPeerRecovery(remotePeerId: string): void {
+    this.recoveringPeers.delete(remotePeerId);
+    const store = useCallStore.getState();
+    if (this.recoveringPeers.size === 0 && store.error === this.connectionFailureMessage) {
+      store.setError(null);
+      this.connectionFailureMessage = undefined;
+    }
   }
 
   private async cleanup(): Promise<void> {
@@ -1074,6 +1190,7 @@ export class CallController {
     this.avatar = undefined;
     this.turnAvailable = false;
     this.connectionFailureMessage = undefined;
+    this.recoveringPeers.clear();
     this.identity = undefined;
     this.trustedPeers.clear();
     this.revokedPeers.clear();
@@ -1099,7 +1216,7 @@ export class CallController {
 
     const store = useCallStore.getState();
     store.clearParticipants();
-    store.setLocalMedia({ camera: null, screen: null }, this.state);
+    store.setLocalMedia({ microphone: null, camera: null, screen: null }, this.state);
 
     await signaling?.disconnect().catch(() => undefined);
     await transport?.disconnect().catch(() => undefined);

@@ -1,5 +1,5 @@
 import { ChatController, type ChatConnectionOptions, type ChatConnectionStatus } from "../../chat";
-import type { LocalGroup } from "../offline/social-storage";
+import { getOrCreateLocalIdentity, groupRendezvousId, type LocalGroup } from "../offline/social-storage";
 
 const MAX_BACKGROUND_CHANNELS = 8;
 export const MAX_BACKGROUND_PRIVATE_CHATS = 8;
@@ -20,6 +20,7 @@ export type PrivateChatSessionSnapshot = {
 
 export class BackgroundChatManager {
   private readonly sessions = new Map<string, ChatController>();
+  private readonly membershipSessions = new Map<string, ChatController>();
   private readonly privateSessions = new Map<string, PrivateChatSession>();
   private readonly unread = new Map<string, number>();
   private desiredChannels = new Set<string>();
@@ -121,6 +122,7 @@ export class BackgroundChatManager {
     activeChannelId?: string,
     reservedChannelIds: readonly string[] = [],
   ): Promise<void> {
+    await this.syncGroupMembership(groups, displayName, iceServers);
     const excluded = new Set<string>(reservedChannelIds);
     if (activeChannelId) excluded.add(activeChannelId);
     const desired = groups.flatMap((group) => group.channels.filter((channel) => channel.kind === "text").map((channel) => channel.id))
@@ -162,14 +164,50 @@ export class BackgroundChatManager {
   async disconnect(): Promise<void> {
     this.desiredChannels.clear();
     const sessions = [...this.sessions.values()];
+    const membershipSessions = [...this.membershipSessions.values()];
     const privateSessions = [...this.privateSessions.values()];
     this.sessions.clear();
+    this.membershipSessions.clear();
     this.privateSessions.clear();
     privateSessions.forEach((session) => { session.offStatus(); session.offMessage(); });
     await Promise.all([
       ...sessions.map((session) => session.disconnect()),
+      ...membershipSessions.map((session) => session.disconnect()),
       ...privateSessions.map((session) => session.controller.disconnect()),
     ]);
+  }
+
+  private async syncGroupMembership(groups: LocalGroup[], displayName: string, iceServers: RTCIceServer[]): Promise<void> {
+    const desired = new Map(groups.map((group) => [group.groupId, group]));
+    await Promise.all([...this.membershipSessions].filter(([groupId]) => !desired.has(groupId)).map(async ([groupId, controller]) => {
+      if (this.membershipSessions.get(groupId) !== controller) return;
+      this.membershipSessions.delete(groupId);
+      await controller.disconnect();
+    }));
+    if (!desired.size) return;
+    const identity = await getOrCreateLocalIdentity(displayName);
+    await Promise.all([...desired.values()].map(async (group) => {
+      if (this.membershipSessions.has(group.groupId)) return;
+      const controller = new ChatController();
+      this.membershipSessions.set(group.groupId, controller);
+      try {
+        await controller.connect(group.groupId, displayName, iceServers, {
+          identity,
+          trustedPeers: group.members,
+          revokedPeers: group.removedMembers ?? [],
+          revocations: group.revocations ?? [],
+          groupId: group.groupId,
+          rendezvousId: groupRendezvousId(group, "chat", group.groupId),
+          namespace: "group",
+          requireIdentityAuthentication: true,
+          membershipOnly: true,
+          maxRemotePeers: 47,
+        });
+      } catch {
+        if (this.membershipSessions.get(group.groupId) === controller) this.membershipSessions.delete(group.groupId);
+        await controller.disconnect();
+      }
+    }));
   }
 
   private async evictPrivateSessionIfNeeded(): Promise<void> {

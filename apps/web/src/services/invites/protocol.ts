@@ -1,10 +1,10 @@
-import { validGroupAdministratorGrant, validGroupRevocationCertificate, verifyGroupAdministratorGrant, type LocalIdentity, type PublicGroupMetadata, type PublicPeerIdentity } from "../offline/social-storage";
+import { validGroupAdministratorGrant, validGroupRevocationCertificate, verifyGroupAdministratorGrant, type GroupInviteMetadata, type LocalIdentity, type PublicPeerIdentity } from "../offline/social-storage";
 import { validAvatarDataUrl } from "../offline/profile";
 
 export type InviteProtocolType = "friend.request" | "friend.accept" | "friend.reject" | "group.join.request" | "group.join.accept" | "group.join.reject" | "invite.ack" | "invite.busy";
 export type SignedInviteMessage = {
   version: 1; type: InviteProtocolType; requestId: string; timestamp: number;
-  identity: PublicPeerIdentity; group?: PublicGroupMetadata; reason?: string; signature: string;
+  identity: PublicPeerIdentity; group?: GroupInviteMetadata; reason?: string; signature: string;
 };
 
 // O DataChannel de controle do MeshWebRTCTransport aceita até 64 KiB. O parser
@@ -61,7 +61,7 @@ export async function parseAndVerifyInviteMessage(raw: string, now = Date.now())
   } catch { return null; }
 }
 
-function compactGroupInviteMetadata(group: PublicGroupMetadata): PublicGroupMetadata {
+function compactGroupInviteMetadata(group: GroupInviteMetadata): GroupInviteMetadata {
   return {
     ...group,
     // Avatares antigos ou fora do formato atual não podem invalidar todo o
@@ -69,6 +69,7 @@ function compactGroupInviteMetadata(group: PublicGroupMetadata): PublicGroupMeta
     // posteriormente; avatares válidos do próprio grupo continuam preservados.
     avatar: group.avatar && validAvatarDataUrl(group.avatar) ? group.avatar : undefined,
     ownerIdentity: group.ownerIdentity ? withoutAvatar(group.ownerIdentity) : undefined,
+    members: group.members?.slice(0, 48).map(withoutAvatar),
     removedMembers: (group.removedMembers ?? []).map(withoutAvatar),
   };
 }
@@ -92,7 +93,7 @@ function isMessage(value: unknown): value is SignedInviteMessage {
     typeof item.timestamp === "number" && Number.isFinite(item.timestamp) && typeof item.signature === "string" && item.signature.length < 512 &&
     Boolean(identity && isPeerIdentity(identity)) &&
     (item.reason === undefined || (typeof item.reason === "string" && item.reason.length <= 200)) &&
-    (type !== "group.join.accept" || (isGroup(item.group) && ((item.group as PublicGroupMetadata).ownerPeerId === identity?.peerId || ((item.group as PublicGroupMetadata).administratorPeerIds.includes(String(identity?.peerId)) && Boolean((item.group as PublicGroupMetadata).ownerIdentity)))));
+    (type !== "group.join.accept" || (isGroup(item.group) && ((item.group as GroupInviteMetadata).ownerPeerId === identity?.peerId || ((item.group as GroupInviteMetadata).administratorPeerIds.includes(String(identity?.peerId)) && Boolean((item.group as GroupInviteMetadata).ownerIdentity)))));
 }
 
 function isGroup(value: unknown): boolean {
@@ -110,6 +111,7 @@ function isGroup(value: unknown): boolean {
     const owner = group.ownerIdentity as Record<string, unknown>;
     if (!owner || owner.peerId !== group.ownerPeerId || !isPeerIdentity(owner)) return false;
   }
+  if (group.members !== undefined && (!Array.isArray(group.members) || group.members.length === 0 || group.members.length > 48 || !group.members.every(isPeerIdentity))) return false;
   return group.channels.every((value) => {
     if (!value || typeof value !== "object") return false;
     const channel = value as Record<string, unknown>;

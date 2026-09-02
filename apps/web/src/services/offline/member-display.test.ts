@@ -7,12 +7,12 @@ function identity(peerId: string, displayName: string, key: string, avatar?: str
 }
 
 describe("dedupeMembersForDisplay", () => {
-  it("mantém somente a identidade local atual quando existem cópias antigas com o mesmo nome", () => {
+  it("mantém identidades distintas mesmo quando usam o mesmo nome", () => {
     const oldA = identity("old-peer-a", "xxsam", "old-a");
     const oldB = identity("old-peer-b", " XXSAM ", "old-b");
     const current = identity("current-peer", "xxsam", "current", "data:image/webp;base64,YQ==");
     const other = identity("other-peer", "DennisGames", "other");
 
-    expect(dedupeMembersForDisplay([oldA, other, oldB, current], current)).toEqual([current, other]);
+    expect(dedupeMembersForDisplay([oldA, other, oldB, current], current)).toEqual([oldA, other, oldB, current]);
   });
 });

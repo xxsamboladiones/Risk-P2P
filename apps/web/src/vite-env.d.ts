@@ -30,6 +30,15 @@ type RiskDesktopBackendStatus = {
   message: string;
 };
 
+type RiskDesktopNetworkInterface = {
+  name: string;
+  address: string;
+  family: "IPv4" | "IPv6";
+  netmask?: string;
+  cidr?: string;
+  provider: "zerotier" | "tailscale" | "wireguard" | "vpn" | "unknown";
+};
+
 interface Window {
   desktop?: {
     listScreenSources(): Promise<RiskDesktopSource[]>;
@@ -37,6 +46,7 @@ interface Window {
     selectScreenSource(sourceId: string): Promise<void>;
     setWindowFullscreen(enabled: boolean): Promise<{ fullscreen: boolean }>;
     getBackendConfig(): Promise<RiskDesktopBackendConfig>;
+    getNetworkInterfaces(): Promise<RiskDesktopNetworkInterface[]>;
     onBackendStatus(callback: (status: RiskDesktopBackendStatus) => void): () => void;
   };
 }

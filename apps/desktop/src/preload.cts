@@ -17,6 +17,15 @@ export type DesktopBackendStatus = {
   message: string;
 };
 
+export type DesktopNetworkInterface = {
+  name: string;
+  address: string;
+  family: "IPv4" | "IPv6";
+  netmask?: string;
+  cidr?: string;
+  provider: "zerotier" | "tailscale" | "wireguard" | "vpn" | "unknown";
+};
+
 const MIN_FULLSCREEN_ZOOM = 0.5;
 const MAX_FULLSCREEN_ZOOM = 5;
 const FULLSCREEN_ZOOM_FACTOR = 1.12;
@@ -222,6 +231,7 @@ contextBridge.exposeInMainWorld("desktop", {
   selectScreenSource: (sourceId: string): Promise<void> => ipcRenderer.invoke("screen:select", sourceId),
   setWindowFullscreen: (enabled: boolean): Promise<{ fullscreen: boolean }> => ipcRenderer.invoke("window:fullscreen", enabled),
   getBackendConfig: (): Promise<DesktopBackendConfig> => ipcRenderer.invoke("backend:config"),
+  getNetworkInterfaces: (): Promise<DesktopNetworkInterface[]> => ipcRenderer.invoke("network:interfaces"),
   onBackendStatus: (callback: (status: DesktopBackendStatus) => void): (() => void) => {
     const listener = (_event: Electron.IpcRendererEvent, status: DesktopBackendStatus) => callback(status);
     ipcRenderer.on("backend:status", listener);

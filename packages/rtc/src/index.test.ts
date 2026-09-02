@@ -1,12 +1,31 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MeshWebRTCTransport, WebScreenShareProvider } from "./index";
 
+class FakeRtpSender {
+  parameters = {
+    transactionId: "fake",
+    encodings: [{}],
+    codecs: [],
+    headerExtensions: [],
+    rtcp: {},
+  } as unknown as RTCRtpSendParameters;
+
+  constructor(public track: MediaStreamTrack | null) {}
+  getParameters(): RTCRtpSendParameters { return this.parameters; }
+  async setParameters(parameters: RTCRtpSendParameters): Promise<void> { this.parameters = parameters; }
+  async replaceTrack(track: MediaStreamTrack | null): Promise<void> { this.track = track; }
+}
+
 class FakePeerConnection {
   static instances: FakePeerConnection[] = [];
   static addedIce: RTCIceCandidateInit[] = [];
   static dataChannels: FakeDataChannel[] = [];
   static addedTracks: MediaStreamTrack[] = [];
   static failMLineOrderOnce = false;
+  static configurations: RTCConfiguration[] = [];
+  static stats: Array<Record<string, unknown>> = [];
+  static restartIceCalls = 0;
+  static offerOptions: RTCOfferOptions[] = [];
   connectionState: RTCPeerConnectionState = "new";
   iceConnectionState: RTCIceConnectionState = "new";
   signalingState: RTCSignalingState = "stable";
@@ -17,9 +36,16 @@ class FakePeerConnection {
   onnegotiationneeded: (() => void) | null = null;
   onconnectionstatechange: (() => void) | null = null;
   ondatachannel: ((event: RTCDataChannelEvent) => void) | null = null;
+  readonly senders: FakeRtpSender[] = [];
 
-  constructor() { FakePeerConnection.instances.push(this); }
-  async createOffer(): Promise<RTCSessionDescriptionInit> { return { type: "offer", sdp: "offer" }; }
+  constructor(configuration: RTCConfiguration) {
+    FakePeerConnection.instances.push(this);
+    FakePeerConnection.configurations.push(configuration);
+  }
+  async createOffer(options: RTCOfferOptions = {}): Promise<RTCSessionDescriptionInit> {
+    FakePeerConnection.offerOptions.push(options);
+    return { type: "offer", sdp: "offer" };
+  }
   async createAnswer(): Promise<RTCSessionDescriptionInit> { return { type: "answer", sdp: "answer" }; }
   async setLocalDescription(description: RTCSessionDescriptionInit): Promise<void> {
     this.localDescription = descriptionWithJson(description);
@@ -34,12 +60,23 @@ class FakePeerConnection {
     this.signalingState = description.type === "offer" ? "have-remote-offer" : "stable";
   }
   async addIceCandidate(candidate: RTCIceCandidateInit): Promise<void> { FakePeerConnection.addedIce.push(candidate); }
-  addTrack(track: MediaStreamTrack): RTCRtpSender { FakePeerConnection.addedTracks.push(track); return {} as RTCRtpSender; }
-  removeTrack(): void {}
-  getSenders(): RTCRtpSender[] { return []; }
+  addTrack(track: MediaStreamTrack): RTCRtpSender {
+    FakePeerConnection.addedTracks.push(track);
+    const sender = new FakeRtpSender(track);
+    this.senders.push(sender);
+    return sender as unknown as RTCRtpSender;
+  }
+  removeTrack(sender: RTCRtpSender): void {
+    const index = this.senders.indexOf(sender as unknown as FakeRtpSender);
+    if (index >= 0) this.senders.splice(index, 1);
+  }
+  getSenders(): RTCRtpSender[] { return this.senders as unknown as RTCRtpSender[]; }
   getTransceivers(): RTCRtpTransceiver[] { return []; }
   createDataChannel(label: string): RTCDataChannel { const channel = new FakeDataChannel(label); FakePeerConnection.dataChannels.push(channel); return channel as unknown as RTCDataChannel; }
-  restartIce(): void {}
+  restartIce(): void { FakePeerConnection.restartIceCalls += 1; }
+  async getStats(): Promise<RTCStatsReport> {
+    return new Map(FakePeerConnection.stats.map((stat) => [String(stat.id), stat])) as unknown as RTCStatsReport;
+  }
   close(): void { this.connectionState = "closed"; }
 }
 
@@ -91,6 +128,16 @@ describe("WebScreenShareProvider", () => {
 
     expect(getDisplayMedia).toHaveBeenCalledOnce();
   });
+
+  it("não solicita captura de áudio quando o usuário escolhe transmitir somente vídeo", async () => {
+    const getDisplayMedia = vi.fn(async () => ({ getTracks: () => [] }) as unknown as MediaStream);
+    vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia } });
+
+    const provider = new WebScreenShareProvider();
+    await provider.startScreenShare(undefined, false);
+
+    expect(getDisplayMedia).toHaveBeenCalledWith({ video: true, audio: false });
+  });
 });
 
 describe("MeshWebRTCTransport", () => {
@@ -100,9 +147,16 @@ describe("MeshWebRTCTransport", () => {
     FakePeerConnection.dataChannels = [];
     FakePeerConnection.addedTracks = [];
     FakePeerConnection.failMLineOrderOnce = false;
+    FakePeerConnection.configurations = [];
+    FakePeerConnection.stats = [];
+    FakePeerConnection.restartIceCalls = 0;
+    FakePeerConnection.offerOptions = [];
     vi.stubGlobal("RTCPeerConnection", FakePeerConnection);
   });
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
 
   it("mantém no máximo uma RTCPeerConnection por peer", async () => {
     const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], events());
@@ -110,6 +164,41 @@ describe("MeshWebRTCTransport", () => {
     await transport.connect("00000000-0000-4000-8000-000000000002", false);
     expect(FakePeerConnection.instances).toHaveLength(1);
     await transport.disconnect();
+  });
+
+  it("preserva ICE normal com host, STUN e TURN habilitados", async () => {
+    const iceServers = [{ urls: "stun:stun.example.test" }, { urls: "turn:turn.example.test" }];
+    const transport = new MeshWebRTCTransport("local", iceServers, events());
+    await transport.connect("remote", false);
+    expect(FakePeerConnection.configurations[0]).toEqual({ iceServers, iceTransportPolicy: "all" });
+  });
+
+  it("reavalia a rota selecionada a cada getStats sem expor o endereço", async () => {
+    const transport = new MeshWebRTCTransport("local", [], events(), [{
+      name: "ztabcd1234",
+      address: "10.147.20.5",
+      family: "IPv4",
+      provider: "zerotier",
+    }]);
+    await transport.connect("remote", false);
+    FakePeerConnection.stats = [
+      { id: "transport", type: "transport", selectedCandidatePairId: "pair" },
+      { id: "pair", type: "candidate-pair", state: "succeeded", localCandidateId: "local-candidate", remoteCandidateId: "remote-candidate", currentRoundTripTime: 0.021 },
+      { id: "local-candidate", type: "local-candidate", candidateType: "host", address: "10.147.20.5", protocol: "udp" },
+      { id: "remote-candidate", type: "remote-candidate", candidateType: "host", address: "10.147.20.8", protocol: "udp" },
+    ];
+    const vpn = (await transport.collectDiagnostics())[0]!;
+    expect(vpn.selectedConnectionPath).toMatchObject({ kind: "vpn-direct", provider: "zerotier" });
+    expect(vpn.roundTripTimeMs).toBe(21);
+    expect(JSON.stringify(vpn)).not.toContain("10.147.20.5");
+
+    FakePeerConnection.stats = [
+      { id: "transport", type: "transport", selectedCandidatePairId: "relay-pair" },
+      { id: "relay-pair", type: "candidate-pair", state: "succeeded", localCandidateId: "relay", remoteCandidateId: "remote-candidate" },
+      { id: "relay", type: "local-candidate", candidateType: "relay", protocol: "udp" },
+      { id: "remote-candidate", type: "remote-candidate", candidateType: "host" },
+    ];
+    expect((await transport.collectDiagnostics())[0]?.selectedConnectionPath.kind).toBe("turn-relay");
   });
 
   it("mantém cinco conexões remotas para uma chamada Mesh de seis participantes", async () => {
@@ -150,6 +239,53 @@ describe("MeshWebRTCTransport", () => {
     await transport.publishTrack(track, stream);
 
     expect(callbacks.sendOffer).toHaveBeenCalledTimes(2);
+  });
+
+  it("aplica no sender a política de alta movimentação e permite atualizá-la ao vivo", async () => {
+    const callbacks = events();
+    const peerId = "00000000-0000-4000-8000-000000000002";
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
+    await transport.connect(peerId, true);
+    await transport.acceptAnswer(peerId, { type: "answer", sdp: "answer-1" });
+
+    const track = {
+      id: "screen-track",
+      kind: "video",
+      getSettings: () => ({ width: 3840, height: 2160 }),
+    } as unknown as MediaStreamTrack;
+    await transport.publishTrack(track, { id: "screen-stream" } as MediaStream, {
+      source: "screen",
+      maxBitrate: 9_000_000,
+      maxFramerate: 60,
+      targetWidth: 1920,
+      targetHeight: 1080,
+      degradationPreference: "balanced",
+    });
+
+    const sender = FakePeerConnection.instances[0]!.senders[0]!;
+    expect(sender.parameters.encodings[0]).toMatchObject({
+      maxBitrate: 9_000_000,
+      maxFramerate: 60,
+      scaleResolutionDownBy: 2,
+      priority: "high",
+      networkPriority: "high",
+    });
+    expect(sender.parameters.degradationPreference).toBe("balanced");
+
+    await transport.configurePublishedVideoTrack(track, {
+      source: "screen",
+      maxBitrate: 3_500_000,
+      maxFramerate: 30,
+      targetWidth: 1280,
+      targetHeight: 720,
+      degradationPreference: "maintain-resolution",
+    });
+    expect(sender.parameters.encodings[0]).toMatchObject({
+      maxBitrate: 3_500_000,
+      maxFramerate: 30,
+      scaleResolutionDownBy: 3,
+    });
+    expect(sender.parameters.degradationPreference).toBe("maintain-resolution");
   });
 
   it("não publica mídia antes da autorização criptográfica do peer", async () => {
@@ -198,6 +334,57 @@ describe("MeshWebRTCTransport", () => {
 
     await transport.acceptAnswer(peerId, { type: "answer", sdp: "answer-1" });
     expect(callbacks.sendOffer).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserva o ICE restart quando a queda ocorre com uma offer em andamento", async () => {
+    vi.useFakeTimers();
+    const callbacks = events();
+    const peerId = "00000000-0000-4000-8000-000000000002";
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
+    await transport.connect(peerId, true);
+    const connection = FakePeerConnection.instances[0]!;
+    connection.connectionState = "failed";
+    connection.onconnectionstatechange?.();
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(FakePeerConnection.restartIceCalls).toBe(1);
+    expect(callbacks.sendOffer).toHaveBeenCalledTimes(1);
+
+    await transport.acceptAnswer(peerId, { type: "answer", sdp: "answer-inicial-atrasada" });
+    expect(callbacks.sendOffer).toHaveBeenCalledTimes(2);
+    expect(FakePeerConnection.offerOptions.at(-1)).toMatchObject({ iceRestart: true });
+
+    connection.connectionState = "connected";
+    connection.onconnectionstatechange?.();
+    await transport.disconnect();
+    vi.useRealTimers();
+  });
+
+  it("repete a recuperação e recria um peer que continua travado", async () => {
+    vi.useFakeTimers();
+    const callbacks = { ...events(), onDataMessage: vi.fn(), onPeerReset: vi.fn() };
+    const peerId = "00000000-0000-4000-8000-000000000002";
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
+    await transport.connect(peerId, true);
+    await transport.acceptAnswer(peerId, { type: "answer", sdp: "answer" });
+    const stalled = FakePeerConnection.instances[0]!;
+    stalled.connectionState = "failed";
+    stalled.onconnectionstatechange?.();
+
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(4_000);
+    await vi.advanceTimersByTimeAsync(8_000);
+
+    expect(FakePeerConnection.restartIceCalls).toBe(3);
+    expect(FakePeerConnection.instances).toHaveLength(2);
+    expect(callbacks.onPeerReset).toHaveBeenCalledWith(peerId);
+    expect(callbacks.sendOffer).toHaveBeenCalledTimes(3);
+
+    const replacement = FakePeerConnection.instances[1]!;
+    replacement.connectionState = "connected";
+    replacement.onconnectionstatechange?.();
+    await transport.disconnect();
+    vi.useRealTimers();
   });
 
   it("recria somente o peer quando uma offer antiga viola a ordem de m-lines", async () => {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type RefObject } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type RefObject } from "react";
 import {
   Activity,
   Copy,
@@ -29,56 +29,32 @@ import type {
 } from "../chat";
 import { loadLocalGroups } from "../services/offline/social-storage";
 import { incompatiblePeerMessage } from "../services/protocol-compatibility";
+import { observeVoiceActivity } from "../services/audio/voice-activity";
+import {
+  isScreenQuality,
+  SCREEN_QUALITY_PROFILES as QUALITY_PROFILES,
+  type ScreenQuality,
+} from "../services/rtc/screen-quality";
 import { useCallStore, type Participant } from "../store";
 import { ConversationTimeline } from "./ConversationTimeline";
+import { responsiveCallGrid } from "./call-layout";
 import { InCallAudioSettings } from "./InCallAudioSettings";
 import { MessageComposer } from "./MessageComposer";
 import { ProfileAvatar } from "./ProfileAvatar";
 import "./call-workspace.css";
 
 type ViewMode = "call" | "chat";
-type ScreenQuality = "720p30" | "720p60" | "1080p30" | "1080p60";
-
-type QualityProfile = {
-  label: string;
-  width: number;
-  height: number;
-  fps: number;
-};
 
 const SCREEN_QUALITY_KEY = "risk.screenShareQuality";
-const QUALITY_PROFILES: Record<ScreenQuality, QualityProfile> = {
-  "720p30": { label: "720p · 30 FPS", width: 1280, height: 720, fps: 30 },
-  "720p60": { label: "720p · 60 FPS", width: 1280, height: 720, fps: 60 },
-  "1080p30": { label: "1080p · 30 FPS", width: 1920, height: 1080, fps: 30 },
-  "1080p60": { label: "1080p · 60 FPS", width: 1920, height: 1080, fps: 60 },
-};
-
-function isScreenQuality(value: string | null): value is ScreenQuality {
-  return Boolean(value && value in QUALITY_PROFILES);
-}
+const SCREEN_AUDIO_KEY = "risk.screenShareAudio";
 
 function initialScreenQuality(): ScreenQuality {
   const saved = localStorage.getItem(SCREEN_QUALITY_KEY);
   return isScreenQuality(saved) ? saved : "1080p30";
 }
 
-async function applyScreenQuality(stream: MediaStream | null, quality: ScreenQuality): Promise<void> {
-  const track = stream?.getVideoTracks()[0];
-  if (!track) return;
-  const profile = QUALITY_PROFILES[quality];
-  try { track.contentHint = "detail"; } catch { /* contentHint é opcional */ }
-  try {
-    await track.applyConstraints({
-      width: { ideal: profile.width, max: profile.width },
-      height: { ideal: profile.height, max: profile.height },
-      frameRate: { ideal: profile.fps, max: profile.fps },
-    });
-  } catch {
-    // Alguns capturadores não permitem reduzir resolução via constraints, mas
-    // normalmente aceitam limitar FPS. Não interrompemos a transmissão por isso.
-    await track.applyConstraints({ frameRate: { ideal: profile.fps, max: profile.fps } }).catch(() => undefined);
-  }
+function initialScreenAudio(): boolean {
+  return localStorage.getItem(SCREEN_AUDIO_KEY) !== "false";
 }
 
 function RemoteAudio({ stream, volume }: { stream: MediaStream; volume: number }) {
@@ -110,6 +86,19 @@ function RemoteAudio({ stream, volume }: { stream: MediaStream; volume: number }
   }, [volume]);
 
   return null;
+}
+
+function useVoiceActivity(stream: MediaStream | null | undefined, enabled: boolean): boolean {
+  const [speaking, setSpeaking] = useState(false);
+  const audioTrackKey = stream?.getAudioTracks().map((track) => `${track.id}:${track.readyState}`).join(":") ?? "";
+
+  useEffect(() => {
+    setSpeaking(false);
+    if (!enabled || !stream || !audioTrackKey) return;
+    return observeVoiceActivity(stream, setSpeaking);
+  }, [audioTrackKey, enabled, stream]);
+
+  return enabled && speaking;
 }
 
 function VolumeControl({ label, value, onChange }: { label: string; value: number; onChange(value: number): void }) {
@@ -182,10 +171,11 @@ function VideoTile({
   const canSwitch = participant.state.camera && Boolean(cameraStream && screenStream);
   const userHasAudio = Boolean(microphoneStream?.getAudioTracks().some((track) => track.readyState === "live"));
   const screenHasAudio = Boolean(screenStream?.getAudioTracks().some((track) => track.readyState === "live"));
+  const speaking = useVoiceActivity(microphoneStream, participant.state.microphone && userHasAudio);
 
   return <article
     ref={articleRef}
-    className={`tile ${source} ${participant.connection === "connected" ? "online" : ""} ${focused ? "focused" : ""} ${compact ? "thumbnail" : ""}`}
+    className={`tile ${source} ${participant.connection === "connected" ? "online" : ""} ${speaking ? "speaking" : ""} ${focused ? "focused" : ""} ${compact ? "thumbnail" : ""}`}
     onClick={(event) => {
       if ((event.target as HTMLElement).closest("button,input")) return;
       onFocus(tileId);
@@ -209,17 +199,19 @@ function VideoTile({
   </article>;
 }
 
-function LocalProfileTile({ displayName, avatar, microphone, tileId, focused, compact, onFocus }: {
+function LocalProfileTile({ displayName, avatar, microphone, microphoneStream, tileId, focused, compact, onFocus }: {
   displayName: string;
   avatar?: string;
   microphone: boolean;
+  microphoneStream: MediaStream | null;
   tileId: string;
   focused: boolean;
   compact: boolean;
   onFocus(tileId: string): void;
 }) {
+  const speaking = useVoiceActivity(microphoneStream, microphone);
   return <article
-    className={`tile local online profile-only ${focused ? "focused" : ""} ${compact ? "thumbnail" : ""}`}
+    className={`tile local online profile-only ${speaking ? "speaking" : ""} ${focused ? "focused" : ""} ${compact ? "thumbnail" : ""}`}
     onClick={() => onFocus(tileId)}
   >
     <div className="video-off"><ProfileAvatar displayName={displayName} avatar={avatar} className="call-profile-avatar"/></div>
@@ -233,6 +225,7 @@ function LocalVideoTile({
   label,
   mirrored,
   microphone,
+  microphoneStream,
   focused,
   compact,
   onFocus,
@@ -242,6 +235,7 @@ function LocalVideoTile({
   label: string;
   mirrored: boolean;
   microphone: boolean;
+  microphoneStream?: MediaStream | null;
   focused: boolean;
   compact: boolean;
   onFocus(tileId: string): void;
@@ -249,6 +243,7 @@ function LocalVideoTile({
   const videoRef = useRef<HTMLVideoElement>(null);
   const articleRef = useRef<HTMLElement>(null);
   const source = mirrored ? "camera" : "screen";
+  const speaking = useVoiceActivity(microphoneStream, microphone && Boolean(microphoneStream));
   useEffect(() => {
     if (videoRef.current) {
       videoRef.current.srcObject = stream;
@@ -258,7 +253,7 @@ function LocalVideoTile({
 
   return <article
     ref={articleRef}
-    className={`tile local online ${source} ${focused ? "focused" : ""} ${compact ? "thumbnail" : ""}`}
+    className={`tile local online ${source} ${speaking ? "speaking" : ""} ${focused ? "focused" : ""} ${compact ? "thumbnail" : ""}`}
     onClick={(event) => {
       if ((event.target as HTMLElement).closest("button")) return;
       onFocus(tileId);
@@ -284,17 +279,30 @@ function upsertAttachment(current: ChatAttachmentRecord[], record: ChatAttachmen
 function ScreenSourcePicker({
   sources,
   loading,
+  includeAudio,
+  onAudioChange,
   onChoose,
   onClose,
 }: {
   sources: RiskDesktopSource[];
   loading: boolean;
+  includeAudio: boolean;
+  onAudioChange(includeAudio: boolean): void;
   onChoose(source: RiskDesktopSource): void;
   onClose(): void;
 }) {
   return <div className="screen-picker-backdrop" onMouseDown={onClose}>
     <section className="screen-picker" onMouseDown={(event) => event.stopPropagation()}>
-      <header><div><MonitorUp/><span><strong>Compartilhar tela</strong><small>Escolha uma tela ou janela</small></span></div><button onClick={onClose} aria-label="Fechar"><X/></button></header>
+      <header>
+        <div><MonitorUp/><span><strong>Compartilhar tela</strong><small>Escolha uma tela ou janela</small></span></div>
+        <button
+          className={`screen-audio-option ${includeAudio ? "active" : ""}`}
+          onClick={() => onAudioChange(!includeAudio)}
+          aria-pressed={includeAudio}
+          title={includeAudio ? "O áudio do sistema será transmitido" : "Apenas o vídeo da tela será transmitido"}
+        >{includeAudio ? <Volume2 size={17}/> : <VolumeX size={17}/>}<span>{includeAudio ? "Com áudio" : "Sem áudio"}</span></button>
+        <button className="screen-picker-close" onClick={onClose} aria-label="Fechar"><X/></button>
+      </header>
       {loading ? <div className="screen-picker-loading"><Sparkles/><span>Buscando telas e janelas…</span></div> :
         <div className="screen-source-grid">
           {sources.map((source) => <button key={source.id} className="screen-source" onClick={() => onChoose(source)}>
@@ -326,6 +334,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
   const [attachments, setAttachments] = useState<ChatAttachmentRecord[]>([]);
   const [attachmentProgress, setAttachmentProgress] = useState<Record<string, ChatAttachmentProgress | undefined>>({});
   const [quality, setQuality] = useState<ScreenQuality>(initialScreenQuality);
+  const [screenAudioEnabled, setScreenAudioEnabled] = useState(initialScreenAudio);
   const [audioSettingsOpen, setAudioSettingsOpen] = useState(false);
   const [sourcePickerOpen, setSourcePickerOpen] = useState(false);
   const [screenSources, setScreenSources] = useState<RiskDesktopSource[]>([]);
@@ -443,14 +452,21 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
 
   useEffect(() => {
     localStorage.setItem(SCREEN_QUALITY_KEY, quality);
-    void applyScreenQuality(localPreviews.screen, quality);
-  }, [localPreviews.screen, quality]);
+    void call.updateScreenQuality(QUALITY_PROFILES[quality]).catch((cause) => {
+      setError(cause instanceof Error ? cause.message : "Não foi possível atualizar a qualidade da transmissão.");
+    });
+  }, [call, quality, setError]);
+
+  useEffect(() => {
+    localStorage.setItem(SCREEN_AUDIO_KEY, String(screenAudioEnabled));
+  }, [screenAudioEnabled]);
 
   useEffect(() => {
     let alive = true;
     const update = async () => {
       const diagnostics = await call.getLiveDiagnostics().catch(() => null);
       if (!alive || !diagnostics) return;
+      setDiagnostics(diagnostics);
       const degraded = diagnostics.peerConnections.some((peer) => (peer.roundTripTimeMs ?? 0) > 350 || (peer.jitterMs ?? 0) > 60 || (peer.packetsLost ?? 0) > 20);
       const disconnected = diagnostics.peerConnections.some((peer) => !["connected", "connecting", "new"].includes(peer.connectionState));
       setNetworkQuality(disconnected ? "Instável" : degraded ? "Limitada" : "Boa");
@@ -479,7 +495,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
       return;
     }
     if (!window.desktop?.listScreenSources) {
-      await call.toggleScreen(roomId);
+      await call.toggleScreen(roomId, undefined, screenAudioEnabled, QUALITY_PROFILES[quality]);
       return;
     }
     setSourcePickerOpen(true);
@@ -497,7 +513,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
   async function chooseScreen(source: RiskDesktopSource): Promise<void> {
     setSourcePickerOpen(false);
     try {
-      await call.toggleScreen(roomId, source.id);
+      await call.toggleScreen(roomId, source.id, screenAudioEnabled, QUALITY_PROFILES[quality]);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Não foi possível iniciar o compartilhamento.");
     }
@@ -530,6 +546,13 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
   }
 
   const focused = focusedTile && tileIds.includes(focusedTile) ? focusedTile : null;
+  const responsiveGrid = responsiveCallGrid(tileIds.length);
+  const stageStyle = {
+    "--call-portrait-columns": responsiveGrid.portrait.columns,
+    "--call-portrait-rows": responsiveGrid.portrait.rows,
+    "--call-compact-columns": responsiveGrid.compactLandscape.columns,
+    "--call-compact-rows": responsiveGrid.compactLandscape.rows,
+  } as CSSProperties;
   const timeline = <ConversationTimeline
     messages={messages}
     attachments={attachments}
@@ -554,8 +577,8 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
           onMinimize();
         }} title="Voltar para o Risk"><PanelLeft size={17}/><span>Voltar ao menu</span></button>
         <div className="call-view-tabs">
-          <button className={view === "call" ? "active" : ""} onClick={() => setView("call")}><Video size={16}/> Chamada</button>
-          <button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")} disabled={!context?.textChannelId}><MessageCircle size={16}/> Chat</button>
+          <button className={view === "call" ? "active" : ""} onClick={() => setView("call")}><Video size={16}/><span>Chamada</span></button>
+          <button className={view === "chat" ? "active" : ""} onClick={() => setView("chat")} disabled={!context?.textChannelId}><MessageCircle size={16}/><span>Chat</span></button>
         </div>
         <button
           className={`network-header-button network-${networkQuality.toLocaleLowerCase()}`}
@@ -568,13 +591,14 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
     {callError && <div className="global-error" onClick={() => setError(null)}>{callError}</div>}
 
     <section className={`call-view ${view === "call" ? "" : "is-hidden"}`}>
-      <section className={`stage ${focused ? "stage-focused" : ""}`} onMouseDown={(event) => {
+      <section className={`stage ${focused ? "stage-focused" : ""}`} style={stageStyle} onMouseDown={(event) => {
         if (event.target === event.currentTarget) setFocusedTile(null);
       }}>
         {!localPreviews.camera && <LocalProfileTile
           displayName={context?.displayName ?? "Você"}
           avatar={context?.avatar}
           microphone={localState.microphone}
+          microphoneStream={localPreviews.microphone}
           tileId="local-profile"
           focused={focused === "local-profile"}
           compact={Boolean(focused && focused !== "local-profile")}
@@ -586,6 +610,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
           label="Câmera"
           mirrored
           microphone={localState.microphone}
+          microphoneStream={localPreviews.microphone}
           focused={focused === "local-camera"}
           compact={Boolean(focused && focused !== "local-camera")}
           onFocus={(id) => setFocusedTile((current) => current === id ? null : id)}
@@ -640,6 +665,16 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
       <button className={localState.camera ? "active" : ""} onClick={() => void call.toggleCamera(roomId)}>{localState.camera ? <Video/> : <VideoOff/>}<span>Câmera</span></button>
       <div className="share-control">
         <button className={localState.screenShare ? "active" : ""} onClick={() => void showScreenPicker()}><MonitorUp/><span>{localState.screenShare ? "Parar transmissão" : "Compartilhar"}</span></button>
+        <select
+          value={screenAudioEnabled ? "audio" : "silent"}
+          onChange={(event) => setScreenAudioEnabled(event.target.value === "audio")}
+          disabled={localState.screenShare}
+          aria-label="Áudio da transmissão de tela"
+          title={localState.screenShare ? "Pare a transmissão para mudar o áudio" : "Escolha se o áudio do sistema será transmitido"}
+        >
+          <option value="audio">Com áudio</option>
+          <option value="silent">Sem áudio</option>
+        </select>
         <select value={quality} onChange={(event) => setQuality(event.target.value as ScreenQuality)} aria-label="Qualidade da transmissão" title="Qualidade da transmissão">
           {Object.entries(QUALITY_PROFILES).map(([value, profile]) => <option key={value} value={value}>{profile.label}</option>)}
         </select>
@@ -660,12 +695,27 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
       <p>Canal Supabase: <b>{diagnostics?.signaling?.channelStatus ?? "indisponível"}</b></p>
       <p>Peers presentes: <b>{diagnostics?.signaling?.presencePeers.length ?? 0}</b></p>
       <p>Conectividade: <b>{diagnostics?.connectivity.label ?? "verificando"}</b></p>
-      {(diagnostics?.peerConnections ?? []).map((peer) => <article key={peer.peerId}><strong>{peer.peerId.slice(0, 8)}</strong><span>WebRTC {peer.connectionState} · ICE {peer.iceConnectionState}</span><small>RTT {peer.roundTripTimeMs ?? 0} ms · jitter {peer.jitterMs ?? 0} ms · perdas {peer.packetsLost ?? 0}</small></article>)}
+      {(diagnostics?.peerConnections ?? []).map((peer) => {
+        const path = peer.selectedConnectionPath;
+        const routeLabel = path.kind === "unknown" && ["new", "connecting"].includes(peer.connectionState)
+          ? "Conectando..."
+          : path.label;
+        const candidateTypes = [path.localCandidateType, path.remoteCandidateType].filter(Boolean).join(" → ");
+        return <article key={peer.peerId}>
+          <strong>{participants[peer.peerId]?.displayName ?? peer.peerId.slice(0, 8)}</strong>
+          <span>WebRTC {peer.connectionState} · ICE {peer.iceConnectionState}</span>
+          <span>{routeLabel}{path.protocol ? ` · ${path.protocol.toLocaleUpperCase()}` : ""}</span>
+          {candidateTypes && <small>Candidates {candidateTypes}{path.provider ? ` · VPN ${path.provider}` : ""}</small>}
+          <small>RTT {peer.roundTripTimeMs ?? 0} ms · jitter {peer.jitterMs ?? 0} ms · perdas {peer.packetsLost ?? 0}</small>
+        </article>;
+      })}
       <button onClick={() => void navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2))}><Copy/> Copiar relatório sanitizado</button>
     </section>}
     {sourcePickerOpen && <ScreenSourcePicker
       sources={screenSources}
       loading={screenSourcesLoading}
+      includeAudio={screenAudioEnabled}
+      onAudioChange={setScreenAudioEnabled}
       onChoose={(source) => void chooseScreen(source)}
       onClose={() => setSourcePickerOpen(false)}
     />}

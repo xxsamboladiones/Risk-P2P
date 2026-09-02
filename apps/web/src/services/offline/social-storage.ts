@@ -52,6 +52,8 @@ export type PublicGroupMetadata = {
   /** Incluída em convites criados por administradores para ancorar a chave do proprietário. */
   ownerIdentity?: PublicPeerIdentity;
 };
+/** Manifesto compacto usado somente no aceite de convite. */
+export type GroupInviteMetadata = PublicGroupMetadata & { members?: PublicPeerIdentity[] };
 export type LocalGroup = PublicGroupMetadata & { members: PublicPeerIdentity[]; joinedAt: number };
 
 export function nextGroupManifestRevision(group: PublicGroupMetadata, actorPeerId: string): Pick<PublicGroupMetadata, "manifestVersion" | "manifestActorPeerId" | "manifestOperationId"> {
@@ -298,17 +300,26 @@ export async function addLocalGroupMember(group: PublicGroupMetadata, member: Pu
     || (base.removedMembers ?? []).some((candidate) => samePeerIdentity(candidate, member))) {
     throw new Error("Esta identidade foi revogada neste grupo e não pode ser reutilizada. Crie uma nova identidade P2P para um novo ingresso.");
   }
-  const members = [...base.members];
-  if (!members.some((item) => samePeerIdentity(item, member)) && members.length >= MAX_GROUP_MEMBERS) {
+  const existingMember = base.members.some((item) => samePeerIdentity(item, member));
+  if (!existingMember && base.members.length >= MAX_GROUP_MEMBERS) {
     throw new Error(`Este grupo atingiu o limite local de ${MAX_GROUP_MEMBERS} membros da versão Alpha.`);
   }
-  if (!members.some((item) => samePeerIdentity(item, member))) members.push(member);
+  const members = upsertGroupMemberIdentity(base.members, member);
   await saveLocalGroup({
     ...base,
     members,
     membershipVersion: Math.max(group.membershipVersion, base.membershipVersion) + 1,
     ...nextGroupManifestRevision({ ...base, manifestVersion: Math.max(group.manifestVersion, base.manifestVersion) }, owner.peerId),
   });
+  if (typeof window !== "undefined") window.dispatchEvent(new Event("risk:social-updated"));
+}
+
+export function upsertGroupMemberIdentity(members: PublicPeerIdentity[], member: PublicPeerIdentity): PublicPeerIdentity[] {
+  const next = [...members];
+  const index = next.findIndex((candidate) => samePeerIdentity(candidate, member));
+  if (index < 0) next.push(member);
+  else next[index] = member;
+  return next;
 }
 
 export async function updateLocalGroupProfile(groupId: string, name: string, avatar?: string): Promise<LocalGroup> {
@@ -439,9 +450,35 @@ export async function mergeLocalGroupManifest(incoming: LocalGroup, senderPeerId
     }
     return merged;
   }
+  if (sameLocalGroupManifestState(group, merged)) return group;
   await saveLocalGroup(merged);
   if (typeof window !== "undefined") window.dispatchEvent(new Event("risk:social-updated"));
   return merged;
+}
+
+export function sameLocalGroupManifestState(left: LocalGroup, right: LocalGroup): boolean {
+  const state = (group: LocalGroup) => ({
+    groupId: group.groupId,
+    name: group.name,
+    avatar: group.avatar,
+    channels: group.channels,
+    ownerPeerId: group.ownerPeerId,
+    membershipVersion: group.membershipVersion,
+    manifestVersion: group.manifestVersion,
+    manifestActorPeerId: group.manifestActorPeerId,
+    manifestOperationId: group.manifestOperationId,
+    administratorEpoch: group.administratorEpoch,
+    administratorPeerIds: group.administratorPeerIds,
+    administratorGrants: group.administratorGrants,
+    removedPeerIds: group.removedPeerIds,
+    removedMembers: group.removedMembers,
+    revocations: group.revocations,
+    rendezvousVersion: group.rendezvousVersion,
+    rendezvousSecret: group.rendezvousSecret,
+    ownerIdentity: group.ownerIdentity,
+    members: group.members,
+  });
+  return stableCanonicalValue(state(left)) === stableCanonicalValue(state(right));
 }
 
 export function resolveLocalGroupManifest(group: LocalGroup, incomingValue: LocalGroup, senderPeerId = incomingValue.manifestActorPeerId ?? incomingValue.ownerPeerId): LocalGroup {
@@ -474,8 +511,8 @@ export function resolveLocalGroupManifest(group: LocalGroup, incomingValue: Loca
     : incomingAdministratorEpoch < localAdministratorEpoch
       ? group.members
       : incomingWins
-        ? [...group.members, ...incoming.members]
-        : [...incoming.members, ...group.members];
+        ? [...incoming.members, ...group.members]
+        : [...group.members, ...incoming.members];
   const members = dedupePeerIdentities(orderedMembers).filter((member) => !removed.has(member.peerId)).map((member) => {
     const cached = group.members.find((candidate) => samePeerIdentity(candidate, member));
     return member.avatar === undefined && cached?.avatar ? { ...member, avatar: cached.avatar } : member;
@@ -882,6 +919,18 @@ function samePublicKey(left: JsonWebKey, right: JsonWebKey): boolean {
 
 function canonicalPublicKey(key: JsonWebKey): object {
   return { kty: key.kty ?? null, crv: key.crv ?? null, x: key.x ?? null, y: key.y ?? null };
+}
+
+function stableCanonicalValue(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableCanonicalValue).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableCanonicalValue(item)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
 function canonicalAdministratorGrantValue(grant: GroupAdministratorGrant): object {

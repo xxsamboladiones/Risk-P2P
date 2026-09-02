@@ -3,11 +3,13 @@ import { SupabaseSignalingProvider } from "../supabase/signaling";
 import type { SignalingProvider } from "../signaling/types";
 import {
   addLocalGroupMember,
+  loadLocalGroups,
+  mergeLocalGroupManifest,
   publicIdentity,
   saveLocalFriend,
   saveLocalGroup,
+  type GroupInviteMetadata,
   type LocalIdentity,
-  type PublicGroupMetadata,
   type PublicPeerIdentity,
 } from "../offline/social-storage";
 import {
@@ -99,7 +101,8 @@ export class InviteService {
   private candidatePeerId?: string;
   private request?: IncomingInviteRequest;
   private requestId?: string;
-  private group?: PublicGroupMetadata;
+  private group?: GroupInviteMetadata;
+  private membershipCommittedRequestId?: string;
   private pendingDecision?: "accept" | "reject";
   private expiryTimer?: ReturnType<typeof setTimeout>;
   private availabilityTimer?: ReturnType<typeof setTimeout>;
@@ -135,7 +138,7 @@ export class InviteService {
 
   async createInvite(
     type: InviteType,
-    group?: PublicGroupMetadata,
+    group?: GroupInviteMetadata,
     ttlMs = DEFAULT_INVITE_TTL_MS,
   ): Promise<InviteSnapshot> {
     await this.cancel(false);
@@ -202,6 +205,7 @@ export class InviteService {
       message: role === "creator" ? "Aguardando alguém entrar…" : "Procurando convite…",
     };
     this.pendingDecision = undefined;
+    this.membershipCommittedRequestId = undefined;
     this.request = undefined;
     this.requestId = undefined;
     this.emitState();
@@ -354,7 +358,7 @@ export class InviteService {
           const remote = this.request.identity;
           if (this.snapshot.type === "friend") {
             await saveLocalFriend({ ...remote, addedAt: this.dependencies.now() });
-          } else {
+          } else if (this.membershipCommittedRequestId !== message.requestId) {
             if (!this.group) throw new Error("Metadados do grupo indisponíveis.");
             await addLocalGroupMember(this.group, remote, publicIdentity(this.identity));
           }
@@ -404,13 +408,27 @@ export class InviteService {
       } else if (message.group) {
         const ownerIdentity = message.group.ownerIdentity ?? (message.identity.peerId === message.group.ownerPeerId ? message.identity : undefined);
         if (!ownerIdentity) throw new Error("A identidade do proprietário não veio no convite.");
-        const members = [ownerIdentity, message.identity, publicIdentity(this.identity)]
-          .filter((member, index, all) => all.findIndex((candidate) => candidate.peerId === member.peerId) === index);
-        await saveLocalGroup({
+        const membersByPeerId = new Map<string, PublicPeerIdentity>();
+        // O snapshot pode conter um perfil antigo do proprietário ou do
+        // administrador. As identidades autenticadas pelo convite prevalecem.
+        for (const member of [...(message.group.members ?? []), ownerIdentity, message.identity, publicIdentity(this.identity)]) {
+          membersByPeerId.set(member.peerId, member);
+        }
+        const members = [...membersByPeerId.values()];
+        const incomingGroup = {
           ...message.group,
           members,
           joinedAt: this.dependencies.now(),
-        });
+        };
+        const existing = (await loadLocalGroups()).find((group) => group.groupId === incomingGroup.groupId);
+        if (existing) {
+          if (existing.ownerPeerId !== incomingGroup.ownerPeerId) {
+            throw new Error("Já existe um grupo local com o mesmo identificador e outro proprietário.");
+          }
+          await mergeLocalGroupManifest({ ...incomingGroup, joinedAt: existing.joinedAt }, message.identity.peerId);
+        } else {
+          await saveLocalGroup(incomingGroup);
+        }
       } else {
         return;
       }
@@ -436,6 +454,16 @@ export class InviteService {
       ? this.snapshot.type === "friend" ? "friend.accept" : "group.join.accept"
       : this.snapshot.type === "friend" ? "friend.reject" : "group.join.reject";
     const requestId = this.request.requestId;
+    if (decision === "reject" && this.membershipCommittedRequestId === requestId) {
+      throw new Error("Esta entrada já foi aprovada localmente. Reenvie o aceite para concluir no outro dispositivo.");
+    }
+    if (decision === "accept" && this.snapshot.type === "group" && this.membershipCommittedRequestId !== requestId) {
+      if (!this.group) throw new Error("Metadados do grupo indisponíveis.");
+      await addLocalGroupMember(this.group, this.request.identity, publicIdentity(this.identity));
+      this.membershipCommittedRequestId = requestId;
+      const updated = (await loadLocalGroups()).find((group) => group.groupId === this.group!.groupId);
+      if (updated) this.group = updated;
+    }
     this.pendingDecision = decision;
     this.update(
       "confirming",
@@ -464,7 +492,7 @@ export class InviteService {
   private async send(
     type: SignedInviteMessage["type"],
     requestId: string,
-    group?: PublicGroupMetadata,
+    group?: GroupInviteMetadata,
   ): Promise<void> {
     if (!this.transport || !this.candidatePeerId) {
       throw new Error("Conexão P2P indisponível.");
@@ -651,6 +679,7 @@ export class InviteService {
     this.request = undefined;
     this.requestId = undefined;
     this.pendingDecision = undefined;
+    this.membershipCommittedRequestId = undefined;
   }
 }
 
@@ -669,7 +698,7 @@ export class FriendInviteService extends InviteService {
 }
 
 export class GroupInviteService extends InviteService {
-  createGroupInvite(group: PublicGroupMetadata, ttlMs?: number): Promise<InviteSnapshot> {
+  createGroupInvite(group: GroupInviteMetadata, ttlMs?: number): Promise<InviteSnapshot> {
     return this.createInvite("group", group, ttlMs);
   }
 

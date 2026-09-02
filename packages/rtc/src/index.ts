@@ -1,10 +1,20 @@
 import type { IceCandidatePayload, PeerState } from "@risk/protocol";
 import { MediaDeviceError, logger } from "@risk/shared";
+import {
+  classifySelectedConnectionPath,
+  resolveSelectedCandidatePair,
+  type NetworkInterfaceDescriptor,
+  type SelectedConnectionPath,
+} from "./connection-path";
+import { resolveVideoSenderPolicy, type VideoPublicationOptions } from "./video-encoding";
+
+export * from "./connection-path";
+export * from "./video-encoding";
 
 export type ScreenSource = { id: string; name: string; thumbnail?: string; displayId?: string };
 export interface ScreenShareProvider {
   getSources(): Promise<ScreenSource[]>;
-  startScreenShare(sourceId?: string): Promise<MediaStream>;
+  startScreenShare(sourceId?: string, includeAudio?: boolean): Promise<MediaStream>;
   stopScreenShare(): Promise<void>;
 }
 
@@ -34,7 +44,7 @@ export class WebScreenShareProvider implements ScreenShareProvider {
     return desktop ? desktop.listScreenSources() : [];
   }
 
-  async startScreenShare(sourceId?: string): Promise<MediaStream> {
+  async startScreenShare(sourceId?: string, includeAudio = true): Promise<MediaStream> {
     const desktop = desktopScreenBridge();
     if (desktop) {
       let selectedSourceId = sourceId;
@@ -52,10 +62,12 @@ export class WebScreenShareProvider implements ScreenShareProvider {
     }
 
     const restrictOwnAudio = riskMediaCaptureOptions()?.restrictOwnAudio === true;
-    const audio: true | DisplayAudioConstraints = restrictOwnAudio ? { restrictOwnAudio: true } : true;
+    const audio: boolean | DisplayAudioConstraints = includeAudio
+      ? restrictOwnAudio ? { restrictOwnAudio: true } : true
+      : false;
     this.stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio });
 
-    if (restrictOwnAudio) {
+    if (includeAudio && restrictOwnAudio) {
       const audioTrack = this.stream.getAudioTracks()[0];
       if (audioTrack) {
         const settings = audioTrack.getSettings() as DisplayAudioSettings;
@@ -122,12 +134,14 @@ export type PeerConnectionDiagnostics = {
   packetsLost?: number;
   jitterMs?: number;
   outboundBitrateKbps?: number;
+  selectedConnectionPath: SelectedConnectionPath;
 };
 
 export interface CallTransport {
   connect(peerId: string, initiator: boolean): Promise<void>;
   disconnect(peerId?: string): Promise<void>;
-  publishTrack(track: MediaStreamTrack, stream: MediaStream): Promise<void>;
+  publishTrack(track: MediaStreamTrack, stream: MediaStream, options?: VideoPublicationOptions): Promise<void>;
+  configurePublishedVideoTrack(track: MediaStreamTrack, options: VideoPublicationOptions): Promise<void>;
   unpublishTrack(track: MediaStreamTrack): Promise<void>;
   replaceTrack(kind: "audio" | "video", track: MediaStreamTrack | null): Promise<void>;
   replacePublishedTrack(previousTrack: MediaStreamTrack, nextTrack: MediaStreamTrack, stream: MediaStream): Promise<void>;
@@ -138,6 +152,7 @@ type PeerEntry = {
   canNegotiate: boolean;
   makingOffer: boolean;
   needsNegotiation: boolean;
+  needsIceRestart: boolean;
   ignoreOffer: boolean;
   settingRemoteAnswer: boolean;
   pendingIceCandidates: RTCIceCandidateInit[];
@@ -156,24 +171,38 @@ const MAX_TRANSFER_FRAME_BYTES = 320 * 1024;
 const TRANSFER_HIGH_WATER_MARK_BYTES = 4 * 1024 * 1024;
 const TRANSFER_LOW_WATER_MARK_BYTES = 1 * 1024 * 1024;
 const TRANSFER_BUFFER_WAIT_TIMEOUT_MS = 15_000;
+const DISCONNECTED_RECOVERY_DELAY_MS = 4_000;
+const MAX_RECOVERY_DELAY_MS = 30_000;
+const RECREATE_PEER_EVERY_ATTEMPTS = 3;
 
 export class MeshWebRTCTransport implements CallTransport {
   private readonly peers = new Map<string, PeerEntry>();
-  private readonly localTracks = new Map<string, { track: MediaStreamTrack; stream: MediaStream }>();
+  private readonly localTracks = new Map<string, { track: MediaStreamTrack; stream: MediaStream; video?: VideoPublicationOptions }>();
   private readonly mediaAuthorizedPeers = new Set<string>();
   private readonly pendingRemoteStreams = new Map<string, Map<string, MediaStream>>();
   private readonly activeRemoteStreams = new Map<string, Map<string, MediaStream>>();
-  private readonly disconnectedTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly recoveryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly recoveryAttempts = new Map<string, number>();
   private mediaAuthorizationRequired = false;
   private readonly previousOutboundBytes = new Map<string, { bytes: number; timestamp: number }>();
+  private readonly previousConnectionPaths = new Map<string, string>();
+  private readonly maxRemotePeers: number;
+  private readonly networkInterfaces: readonly NetworkInterfaceDescriptor[];
+  private videoParameterUpdate: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly localPeerId: string,
     private readonly iceServers: RTCIceServer[],
     private readonly events: TransportEvents,
-    private readonly maxRemotePeers = DEFAULT_MAX_REMOTE_PEERS,
+    maxRemotePeersOrNetworkInterfaces: number | readonly NetworkInterfaceDescriptor[] = DEFAULT_MAX_REMOTE_PEERS,
   ) {
-    if (!Number.isInteger(maxRemotePeers) || maxRemotePeers < 1) throw new Error("maxRemotePeers deve ser maior que zero.");
+    this.maxRemotePeers = typeof maxRemotePeersOrNetworkInterfaces === "number"
+      ? maxRemotePeersOrNetworkInterfaces
+      : DEFAULT_MAX_REMOTE_PEERS;
+    this.networkInterfaces = typeof maxRemotePeersOrNetworkInterfaces === "number"
+      ? []
+      : maxRemotePeersOrNetworkInterfaces;
+    if (!Number.isInteger(this.maxRemotePeers) || this.maxRemotePeers < 1) throw new Error("maxRemotePeers deve ser maior que zero.");
   }
 
   async connect(peerId: string, initiator: boolean): Promise<void> {
@@ -186,6 +215,7 @@ export class MeshWebRTCTransport implements CallTransport {
       entry.needsNegotiation = true;
       await this.negotiateIfNeeded(peerId, entry);
     }
+    await this.applyAdaptiveVideoParameters();
   }
 
   requireMediaAuthorization(): void {
@@ -224,16 +254,19 @@ export class MeshWebRTCTransport implements CallTransport {
         if (sender.track) entry.pc.removeTrack(sender);
       }
     }
+    void this.applyAdaptiveVideoParameters();
   }
 
   async acceptOffer(peerId: string, description: RTCSessionDescriptionInit): Promise<void> {
     if (description.type !== "offer") throw new Error("Descrição WebRTC não é uma offer.");
     await this.acceptDescription(peerId, description);
+    await this.applyAdaptiveVideoParameters();
   }
 
   async acceptAnswer(peerId: string, description: RTCSessionDescriptionInit): Promise<void> {
     if (description.type !== "answer") throw new Error("Descrição WebRTC não é uma answer.");
     await this.acceptDescription(peerId, description);
+    await this.applyAdaptiveVideoParameters();
   }
 
   async addIceCandidate(peerId: string, candidate: RTCIceCandidateInit): Promise<void> {
@@ -246,8 +279,8 @@ export class MeshWebRTCTransport implements CallTransport {
     await entry.pc.addIceCandidate(candidate);
   }
 
-  async publishTrack(track: MediaStreamTrack, stream: MediaStream): Promise<void> {
-    this.localTracks.set(track.id, { track, stream });
+  async publishTrack(track: MediaStreamTrack, stream: MediaStream, options?: VideoPublicationOptions): Promise<void> {
+    this.localTracks.set(track.id, { track, stream, video: track.kind === "video" ? options : undefined });
     const negotiations: Promise<void>[] = [];
     for (const [peerId, entry] of this.peers) {
       if (this.mediaAuthorizationRequired && !this.mediaAuthorizedPeers.has(peerId)) continue;
@@ -257,6 +290,14 @@ export class MeshWebRTCTransport implements CallTransport {
       negotiations.push(this.negotiateIfNeeded(peerId, entry));
     }
     await Promise.all(negotiations);
+    await this.applyAdaptiveVideoParameters();
+  }
+
+  async configurePublishedVideoTrack(track: MediaStreamTrack, options: VideoPublicationOptions): Promise<void> {
+    if (track.kind !== "video") throw new Error("Somente faixas de vídeo aceitam parâmetros de codificação.");
+    const published = this.localTracks.get(track.id);
+    if (!published) throw new Error(`Track publicada não encontrada: ${track.id}`);
+    this.localTracks.set(track.id, { ...published, video: options });
     await this.applyAdaptiveVideoParameters();
   }
 
@@ -271,6 +312,7 @@ export class MeshWebRTCTransport implements CallTransport {
       negotiations.push(this.negotiateIfNeeded(peerId, entry));
     }
     await Promise.all(negotiations);
+    await this.applyAdaptiveVideoParameters();
   }
 
   async replaceTrack(kind: "audio" | "video", track: MediaStreamTrack | null): Promise<void> {
@@ -298,8 +340,10 @@ export class MeshWebRTCTransport implements CallTransport {
       throw error;
     }
 
+    const previousPublication = this.localTracks.get(previousTrack.id);
     this.localTracks.delete(previousTrack.id);
-    this.localTracks.set(nextTrack.id, { track: nextTrack, stream });
+    this.localTracks.set(nextTrack.id, { track: nextTrack, stream, video: previousPublication?.video });
+    if (nextTrack.kind === "video") await this.applyAdaptiveVideoParameters();
   }
 
   sendData(data: string, targetPeerId?: string): number {
@@ -378,8 +422,9 @@ export class MeshWebRTCTransport implements CallTransport {
 
   async restartIce(peerId: string): Promise<void> {
     const entry = this.requirePeer(peerId);
+    entry.needsIceRestart = true;
     entry.pc.restartIce();
-    await this.negotiate(peerId, entry, true);
+    await this.negotiateIfNeeded(peerId, entry);
   }
 
   async disconnect(peerId?: string): Promise<void> {
@@ -402,10 +447,13 @@ export class MeshWebRTCTransport implements CallTransport {
       this.pendingRemoteStreams.delete(id);
       this.activeRemoteStreams.delete(id);
       this.previousOutboundBytes.delete(id);
-      const timer = this.disconnectedTimers.get(id);
+      this.previousConnectionPaths.delete(id);
+      const timer = this.recoveryTimers.get(id);
       if (timer) clearTimeout(timer);
-      this.disconnectedTimers.delete(id);
+      this.recoveryTimers.delete(id);
+      this.recoveryAttempts.delete(id);
     });
+    await this.applyAdaptiveVideoParameters();
   }
 
   getDiagnostics(): PeerConnectionDiagnostics[] {
@@ -417,6 +465,7 @@ export class MeshWebRTCTransport implements CallTransport {
       pendingIceCandidates: entry.pendingIceCandidates.length,
       dataChannelState: entry.dataChannel?.readyState ?? "unavailable",
       transferDataChannelState: entry.transferDataChannel?.readyState ?? "unavailable",
+      selectedConnectionPath: classifySelectedConnectionPath(undefined),
     }));
   }
 
@@ -424,12 +473,13 @@ export class MeshWebRTCTransport implements CallTransport {
     return Promise.all([...this.peers].map(async ([peerId, entry]) => {
       const base = this.getDiagnostics().find((item) => item.peerId === peerId)!;
       const reports = await entry.pc.getStats();
+      const selectedPair = resolveSelectedCandidatePair(reports);
+      const selectedConnectionPath = classifySelectedConnectionPath(selectedPair, this.networkInterfaces);
       let roundTripTimeMs: number | undefined;
       let packetsLost: number | undefined;
       let jitterMs: number | undefined;
       let outboundBitrateKbps: number | undefined;
       reports.forEach((report) => {
-        if (report.type === "candidate-pair" && report.state === "succeeded" && typeof report.currentRoundTripTime === "number") roundTripTimeMs = Math.round(report.currentRoundTripTime * 1000);
         if (report.type === "inbound-rtp" && !report.isRemote) {
           if (typeof report.packetsLost === "number") packetsLost = (packetsLost ?? 0) + report.packetsLost;
           if (typeof report.jitter === "number") jitterMs = Math.max(jitterMs ?? 0, Math.round(report.jitter * 1000));
@@ -441,7 +491,20 @@ export class MeshWebRTCTransport implements CallTransport {
           this.previousOutboundBytes.set(peerId, { bytes: report.bytesSent, timestamp: now });
         }
       });
-      return { ...base, roundTripTimeMs, packetsLost, jitterMs, outboundBitrateKbps };
+      if (typeof selectedPair?.pair.currentRoundTripTime === "number") {
+        roundTripTimeMs = Math.round(selectedPair.pair.currentRoundTripTime * 1000);
+      }
+      const pathSignature = `${selectedConnectionPath.kind}:${selectedConnectionPath.provider ?? ""}:${selectedConnectionPath.protocol ?? ""}`;
+      if (this.previousConnectionPaths.get(peerId) !== pathSignature) {
+        this.previousConnectionPaths.set(peerId, pathSignature);
+        logger.info("[rtc] selected connection path", {
+          peerId,
+          kind: selectedConnectionPath.kind,
+          provider: selectedConnectionPath.provider,
+          protocol: selectedConnectionPath.protocol,
+        });
+      }
+      return { ...base, roundTripTimeMs, packetsLost, jitterMs, outboundBitrateKbps, selectedConnectionPath };
     }));
   }
 
@@ -451,12 +514,13 @@ export class MeshWebRTCTransport implements CallTransport {
     if (this.peers.size >= this.maxRemotePeers) {
       throw new Error(`Sala cheia: este cliente aceita no máximo ${this.maxRemotePeers + 1} participantes no Mesh.`);
     }
-    const pc = new RTCPeerConnection({ iceServers: this.iceServers });
+    const pc = new RTCPeerConnection({ iceServers: this.iceServers, iceTransportPolicy: "all" });
     const entry: PeerEntry = {
       pc,
       canNegotiate: false,
       makingOffer: false,
       needsNegotiation: false,
+      needsIceRestart: false,
       ignoreOffer: false,
       settingRemoteAnswer: false,
       pendingIceCandidates: [],
@@ -494,7 +558,10 @@ export class MeshWebRTCTransport implements CallTransport {
         entry.needsNegotiation = true;
         return;
       }
-      if (entry.makingOffer || entry.pc.signalingState !== "stable") return;
+      if (entry.makingOffer || entry.pc.signalingState !== "stable") {
+        entry.needsNegotiation = true;
+        return;
+      }
       entry.needsNegotiation = true;
       void this.negotiateIfNeeded(peerId, entry).catch((error) => {
         logger.warn("WebRTC negotiationneeded failed", { peerId, error: String(error) });
@@ -503,34 +570,119 @@ export class MeshWebRTCTransport implements CallTransport {
     };
     pc.onconnectionstatechange = () => {
       this.events.onConnectionState(peerId, pc.connectionState);
-      const priorTimer = this.disconnectedTimers.get(peerId);
-      if (pc.connectionState === "connected" && priorTimer) {
-        clearTimeout(priorTimer);
-        this.disconnectedTimers.delete(peerId);
-      }
-      if (pc.connectionState === "disconnected" && !priorTimer && this.localPeerId < peerId) {
-        const timer = setTimeout(() => {
-          this.disconnectedTimers.delete(peerId);
-          if (pc.connectionState === "disconnected") void this.restartIce(peerId).catch((error) => logger.warn("ICE restart after disconnect failed", { peerId, error: String(error) }));
-        }, 8_000);
-        this.disconnectedTimers.set(peerId, timer);
-      }
-      if (pc.connectionState === "failed" && this.localPeerId < peerId) {
-        void this.restartIce(peerId).catch((error) => logger.warn("ICE restart failed", { peerId, error: String(error) }));
+      if (pc.connectionState === "connected") this.clearPeerRecovery(peerId);
+      if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
+        this.schedulePeerRecovery(
+          peerId,
+          entry,
+          pc.connectionState === "failed" ? 0 : DISCONNECTED_RECOVERY_DELAY_MS,
+        );
       }
     };
     return entry;
   }
 
-  private async applyAdaptiveVideoParameters(): Promise<void> {
+  private schedulePeerRecovery(peerId: string, entry: PeerEntry, delayMs: number): void {
+    // Um único lado inicia a recuperação para evitar glare. O outro recebe a
+    // oferta de ICE restart pela sinalização e responde normalmente.
+    if (this.localPeerId >= peerId
+      || this.peers.get(peerId) !== entry
+      || entry.pc.connectionState === "connected"
+      || entry.pc.connectionState === "closed"
+      || this.recoveryTimers.has(peerId)) return;
+    const timer = setTimeout(() => {
+      this.recoveryTimers.delete(peerId);
+      void this.recoverPeerConnection(peerId, entry).finally(() => {
+        const current = this.peers.get(peerId);
+        if (!current || current.pc.connectionState === "connected" || current.pc.connectionState === "closed") return;
+        const attempts = this.recoveryAttempts.get(peerId) ?? 0;
+        const retryDelay = Math.min(MAX_RECOVERY_DELAY_MS, 2_000 * 2 ** Math.min(attempts, 4));
+        this.schedulePeerRecovery(peerId, current, retryDelay);
+      });
+    }, delayMs);
+    this.recoveryTimers.set(peerId, timer);
+  }
+
+  private async recoverPeerConnection(peerId: string, observedEntry: PeerEntry): Promise<void> {
+    const entry = this.peers.get(peerId);
+    if (!entry || entry !== observedEntry || entry.pc.connectionState === "connected" || entry.pc.connectionState === "closed") return;
+    const attempt = (this.recoveryAttempts.get(peerId) ?? 0) + 1;
+    this.recoveryAttempts.set(peerId, attempt);
+    try {
+      if (attempt % RECREATE_PEER_EVERY_ATTEMPTS === 0) {
+        await this.recreatePeerForRecovery(peerId, entry, attempt);
+      } else {
+        await this.restartIce(peerId);
+      }
+    } catch (error) {
+      logger.warn("WebRTC automatic recovery attempt failed", { peerId, attempt, error: String(error) });
+    }
+  }
+
+  private async recreatePeerForRecovery(peerId: string, entry: PeerEntry, attempt: number): Promise<void> {
+    if (this.peers.get(peerId) !== entry) return;
+    logger.warn("Recreating stalled WebRTC peer for recovery", { peerId, attempt });
+    const hadTransferChannel = Boolean(entry.transferDataChannel);
+    this.disposePeerEntry(peerId, entry, true);
+    this.recoveryAttempts.set(peerId, attempt);
+    const replacement = this.createPeer(peerId);
+    replacement.initiator = true;
+    replacement.canNegotiate = true;
+    if (this.events.onDataMessage && !replacement.dataChannel) {
+      this.bindControlDataChannel(peerId, replacement, replacement.pc.createDataChannel(CONTROL_CHANNEL_LABEL, { ordered: true }));
+    }
+    if (hadTransferChannel && this.events.onTransferMessage && !replacement.transferDataChannel) {
+      this.bindTransferDataChannel(peerId, replacement, replacement.pc.createDataChannel(TRANSFER_CHANNEL_LABEL, { ordered: true }));
+    }
+    this.events.onPeerReset?.(peerId);
+    replacement.needsIceRestart = true;
+    replacement.pc.restartIce();
+    await this.negotiateIfNeeded(peerId, replacement);
+    await this.applyAdaptiveVideoParameters();
+  }
+
+  private clearPeerRecovery(peerId: string): void {
+    const timer = this.recoveryTimers.get(peerId);
+    if (timer) clearTimeout(timer);
+    this.recoveryTimers.delete(peerId);
+    this.recoveryAttempts.delete(peerId);
+  }
+
+  private applyAdaptiveVideoParameters(): Promise<void> {
+    const operation = this.videoParameterUpdate.then(() => this.applyAdaptiveVideoParametersNow());
+    this.videoParameterUpdate = operation.catch(() => undefined);
+    return operation;
+  }
+
+  private async applyAdaptiveVideoParametersNow(): Promise<void> {
     const activePeers = Math.max(1, this.mediaAuthorizationRequired ? this.mediaAuthorizedPeers.size : this.peers.size);
-    const maxBitrate = activePeers <= 1 ? 2_500_000 : activePeers <= 3 ? 1_200_000 : 700_000;
+    const screenPublished = [...this.localTracks.values()].some(({ track, video }) => track.kind === "video" && video?.source === "screen");
     await Promise.all([...this.peers.values()].flatMap(({ pc }) => pc.getSenders().filter((sender) => sender.track?.kind === "video").map(async (sender) => {
-      const parameters = sender.getParameters();
-      parameters.encodings = parameters.encodings?.length ? parameters.encodings : [{}];
-      parameters.encodings[0]!.maxBitrate = maxBitrate;
-      parameters.degradationPreference = "maintain-framerate";
-      await sender.setParameters(parameters).catch(() => undefined);
+      const track = sender.track;
+      if (!track) return;
+      const publication = this.localTracks.get(track.id);
+      const capture = typeof track.getSettings === "function" ? track.getSettings() : {};
+      const policy = resolveVideoSenderPolicy(publication?.video, activePeers, capture, screenPublished);
+      try {
+        const parameters = sender.getParameters();
+        parameters.encodings = parameters.encodings?.length ? parameters.encodings : [{}];
+        const encoding = parameters.encodings[0]!;
+        encoding.maxBitrate = policy.maxBitrate;
+        encoding.priority = policy.priority;
+        encoding.networkPriority = policy.priority;
+        if (policy.maxFramerate !== undefined) encoding.maxFramerate = policy.maxFramerate;
+        else delete encoding.maxFramerate;
+        if (policy.scaleResolutionDownBy !== undefined) encoding.scaleResolutionDownBy = policy.scaleResolutionDownBy;
+        else delete encoding.scaleResolutionDownBy;
+        parameters.degradationPreference = policy.degradationPreference;
+        await sender.setParameters(parameters);
+      } catch (error) {
+        logger.warn("Não foi possível aplicar os parâmetros adaptativos de vídeo", {
+          trackId: track.id,
+          source: publication?.video?.source ?? "camera",
+          error: String(error),
+        });
+      }
     })));
   }
 
@@ -632,7 +784,7 @@ export class MeshWebRTCTransport implements CallTransport {
     if (replacement.pc.localDescription) await this.events.sendAnswer(peerId, replacement.pc.localDescription.toJSON());
   }
 
-  private disposePeerEntry(peerId: string, entry: PeerEntry): void {
+  private disposePeerEntry(peerId: string, entry: PeerEntry, preserveRecovery = false): void {
     if (this.peers.get(peerId) === entry) this.peers.delete(peerId);
     entry.pc.onicecandidate = null;
     entry.pc.ontrack = null;
@@ -650,9 +802,11 @@ export class MeshWebRTCTransport implements CallTransport {
     activeStreams?.forEach((stream) => stream.getTracks().forEach((track) => { track.enabled = false; }));
     this.activeRemoteStreams.delete(peerId);
     this.previousOutboundBytes.delete(peerId);
-    const timer = this.disconnectedTimers.get(peerId);
+    this.previousConnectionPaths.delete(peerId);
+    const timer = this.recoveryTimers.get(peerId);
     if (timer) clearTimeout(timer);
-    this.disconnectedTimers.delete(peerId);
+    this.recoveryTimers.delete(peerId);
+    if (!preserveRecovery) this.recoveryAttempts.delete(peerId);
   }
 
   private async flushPendingIce(entry: PeerEntry): Promise<void> {
@@ -673,27 +827,41 @@ export class MeshWebRTCTransport implements CallTransport {
   }
 
   private async negotiateIfNeeded(peerId: string, entry: PeerEntry): Promise<void> {
-    if (!entry.needsNegotiation || !entry.canNegotiate || entry.makingOffer || entry.pc.signalingState !== "stable") return;
+    if ((!entry.needsNegotiation && !entry.needsIceRestart)
+      || !entry.canNegotiate
+      || entry.makingOffer
+      || entry.pc.signalingState !== "stable") return;
+    const needsNegotiation = entry.needsNegotiation;
+    const needsIceRestart = entry.needsIceRestart;
     entry.needsNegotiation = false;
-    await this.negotiate(peerId, entry);
+    entry.needsIceRestart = false;
+    try {
+      const sent = await this.negotiate(peerId, entry, needsIceRestart);
+      if (!sent) {
+        entry.needsNegotiation ||= needsNegotiation;
+        entry.needsIceRestart ||= needsIceRestart;
+      }
+    } catch (error) {
+      entry.needsNegotiation ||= needsNegotiation;
+      entry.needsIceRestart ||= needsIceRestart;
+      throw error;
+    }
   }
 
-  private async negotiate(peerId: string, entry: PeerEntry, iceRestart = false): Promise<void> {
+  private async negotiate(peerId: string, entry: PeerEntry, iceRestart = false): Promise<boolean> {
     if (entry.makingOffer || entry.pc.signalingState !== "stable") {
-      if (!iceRestart) entry.needsNegotiation = true;
-      return;
+      return false;
     }
     entry.makingOffer = true;
     try {
       const offer = await entry.pc.createOffer({ iceRestart });
       if (entry.pc.signalingState !== "stable") {
-        if (!iceRestart) entry.needsNegotiation = true;
-        return;
+        return false;
       }
       await entry.pc.setLocalDescription(offer);
       if (entry.pc.localDescription) await this.events.sendOffer(peerId, entry.pc.localDescription.toJSON());
+      return true;
     } catch (error) {
-      if (!iceRestart) entry.needsNegotiation = true;
       logger.warn("WebRTC renegotiation failed", { peerId, error: String(error) });
       throw error;
     } finally { entry.makingOffer = false; }

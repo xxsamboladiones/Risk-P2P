@@ -19,6 +19,7 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation}
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha384};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     SqlitePool,
@@ -33,6 +34,22 @@ const MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 const LOCAL_TOKEN_HEADER: &str = "x-risk-desktop-token";
 const ACCESS_TOKEN_TTL_SECONDS: i64 = 12 * 60 * 60;
+const EMBEDDED_MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/0001_initial.sql")),
+    (2, include_str!("../migrations/0002_p2p_social.sql")),
+    (3, include_str!("../migrations/0003_p2p_messages.sql")),
+    (
+        4,
+        include_str!("../migrations/0004_p2p_message_signatures.sql"),
+    ),
+    (
+        5,
+        include_str!("../migrations/0005_p2p_group_ownership.sql"),
+    ),
+    (6, include_str!("../migrations/0006_group_manifest.sql")),
+    (7, include_str!("../migrations/0007_group_roles.sql")),
+    (8, include_str!("../migrations/0008_group_consistency.sql")),
+];
 
 #[derive(Clone)]
 struct AppState {
@@ -120,6 +137,51 @@ struct NewMessage {
 struct TokenResponse {
     access_token: String,
 }
+
+fn migration_checksum(sql: &str) -> Vec<u8> {
+    Sha384::digest(sql.as_bytes()).to_vec()
+}
+
+async fn repair_line_ending_migration_checksums(db: &SqlitePool) -> anyhow::Result<()> {
+    let migrations_table_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_sqlx_migrations')",
+    )
+    .fetch_one(db)
+    .await?;
+    if migrations_table_exists == 0 {
+        return Ok(());
+    }
+
+    let mut transaction = db.begin().await?;
+    for &(version, sql) in EMBEDDED_MIGRATIONS {
+        let stored: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT checksum FROM _sqlx_migrations WHERE version=? AND success=TRUE",
+        )
+        .bind(version)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(stored) = stored else { continue };
+
+        let normalized_lf = sql.replace("\r\n", "\n");
+        let current_checksum = migration_checksum(sql);
+        let crlf_checksum = migration_checksum(&normalized_lf.replace('\n', "\r\n"));
+        if stored != current_checksum && stored == crlf_checksum {
+            sqlx::query("UPDATE _sqlx_migrations SET checksum=? WHERE version=? AND checksum=?")
+                .bind(&current_checksum)
+                .bind(version)
+                .bind(&stored)
+                .execute(&mut *transaction)
+                .await?;
+            tracing::warn!(
+                version,
+                "migration checksum reparado após normalização CRLF/LF"
+            );
+        }
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -153,6 +215,7 @@ async fn main() -> anyhow::Result<()> {
         .max_connections(8)
         .connect_with(options)
         .await?;
+    repair_line_ending_migration_checksums(&db).await?;
     sqlx::migrate!("./migrations").run(&db).await?;
 
     let mut secret_bytes = [0_u8; 32];
@@ -904,6 +967,47 @@ mod tests {
         let right = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
         assert_eq!(canonical_pair(left, right), canonical_pair(right, left));
         assert_eq!(canonical_pair(left, right), (right, left));
+    }
+
+    #[tokio::test]
+    async fn repairs_only_crlf_migration_checksums() {
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&db).await.unwrap();
+
+        let sql = include_str!("../migrations/0001_initial.sql");
+        let crlf_checksum = migration_checksum(&sql.replace("\r\n", "\n").replace('\n', "\r\n"));
+        sqlx::query("UPDATE _sqlx_migrations SET checksum=? WHERE version=1")
+            .bind(crlf_checksum)
+            .execute(&db)
+            .await
+            .unwrap();
+
+        repair_line_ending_migration_checksums(&db).await.unwrap();
+        let repaired: Vec<u8> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version=1")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(repaired, migration_checksum(sql));
+        sqlx::migrate!("./migrations").run(&db).await.unwrap();
+
+        let unrelated_checksum = vec![0x5a; 48];
+        sqlx::query("UPDATE _sqlx_migrations SET checksum=? WHERE version=1")
+            .bind(&unrelated_checksum)
+            .execute(&db)
+            .await
+            .unwrap();
+        repair_line_ending_migration_checksums(&db).await.unwrap();
+        let unchanged: Vec<u8> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version=1")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(unchanged, unrelated_checksum);
     }
 
     #[tokio::test]

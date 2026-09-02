@@ -262,4 +262,53 @@ describe("sincronização de membros durante a chamada", () => {
     expect(recoverPeer).toHaveBeenCalledWith(remotePeerId);
     internals.authTimers.forEach((timer) => clearTimeout(timer));
   });
+
+  it("recria rapidamente o peer quando o DataChannel fecha depois da autenticação", async () => {
+    vi.useFakeTimers();
+    const localPeerId = "00000000-0000-4000-8000-000000000001";
+    const remotePeerId = "00000000-0000-4000-8000-000000000002";
+    const recoverPeer = vi.fn(async () => undefined);
+    const transport = {
+      sendData: vi.fn(() => 0),
+      recoverPeer,
+      disconnect: vi.fn(async () => undefined),
+      connect: vi.fn(async () => undefined),
+    };
+    const signaling = {
+      getDiagnostics: () => ({ presencePeers: [remotePeerId] }),
+      sendPeerState: vi.fn(async () => undefined),
+    };
+    const controller = new CallController();
+    const internals = controller as unknown as {
+      lifecycleId: number;
+      roomId: string;
+      peerId: string;
+      signaling: typeof signaling;
+      transport: typeof transport;
+      identity: { peerId: string };
+      mediaAuthenticationRequired: boolean;
+      trustedPeers: Map<string, { peerId: string }>;
+      authenticatedPeers: Set<string>;
+      authTimers: Map<string, ReturnType<typeof setTimeout>>;
+      handleDataChannelState(peerId: string, state: RTCDataChannelState): void;
+    };
+    internals.lifecycleId = 1;
+    internals.roomId = "room-authenticated-channel";
+    internals.peerId = localPeerId;
+    internals.signaling = signaling;
+    internals.transport = transport;
+    internals.identity = { peerId: localPeerId };
+    internals.mediaAuthenticationRequired = true;
+    internals.trustedPeers.set(remotePeerId, { peerId: remotePeerId });
+    internals.authenticatedPeers.add(remotePeerId);
+
+    internals.handleDataChannelState(remotePeerId, "closed");
+    expect(internals.authenticatedPeers.has(remotePeerId)).toBe(false);
+    expect(recoverPeer).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(recoverPeer).toHaveBeenCalledOnce();
+    expect(recoverPeer).toHaveBeenCalledWith(remotePeerId);
+    internals.authTimers.forEach((timer) => clearTimeout(timer));
+  });
 });

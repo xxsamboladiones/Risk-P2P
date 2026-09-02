@@ -1,4 +1,4 @@
-import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, Menu, nativeImage, net, protocol, session, Tray } from "electron";
+import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, Menu, nativeImage, net, protocol, screen, session, Tray } from "electron";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { accessSync, constants as fsConstants, existsSync, readFileSync } from "node:fs";
@@ -6,7 +6,12 @@ import { access, mkdir, unlink, writeFile } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { shouldHideWindowOnClose } from "./desktop-lifecycle.js";
+import {
+  desktopWindowBounds,
+  MAX_BACKEND_RESTART_ATTEMPTS,
+  shouldAttemptBackendRestart,
+  shouldHideWindowOnClose,
+} from "./desktop-lifecycle.js";
 import { collectNetworkInterfaces } from "./network-interfaces.js";
 
 if (process.platform === "linux") {
@@ -83,6 +88,7 @@ const PACKAGED_ENTRY_URL = `${PACKAGED_ORIGIN}/index.html`;
 const PACKAGED_ORIGIN_REPORT_FILE = process.env.RISK_PACKAGED_ORIGIN_REPORT_FILE?.trim();
 const DEV_BACKEND_BRIDGE_FILE = path.resolve(root, "../../../.risk/dev-backend.json");
 const WINDOWS_LOOPBACK_WITHOUT_RISK = "loopbackWithoutChrome";
+const BACKEND_STABLE_RESET_MS = 30_000;
 const APP_ICON_PATH = app.isPackaged
   ? path.join(process.resourcesPath, "icon.png")
   : path.resolve(root, "../build/icon.png");
@@ -122,6 +128,7 @@ let backendConfig: { baseUrl: string; token: string } | undefined;
 let backendWebOrigin = PACKAGED_ORIGIN;
 let backendRestartAttempts = 0;
 let backendRestarting = false;
+let backendRestartStabilityTimer: ReturnType<typeof setTimeout> | undefined;
 let isQuitting = false;
 let mainWindow: BrowserWindow | undefined;
 let tray: Tray | undefined;
@@ -232,6 +239,19 @@ function backendExecutablePath(): string {
   return path.resolve(root, "../../../desktop-backend/target/debug", backendExecutableName());
 }
 
+function clearBackendRestartStabilityTimer(): void {
+  if (backendRestartStabilityTimer) clearTimeout(backendRestartStabilityTimer);
+  backendRestartStabilityTimer = undefined;
+}
+
+function markBackendHealthy(): void {
+  clearBackendRestartStabilityTimer();
+  backendRestartStabilityTimer = setTimeout(() => {
+    backendRestartAttempts = 0;
+    backendRestartStabilityTimer = undefined;
+  }, BACKEND_STABLE_RESET_MS);
+}
+
 async function startBackend(webOrigin: string): Promise<{ baseUrl: string; token: string }> {
   const executable = backendExecutablePath();
   await access(executable, process.platform === "win32" ? fsConstants.F_OK : fsConstants.X_OK).catch(() => {
@@ -310,10 +330,18 @@ async function startBackend(webOrigin: string): Promise<{ baseUrl: string; token
     });
   });
 
-  const response = await fetch(`${baseUrl}/health`, { signal: AbortSignal.timeout(5_000) });
-  if (!response.ok) throw new Error(`Healthcheck do backend falhou com HTTP ${response.status}.`);
+  try {
+    const response = await fetch(`${baseUrl}/health`, { signal: AbortSignal.timeout(5_000) });
+    if (!response.ok) throw new Error(`Healthcheck do backend falhou com HTTP ${response.status}.`);
+  } catch (error) {
+    if (backendProcess === child) backendProcess = undefined;
+    child.stdin?.end();
+    if (!child.killed) child.kill();
+    throw error;
+  }
   child.once("exit", (code, signal) => {
     if (backendProcess !== child) return;
+    clearBackendRestartStabilityTimer();
     backendProcess = undefined;
     backendConfig = undefined;
     if (!isQuitting) void recoverBackendAfterCrash(code, signal);
@@ -328,30 +356,55 @@ function broadcastBackendStatus(payload: { state: "restarting" | "recovered" | "
 }
 
 async function recoverBackendAfterCrash(code: number | null, signal: NodeJS.Signals | null): Promise<void> {
-  if (backendRestarting || backendRestartAttempts >= 1 || isQuitting) {
+  if (!shouldAttemptBackendRestart({
+    isQuitting,
+    restarting: backendRestarting,
+    attempts: backendRestartAttempts,
+  })) {
+    if (backendRestarting || isQuitting) return;
     const message = `O backend local encerrou inesperadamente (code=${code ?? "?"}, signal=${signal ?? "?"}) e não pôde ser reiniciado.`;
     console.error(message);
     broadcastBackendStatus({ state: "failed", message });
     return;
   }
   backendRestarting = true;
-  backendRestartAttempts += 1;
-  broadcastBackendStatus({ state: "restarting", message: "O backend local parou. Tentando recuperar a sessão…" });
-  await new Promise((resolve) => setTimeout(resolve, 750));
+  let lastError = `code=${code ?? "?"}, signal=${signal ?? "?"}`;
   try {
-    backendConfig = await startBackend(backendWebOrigin);
-    await publishDevBackendBridge(backendConfig);
-    broadcastBackendStatus({ state: "recovered", message: "Backend local recuperado. Você já pode continuar." });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error("Falha ao reiniciar o backend local", error);
-    broadcastBackendStatus({ state: "failed", message: `Não foi possível recuperar o backend local: ${message}` });
+    while (!isQuitting && backendRestartAttempts < MAX_BACKEND_RESTART_ATTEMPTS) {
+      backendRestartAttempts += 1;
+      const attempt = backendRestartAttempts;
+      broadcastBackendStatus({
+        state: "restarting",
+        message: `O backend local parou. Tentando recuperar a sessão (${attempt}/${MAX_BACKEND_RESTART_ATTEMPTS})…`,
+      });
+      await new Promise((resolve) => setTimeout(resolve, Math.min(3_000, 750 * attempt)));
+      if (isQuitting) return;
+      try {
+        const config = await startBackend(backendWebOrigin);
+        backendConfig = config;
+        await publishDevBackendBridge(config);
+        if (!backendProcess || backendConfig !== config) {
+          throw new Error("O backend encerrou durante a tentativa de recuperação.");
+        }
+        markBackendHealthy();
+        broadcastBackendStatus({ state: "recovered", message: "Backend local recuperado. Você já pode continuar." });
+        return;
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+        console.error(`Falha ao reiniciar o backend local (${attempt}/${MAX_BACKEND_RESTART_ATTEMPTS})`, error);
+        stopBackend();
+      }
+    }
+    if (!isQuitting) {
+      broadcastBackendStatus({ state: "failed", message: `Não foi possível recuperar o backend local: ${lastError}` });
+    }
   } finally {
     backendRestarting = false;
   }
 }
 
 function stopBackend(): void {
+  clearBackendRestartStabilityTimer();
   const child = backendProcess;
   backendProcess = undefined;
   backendConfig = undefined;
@@ -498,11 +551,12 @@ ipcMain.handle("screen:select", async (event, sourceId: unknown) => {
 function createWindow(): BrowserWindow {
   const reportingPackagedOrigin = app.isPackaged && Boolean(PACKAGED_ORIGIN_REPORT_FILE);
   let rendererRecoveryAttempted = false;
+  const bounds = desktopWindowBounds(screen.getPrimaryDisplay().workAreaSize);
   const window = new BrowserWindow({
-    width: 1280,
-    height: 800,
-    minWidth: 900,
-    minHeight: 600,
+    width: bounds.width,
+    height: bounds.height,
+    minWidth: bounds.minWidth,
+    minHeight: bounds.minHeight,
     backgroundColor: "#090b10",
     icon: APP_ICON_PATH,
     show: false,
@@ -649,6 +703,7 @@ if (hasSingleInstanceLock) {
     backendWebOrigin = webOrigin;
     backendConfig = await startBackend(webOrigin);
     await publishDevBackendBridge(backendConfig);
+    markBackendHealthy();
     session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
       callback(isTrustedRendererUrl(webContents.getURL()) && ["media", "display-capture", "fullscreen"].includes(permission));
     });

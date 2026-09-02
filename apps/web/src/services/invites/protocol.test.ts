@@ -19,7 +19,8 @@ describe("protocolo assinado de convites", () => {
     const author = await identity("João"); const now = Date.now();
     const message = await createSignedInviteMessage(author, { type: "group.join.request", requestId: crypto.randomUUID(), timestamp: now });
     expect(await parseAndVerifyInviteMessage(JSON.stringify({ ...message, identity: { ...message.identity, displayName: "Invasor" } }), now)).toBeNull();
-    expect(await parseAndVerifyInviteMessage(JSON.stringify(message), now + 180_000)).toBeNull();
+    expect(await parseAndVerifyInviteMessage(JSON.stringify(message), now + 4 * 60_000)).not.toBeNull();
+    expect(await parseAndVerifyInviteMessage(JSON.stringify(message), now + 6 * 60_000)).toBeNull();
     expect(await parseAndVerifyInviteMessage(`{"padding":"${"x".repeat(MAX_INVITE_MESSAGE_BYTES + 1_024)}"}`, now)).toBeNull();
   });
 

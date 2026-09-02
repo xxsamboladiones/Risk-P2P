@@ -4,6 +4,7 @@ import { createAttachmentStorage } from "./services/attachments/desktop-storage"
 import type { StoredAttachmentRecord } from "./services/attachments/indexeddb-storage";
 import { SupabaseSignalingProvider } from "./services/supabase/signaling";
 import type { SignalingNamespace, SignalingProvider } from "./services/signaling/types";
+import { P2P_CLOCK_SKEW_TOLERANCE_MS } from "./services/p2p-clock";
 import {
   compatibleAppVersion,
   compatibleChatPeer,
@@ -174,9 +175,10 @@ const MAX_HISTORY_IDS = 200;
 const HISTORY_CHUNK_MESSAGES = 8;
 const MAX_GROUP_SYNC_MEMBERS = 48;
 const MAX_GROUP_SYNC_REVOCATIONS = 48;
-const LIVE_MESSAGE_MAX_AGE_MS = 120_000;
+const LEGACY_MESSAGE_MAX_AGE_MS = 120_000;
+const LEGACY_FUTURE_CLOCK_SKEW_MS = 30_000;
 const QUEUED_MESSAGE_MAX_AGE_MS = 30 * 24 * 60 * 60_000;
-const FUTURE_CLOCK_SKEW_MS = 30_000;
+const FUTURE_CLOCK_SKEW_MS = P2P_CLOCK_SKEW_TOLERANCE_MS;
 const IDENTITY_HANDSHAKE_RETRY_MS = 1_200;
 const IDENTITY_HANDSHAKE_TIMEOUT_MS = 12_000;
 const CHAT_READY_TIMEOUT_MS = 15_000;
@@ -1336,7 +1338,7 @@ function parseLegacyMessage(message: Record<string, unknown>, channelId?: string
     && typeof message.author === "string" && message.author.trim().length >= 2 && message.author.length <= 80
     && typeof message.content === "string" && message.content.trim().length > 0 && message.content.length <= 4_000
     && typeof message.timestamp === "number" && Number.isFinite(message.timestamp)
-    && message.timestamp >= now - LIVE_MESSAGE_MAX_AGE_MS && message.timestamp <= now + FUTURE_CLOCK_SKEW_MS
+    && message.timestamp >= now - LEGACY_MESSAGE_MAX_AGE_MS && message.timestamp <= now + LEGACY_FUTURE_CLOCK_SKEW_MS
     ? message as unknown as LegacyChatWireMessage : null;
 }
 
@@ -1574,8 +1576,8 @@ function samePeerPublicKey(left: PublicPeerIdentity, right: PublicPeerIdentity):
 function freshTimestamp(value: unknown): value is number {
   const now = Date.now();
   return typeof value === "number" && Number.isFinite(value)
-    && value >= now - LIVE_MESSAGE_MAX_AGE_MS
-    && value <= now + FUTURE_CLOCK_SKEW_MS;
+    && value >= now - P2P_CLOCK_SKEW_TOLERANCE_MS
+    && value <= now + P2P_CLOCK_SKEW_TOLERANCE_MS;
 }
 
 function validWireId(value: unknown): value is string {

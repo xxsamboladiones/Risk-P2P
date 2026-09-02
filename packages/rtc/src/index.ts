@@ -698,24 +698,38 @@ export class MeshWebRTCTransport implements CallTransport {
   }
 
   private bindControlDataChannel(peerId: string, entry: PeerEntry, channel: RTCDataChannel): void {
-    if (entry.dataChannel && entry.dataChannel !== channel) entry.dataChannel.close();
+    const previous = entry.dataChannel;
     entry.dataChannel = channel;
-    channel.onopen = () => this.events.onDataState?.(peerId, channel.readyState);
-    channel.onclose = () => this.events.onDataState?.(peerId, channel.readyState);
-    channel.onerror = () => this.events.onDataState?.(peerId, channel.readyState);
+    if (previous && previous !== channel) previous.close();
+    const notifyState = () => {
+      // O fechamento de um canal substituído não pode derrubar a autenticação do
+      // canal novo. Só a geração atualmente associada ao peer publica seu estado.
+      if (this.peers.get(peerId) === entry && entry.dataChannel === channel) {
+        this.events.onDataState?.(peerId, channel.readyState);
+      }
+    };
+    channel.onopen = notifyState;
+    channel.onclose = notifyState;
+    channel.onerror = notifyState;
     channel.onmessage = ({ data }) => {
       if (typeof data === "string" && new TextEncoder().encode(data).byteLength <= MAX_CONTROL_MESSAGE_BYTES) this.events.onDataMessage?.(peerId, data);
     };
   }
 
   private bindTransferDataChannel(peerId: string, entry: PeerEntry, channel: RTCDataChannel): void {
-    if (entry.transferDataChannel && entry.transferDataChannel !== channel) entry.transferDataChannel.close();
+    const previous = entry.transferDataChannel;
     entry.transferDataChannel = channel;
+    if (previous && previous !== channel) previous.close();
     channel.binaryType = "arraybuffer";
     channel.bufferedAmountLowThreshold = TRANSFER_LOW_WATER_MARK_BYTES;
-    channel.onopen = () => this.events.onTransferState?.(peerId, channel.readyState);
-    channel.onclose = () => this.events.onTransferState?.(peerId, channel.readyState);
-    channel.onerror = () => this.events.onTransferState?.(peerId, channel.readyState);
+    const notifyState = () => {
+      if (this.peers.get(peerId) === entry && entry.transferDataChannel === channel) {
+        this.events.onTransferState?.(peerId, channel.readyState);
+      }
+    };
+    channel.onopen = notifyState;
+    channel.onclose = notifyState;
+    channel.onerror = notifyState;
     channel.onmessage = ({ data }) => {
       if (data instanceof ArrayBuffer) {
         if (data.byteLength <= MAX_TRANSFER_FRAME_BYTES) this.events.onTransferMessage?.(peerId, data);

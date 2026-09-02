@@ -7,7 +7,7 @@ import react from "@vitejs/plugin-react";
 const envDir = fileURLToPath(new URL("../../", import.meta.url));
 const devBackendBridgeFile = fileURLToPath(new URL("../../.risk/dev-backend.json", import.meta.url));
 const DEV_API_PREFIX = "/__risk-api";
-const webVersion = process.env.npm_package_version?.trim() || "0.2.0";
+const webVersion = process.env.npm_package_version?.trim() || "0.2.1";
 
 type DevBackendBridge = {
   baseUrl: string;

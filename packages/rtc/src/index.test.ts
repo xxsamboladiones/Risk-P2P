@@ -401,6 +401,7 @@ describe("MeshWebRTCTransport", () => {
     expect(FakePeerConnection.dataChannels).toHaveLength(2);
     expect(callbacks.onPeerReset).toHaveBeenCalledWith(peerId);
     expect(callbacks.sendOffer).toHaveBeenCalledTimes(2);
+    expect(callbacks.onDataState).not.toHaveBeenCalledWith(peerId, "closed");
   });
 
   it("recria somente o peer quando uma offer antiga viola a ordem de m-lines", async () => {

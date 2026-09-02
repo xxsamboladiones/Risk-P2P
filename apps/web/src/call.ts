@@ -20,6 +20,7 @@ import {
 } from "./services/offline/social-storage";
 import { SupabaseSignalingProvider } from "./services/supabase/signaling";
 import type { SignalingDiagnostics, SignalingProvider } from "./services/signaling/types";
+import { withinP2PClockTolerance } from "./services/p2p-clock";
 import {
   compatibleAppVersion,
   compatibleCallPeer,
@@ -58,6 +59,7 @@ type MicrophoneSession = {
 
 const AUTH_CHALLENGE_TIMEOUT_MS = 8_000;
 const AUTH_CONNECTION_WATCHDOG_MS = 20_000;
+const AUTHENTICATED_DATA_CHANNEL_RECOVERY_DELAY_MS = 500;
 const MAX_AUTH_CHALLENGES_PER_CONNECTION = 3;
 
 type CallProfileMessage = {
@@ -474,20 +476,7 @@ export class CallController {
         const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
         store.upsert({ ...participant, displayName: message.payload.displayName, avatar: message.payload.avatar });
       },
-      onDataState: (remotePeerId, state) => {
-        if (state === "open") {
-          if (this.mediaAuthenticationRequired) this.sendAuthChallenge(remotePeerId);
-          else this.sendProfile(remotePeerId);
-          // Uma conexão recriada não gera novo evento de presença. Reenvia o
-          // estado para que câmera/tela/microfone sejam restaurados junto com a
-          // identidade, sem depender de o usuário alternar algum controle.
-          void this.signaling?.sendPeerState(this.state).catch((error) => {
-            console.warn("Não foi possível reenviar o estado após reabrir o DataChannel.", { remotePeerId, error });
-          });
-        } else if (this.mediaAuthenticationRequired && !this.authenticatedPeers.has(remotePeerId)) {
-          this.schedulePeerAuthenticationCheck(remotePeerId, AUTH_CHALLENGE_TIMEOUT_MS);
-        }
-      },
+      onDataState: (remotePeerId, state) => this.handleDataChannelState(remotePeerId, state),
     }, networkInterfaces);
     if (this.mediaAuthenticationRequired) transport.requireMediaAuthorization();
     this.transport = transport;
@@ -822,6 +811,38 @@ export class CallController {
     return true;
   }
 
+  private handleDataChannelState(remotePeerId: string, state: RTCDataChannelState): void {
+    if (state === "open") {
+      if (this.mediaAuthenticationRequired) this.sendAuthChallenge(remotePeerId);
+      else this.sendProfile(remotePeerId);
+      // Uma conexão recriada não gera novo evento de presença. Reenvia o
+      // estado para que câmera/tela/microfone sejam restaurados junto com a
+      // identidade, sem depender de o usuário alternar algum controle.
+      void this.signaling?.sendPeerState(this.state).catch((error) => {
+        console.warn("Não foi possível reenviar o estado após reabrir o DataChannel.", { remotePeerId, error });
+      });
+      return;
+    }
+    if (!this.mediaAuthenticationRequired || !this.isAdmittedCallPeer(remotePeerId)) return;
+
+    if (this.authenticatedPeers.delete(remotePeerId)) {
+      this.authChallenges.delete(remotePeerId);
+      this.authChallengeAttempts.delete(remotePeerId);
+      const timer = this.authTimers.get(remotePeerId);
+      if (timer) clearTimeout(timer);
+      this.authTimers.delete(remotePeerId);
+      const store = useCallStore.getState();
+      const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
+      // Mantém o nome autenticado visível, mas sinaliza imediatamente que o canal
+      // de controle precisa ser recriado e exige uma nova prova de identidade.
+      store.upsert({ ...participant, connection: "connecting" });
+      this.schedulePeerAuthenticationCheck(remotePeerId, AUTHENTICATED_DATA_CHANNEL_RECOVERY_DELAY_MS);
+      return;
+    }
+
+    this.schedulePeerAuthenticationCheck(remotePeerId, AUTH_CHALLENGE_TIMEOUT_MS);
+  }
+
   private schedulePeerAuthenticationCheck(remotePeerId: string, delayMs: number, replace = true): void {
     if (!this.mediaAuthenticationRequired || this.authenticatedPeers.has(remotePeerId)) return;
     const existing = this.authTimers.get(remotePeerId);
@@ -886,7 +907,7 @@ export class CallController {
       this.rejectIncompatibleCallPeer(remotePeerId, validRiskPeerCapabilities(message.capabilities) ? message.capabilities.appVersion : undefined);
       return true;
     }
-    if (Math.abs(Date.now() - Number(message.timestamp)) > 30_000) return true;
+    if (!withinP2PClockTolerance(message.timestamp)) return true;
     if (message.type === "call.auth.challenge") void this.respondAuthChallenge(remotePeerId, message);
     if (message.type === "call.auth.proof") void this.acceptAuthProof(remotePeerId, message);
     return true;

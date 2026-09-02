@@ -694,6 +694,10 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
       <p>Signaling: <b>{diagnostics?.signaling?.status ?? "indisponível"}</b></p>
       <p>Canal Supabase: <b>{diagnostics?.signaling?.channelStatus ?? "indisponível"}</b></p>
       <p>Peers presentes: <b>{diagnostics?.signaling?.presencePeers.length ?? 0}</b></p>
+      {diagnostics?.signaling?.clockSkewMs !== null && diagnostics?.signaling?.clockSkewMs !== undefined && <p>
+        Diferença de relógio: <b>{Math.round(Math.abs(diagnostics.signaling.clockSkewMs) / 1_000)}s ({diagnostics.signaling.clockSkewMs > 0 ? "peer adiantado" : "peer atrasado"})</b>
+        {diagnostics.signaling.clockSkewRejectedMessages > 0 ? ` · ${diagnostics.signaling.clockSkewRejectedMessages} mensagens rejeitadas` : ""}
+      </p>}
       <p>Conectividade: <b>{diagnostics?.connectivity.label ?? "verificando"}</b></p>
       {(diagnostics?.peerConnections ?? []).map((peer) => {
         const path = peer.selectedConnectionPath;

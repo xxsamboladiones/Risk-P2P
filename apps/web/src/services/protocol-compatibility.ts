@@ -1,4 +1,4 @@
-export const RISK_APP_VERSION = import.meta.env.VITE_RISK_APP_VERSION ?? "0.2.0";
+export const RISK_APP_VERSION = import.meta.env.VITE_RISK_APP_VERSION ?? "0.2.1";
 export const RISK_CALL_PROTOCOL_VERSION = 2;
 export const RISK_CHAT_PROTOCOL_VERSION = 2;
 export const RISK_GROUP_MANIFEST_VERSION = 2;

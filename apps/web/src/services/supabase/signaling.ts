@@ -1,6 +1,11 @@
 import type { RealtimeChannel, SupabaseClient } from "@supabase/supabase-js";
 import type { PeerState } from "@risk/protocol";
 import { getSupabaseRealtimeClient } from "./client";
+import {
+  P2P_CLOCK_SKEW_WARNING_MS,
+  p2pClockSkewMs,
+  withinP2PClockTolerance,
+} from "../p2p-clock";
 import { isValidPeer, parseAnswer, parseIceCandidate, parseOffer, parsePeerState } from "../signaling/validation";
 import type {
   AnswerMessage,
@@ -30,10 +35,8 @@ type RateWindow = { startedAt: number; count: number };
 type ConnectionWaiter = { resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
 
 const DEBUG = import.meta.env.VITE_DEBUG_SIGNALING === "true";
-const CLIENT_VERSION = import.meta.env.VITE_RISK_APP_VERSION ?? "0.2.0";
+const CLIENT_VERSION = import.meta.env.VITE_RISK_APP_VERSION ?? "0.2.1";
 const PRESENCE_LEAVE_GRACE_MS = 10_000;
-const SIGNALING_MAX_AGE_MS = 30_000;
-const SIGNALING_FUTURE_SKEW_MS = 10_000;
 const SESSION_TIMESTAMP_TOLERANCE_MS = 1_500;
 const SIGNALING_RECONNECT_SEND_TIMEOUT_MS = 20_000;
 
@@ -60,6 +63,8 @@ export class SupabaseSignalingProvider implements SignalingProvider {
   private readonly peerLeaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly peerDepartedAt = new Map<string, number>();
   private readonly connectionWaiters = new Set<ConnectionWaiter>();
+  private lastObservedClockSkewMs?: number;
+  private clockSkewRejectedMessages = 0;
 
   async connect(roomId: string, peerId: string, namespace: SignalingNamespace = "room"): Promise<void> {
     if (this.channel) await this.disconnect();
@@ -67,6 +72,8 @@ export class SupabaseSignalingProvider implements SignalingProvider {
     this.sessionStartedAt = Date.now();
     this.missingPeers.clear();
     this.peerDepartedAt.clear();
+    this.lastObservedClockSkewMs = undefined;
+    this.clockSkewRejectedMessages = 0;
     this.peerLeaveTimers.forEach((timer) => clearTimeout(timer));
     this.peerLeaveTimers.clear();
     this.setStatus("connecting");
@@ -164,6 +171,8 @@ export class SupabaseSignalingProvider implements SignalingProvider {
       status: this.status, channelStatus: this.channelStatus, peerId: this.peerId ?? null,
       roomId: this.roomId ?? null, connectedPeers: [...this.presencePeers.keys()],
       presencePeers: [...this.presencePeers.keys()], processedMessages: this.processedMessageIds.size,
+      clockSkewMs: this.lastObservedClockSkewMs ?? null,
+      clockSkewRejectedMessages: this.clockSkewRejectedMessages,
     };
   }
 
@@ -277,7 +286,19 @@ export class SupabaseSignalingProvider implements SignalingProvider {
     if (!this.peerId || !this.roomId || message.roomId !== this.roomId || message.fromPeerId === this.peerId) return false;
     if (message.targetPeerId !== undefined && message.targetPeerId !== this.peerId) return false;
     const now = Date.now();
-    if (!Number.isFinite(message.timestamp) || message.timestamp < now - SIGNALING_MAX_AGE_MS || message.timestamp > now + SIGNALING_FUTURE_SKEW_MS) return false;
+    const clockSkew = p2pClockSkewMs(message.timestamp, now);
+    if (clockSkew !== null && Math.abs(clockSkew) >= P2P_CLOCK_SKEW_WARNING_MS) {
+      this.lastObservedClockSkewMs = clockSkew;
+    }
+    if (!withinP2PClockTolerance(message.timestamp, now)) {
+      this.clockSkewRejectedMessages += 1;
+      console.warn("Signaling WebRTC rejeitado por diferença excessiva entre os relógios.", {
+        fromPeerId: message.fromPeerId,
+        clockSkewMs: clockSkew,
+        type: message.type,
+      });
+      return false;
+    }
 
     if (!this.presencePeers.has(message.fromPeerId)) this.reconcilePresence();
     const presentPeer = this.presencePeers.get(message.fromPeerId);

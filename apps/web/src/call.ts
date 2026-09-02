@@ -5,6 +5,7 @@ import { api } from "./api";
 import { openConfiguredMicrophone } from "./services/audio/microphone";
 import { createRnnoiseMicrophone, type RnnoiseMicrophone } from "./services/audio/rnnoise";
 import { loadVoiceVideoSettings, type VoiceVideoSettings } from "./services/audio/settings";
+import { CallPresenceSoundState, playCallSound, type CallSound } from "./services/audio/call-sounds";
 import { validAvatarDataUrl } from "./services/offline/profile";
 import {
   applyGroupRevocationCertificate,
@@ -352,11 +353,13 @@ export class CallController {
   private readonly revocationOnlyPeers = new Set<string>();
   private readonly pendingRevokedPeers = new Set<string>();
   private mediaAuthenticationRequired = false;
+  private readonly presenceSounds = new CallPresenceSoundState();
 
   constructor(private readonly createSignaling: () => SignalingProvider = () => new SupabaseSignalingProvider()) {}
 
   async join(token: string, roomId: string, iceServers: RTCIceServer[], options: CallJoinOptions = {}): Promise<MediaStream> {
     if (this.roomId) await this.leave(this.roomId);
+    this.presenceSounds.reset();
     const lifecycle = ++this.lifecycleId;
     const voiceSettings = loadVoiceVideoSettings();
     this.roomId = roomId;
@@ -501,6 +504,7 @@ export class CallController {
       await signaling.connect(this.rendezvousId, this.peerId);
       if (!this.isActive(lifecycle)) throw new DOMException("Entrada na chamada cancelada.", "AbortError");
       await signaling.sendPeerState(this.state);
+      this.presenceSounds.enable();
       return this.local;
     } catch (error) {
       if (this.isActive(lifecycle)) await this.cleanup();
@@ -862,6 +866,7 @@ export class CallController {
         return;
       }
       const participant = useCallStore.getState().participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
+      this.playPresenceSound(this.presenceSounds.accept(remotePeerId));
       useCallStore.getState().upsert({ ...participant, displayName: remoteIdentity.displayName, avatar: remoteIdentity.avatar });
       await transport.authorizePeerMedia(remotePeerId);
       if (!this.isActive(lifecycle) || this.transport !== transport) return;
@@ -950,6 +955,10 @@ export class CallController {
       .filter((remotePeerId) => remotePeerId !== localPeerId && this.isAdmittedCallPeer(remotePeerId));
     const store = useCallStore.getState();
     await Promise.all(remotePeerIds.map(async (remotePeerId) => {
+      // Um peer pode já estar na presença e só se tornar admitido após a
+      // sincronização do grupo; nesse caso ele também precisa entrar no ciclo
+      // normal de autenticação e sons.
+      this.presenceSounds.observe(remotePeerId);
       const participant = store.participants[remotePeerId] ?? placeholderParticipant(remotePeerId);
       store.upsert({ ...participant, connection: participant.connection ?? "new" });
       await transport.connect(remotePeerId, localPeerId < remotePeerId).catch((error) => store.setError(String(error)));
@@ -1060,6 +1069,8 @@ export class CallController {
           return;
         }
         if (this.mediaAuthenticationRequired && !this.isAdmittedCallPeer(peer.peerId)) return;
+        this.presenceSounds.observe(peer.peerId);
+        if (!this.mediaAuthenticationRequired) this.playPresenceSound(this.presenceSounds.accept(peer.peerId));
         const store = useCallStore.getState();
         const participant = store.participants[peer.peerId] ?? placeholderParticipant(peer.peerId);
         store.upsert({ ...participant, connection: participant.connection ?? "new" });
@@ -1067,6 +1078,7 @@ export class CallController {
         void signaling.sendPeerState(this.state).catch((error) => store.setError(String(error)));
       }),
       signaling.onPeerLeft((remotePeerId) => {
+        this.playPresenceSound(this.presenceSounds.leave(remotePeerId));
         this.finishPeerRecovery(remotePeerId);
         useCallStore.getState().remove(remotePeerId);
         this.authenticatedPeers.delete(remotePeerId);
@@ -1154,6 +1166,10 @@ export class CallController {
     useCallStore.getState().setError(message || fallback);
   }
 
+  private playPresenceSound(sound: CallSound | null): void {
+    if (sound) playCallSound(sound);
+  }
+
   private finishPeerRecovery(remotePeerId: string): void {
     this.recoveringPeers.delete(remotePeerId);
     const store = useCallStore.getState();
@@ -1205,6 +1221,7 @@ export class CallController {
     this.revocationOnlyPeers.clear();
     this.pendingRevokedPeers.clear();
     this.mediaAuthenticationRequired = false;
+    this.presenceSounds.reset();
     this.state = { microphone: true, camera: false, screenShare: false };
 
     unsubscribers.forEach((unsubscribe) => unsubscribe());

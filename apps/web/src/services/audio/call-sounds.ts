@@ -14,6 +14,43 @@ export function callSoundForRoomTransition(previousRoomId: string | null, roomId
   return previousRoomId ? "disconnect" : null;
 }
 
+/**
+ * Mantém os sons de presença remota separados da transição local de sala.
+ * Peers encontrados durante a sincronização inicial ficam silenciosos: quem
+ * acabou de entrar já ouve o próprio som de conexão e não deve ouvir um som
+ * adicional para cada pessoa que já estava na chamada.
+ */
+export class CallPresenceSoundState {
+  private ready = false;
+  private readonly initialPeers = new Set<string>();
+  private readonly acceptedPeers = new Set<string>();
+
+  reset(): void {
+    this.ready = false;
+    this.initialPeers.clear();
+    this.acceptedPeers.clear();
+  }
+
+  enable(): void { this.ready = true; }
+
+  observe(peerId: string): void {
+    if (!this.ready) this.initialPeers.add(peerId);
+  }
+
+  accept(peerId: string): CallSound | null {
+    if (this.acceptedPeers.has(peerId)) return null;
+    this.acceptedPeers.add(peerId);
+    if (this.initialPeers.delete(peerId) || !this.ready) return null;
+    return "connect";
+  }
+
+  leave(peerId: string): CallSound | null {
+    this.initialPeers.delete(peerId);
+    if (!this.acceptedPeers.delete(peerId) || !this.ready) return null;
+    return "disconnect";
+  }
+}
+
 export function preloadCallSounds(): void {
   if (typeof Audio === "undefined") return;
   getCallSound("connect").load();

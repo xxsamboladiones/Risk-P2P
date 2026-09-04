@@ -1,5 +1,6 @@
-import { OFFLINE_STORES, deleteFromStore, getAllFromStore, openRiskDatabase, putInStore } from "./database";
+import { OFFLINE_STORES, deleteFromStore, getAllFromStore, getFromStore, openRiskDatabase, putInStore } from "./database";
 import { validAvatarDataUrl } from "./avatar-validation";
+import { purgeLocalChannelData } from "./data-purge";
 
 export type PublicPeerIdentity = { peerId: string; publicKey: JsonWebKey; displayName: string; avatar?: string };
 export type LocalIdentity = PublicPeerIdentity & { id: "self"; privateKey: CryptoKey };
@@ -248,10 +249,13 @@ export async function saveLocalGroup(group: LocalGroup): Promise<void> {
 }
 
 export async function deleteLocalGroup(groupId: string): Promise<void> {
+  const legacyGroup = await getFromStore<LocalGroup>(OFFLINE_STORES.groups, groupId).catch(() => undefined);
   await deleteFromStore(OFFLINE_STORES.groups, groupId).catch(() => undefined);
   const config = await desktopConfig();
-  if (!config) return;
-  await desktopRequest(config, `/p2p/groups/${encodeURIComponent(groupId)}/delete`, { method: "POST" });
+  const channelIds = config
+    ? (await desktopRequest<{ channelIds?: string[] }>(config, `/p2p/groups/${encodeURIComponent(groupId)}/delete`, { method: "POST" })).channelIds ?? []
+    : legacyGroup?.channels.map((channel) => channel.id) ?? [];
+  await Promise.all(channelIds.map((channelId) => purgeLocalChannelData(channelId)));
 }
 
 export async function createLocalGroup(name: string, owner: PublicPeerIdentity): Promise<LocalGroup> {
@@ -440,6 +444,7 @@ export async function mergeLocalGroupMembers(groupId: string, incoming: PublicPe
 export async function mergeLocalGroupManifest(incoming: LocalGroup, senderPeerId = incoming.manifestActorPeerId ?? incoming.ownerPeerId): Promise<LocalGroup> {
   const group = (await loadLocalGroups()).find((item) => item.groupId === incoming.groupId);
   if (!group) throw new Error("Grupo local não encontrado para sincronizar o manifesto.");
+  if (!(await validateMergedManifestRevocations(group, incoming, senderPeerId))) return group;
   const merged = resolveLocalGroupManifest(group, incoming, senderPeerId);
   const identity = await loadLocalIdentity();
   if (identity && !merged.members.some((member) => samePeerIdentity(member, identity))) {
@@ -452,6 +457,9 @@ export async function mergeLocalGroupManifest(incoming: LocalGroup, senderPeerId
   }
   if (sameLocalGroupManifestState(group, merged)) return group;
   await saveLocalGroup(merged);
+  const remainingChannels = new Set(merged.channels.map((channel) => channel.id));
+  await Promise.all(group.channels.filter((channel) => !remainingChannels.has(channel.id))
+    .map((channel) => purgeLocalChannelData(channel.id)));
   if (typeof window !== "undefined") window.dispatchEvent(new Event("risk:social-updated"));
   return merged;
 }
@@ -484,6 +492,7 @@ export function sameLocalGroupManifestState(left: LocalGroup, right: LocalGroup)
 export function resolveLocalGroupManifest(group: LocalGroup, incomingValue: LocalGroup, senderPeerId = incomingValue.manifestActorPeerId ?? incomingValue.ownerPeerId): LocalGroup {
   let incoming = incomingValue;
   if (incoming.ownerPeerId !== group.ownerPeerId) return group;
+  if (senderPeerId !== group.ownerPeerId && !(group.administratorPeerIds ?? []).includes(senderPeerId)) return group;
   const knownOwner = group.members.find((member) => member.peerId === group.ownerPeerId);
   const incomingOwner = incoming.members.find((member) => member.peerId === incoming.ownerPeerId);
   if (!knownOwner || !incomingOwner || !samePublicKey(knownOwner.publicKey, incomingOwner.publicKey)) return group;
@@ -501,6 +510,20 @@ export function resolveLocalGroupManifest(group: LocalGroup, incomingValue: Loca
   const incomingWins = compareGroupManifestRevisions(incoming, group) > 0
     || incomingAdministratorEpoch > localAdministratorEpoch;
   const revocations = mergeGroupRevocations(group.revocations ?? [], incoming.revocations ?? []);
+  const incomingRemoved = new Set([
+    ...(incoming.removedPeerIds ?? []),
+    ...(incoming.revocations ?? []).map((certificate) => certificate.targetPeerId),
+  ]);
+  const previouslyRemoved = new Set([
+    ...(group.removedPeerIds ?? []),
+    ...(group.revocations ?? []).map((certificate) => certificate.targetPeerId),
+  ]);
+  const availableCertificates = [...(group.revocations ?? []), ...(incoming.revocations ?? [])];
+  if ([...incomingRemoved].some((peerId) => !previouslyRemoved.has(peerId)
+    && !availableCertificates.some((certificate) => certificate.targetPeerId === peerId))) return group;
+  if (incomingRemoved.has(group.ownerPeerId)) return group;
+  if (senderPeerId !== group.ownerPeerId
+    && (group.administratorPeerIds ?? []).some((peerId) => incomingRemoved.has(peerId))) return group;
   const removed = new Set([
     ...(group.removedPeerIds ?? []),
     ...(incoming.removedPeerIds ?? []),
@@ -559,6 +582,45 @@ export function resolveLocalGroupManifest(group: LocalGroup, incomingValue: Loca
       : group.groupId,
   };
   return merged;
+}
+
+async function validateMergedManifestRevocations(
+  group: LocalGroup,
+  incoming: LocalGroup,
+  senderPeerId: string,
+): Promise<boolean> {
+  if (incoming.ownerPeerId !== group.ownerPeerId) return false;
+  if (senderPeerId !== group.ownerPeerId && !(group.administratorPeerIds ?? []).includes(senderPeerId)) return false;
+  const verificationGroup: LocalGroup = {
+    ...group,
+    members: dedupePeerIdentities([...group.members, ...incoming.members]),
+    removedMembers: dedupePeerIdentities([...(group.removedMembers ?? []), ...(incoming.removedMembers ?? [])]),
+  };
+  const verifiedTargets = new Set<string>();
+  for (const certificate of incoming.revocations ?? []) {
+    if (certificate.targetPeerId === group.ownerPeerId) return false;
+    const known = (group.revocations ?? []).find((item) => item.messageId === certificate.messageId);
+    const alreadyTrusted = known
+      && known.signature === certificate.signature
+      && canonicalGroupRevocation(known) === canonicalGroupRevocation(certificate);
+    if (!alreadyTrusted && !(await verifyGroupRevocationCertificate(certificate, verificationGroup, true))) return false;
+    if (certificate.issuerPeerId !== group.ownerPeerId
+      && (group.administratorPeerIds ?? []).includes(certificate.targetPeerId)) return false;
+    verifiedTargets.add(certificate.targetPeerId);
+  }
+  const previouslyRemoved = new Set([
+    ...(group.removedPeerIds ?? []),
+    ...(group.revocations ?? []).map((certificate) => certificate.targetPeerId),
+  ]);
+  const newlyRemoved = new Set([
+    ...(incoming.removedPeerIds ?? []),
+    ...(incoming.revocations ?? []).map((certificate) => certificate.targetPeerId),
+  ]);
+  for (const peerId of newlyRemoved) {
+    if (!previouslyRemoved.has(peerId) && !verifiedTargets.has(peerId)) return false;
+  }
+  return (incoming.removedMembers ?? []).every((removed) => newlyRemoved.has(removed.peerId)
+    && verificationGroup.removedMembers?.some((known) => samePeerIdentity(known, removed)));
 }
 
 export async function updateKnownPeerProfile(peer: PublicPeerIdentity): Promise<void> {
@@ -667,6 +729,10 @@ export async function createGroupRevocationCertificate(
   membershipVersion: number,
 ): Promise<GroupRevocationCertificate> {
   if (!canManageLocalGroup(group, issuer.peerId)) throw new Error("A identidade local não pode revogar membros deste grupo.");
+  if (target.peerId === group.ownerPeerId) throw new Error("O proprietário não pode ser removido do grupo.");
+  if (issuer.peerId !== group.ownerPeerId && (group.administratorPeerIds ?? []).includes(target.peerId)) {
+    throw new Error("Somente o proprietário pode remover um administrador.");
+  }
   let administratorGrant: GroupAdministratorGrant | undefined;
   if (issuer.peerId !== group.ownerPeerId) {
     administratorGrant = (group.administratorGrants ?? []).find((grant) =>
@@ -699,8 +765,13 @@ export async function createGroupRevocationCertificate(
 export async function verifyGroupRevocationCertificate(
   certificate: GroupRevocationCertificate,
   group: PublicGroupMetadata & { members: PublicPeerIdentity[] },
+  allowHistoricalAdministrator = false,
 ): Promise<boolean> {
-  if (!validGroupRevocationCertificate(certificate) || certificate.groupId !== group.groupId) return false;
+  if (!validGroupRevocationCertificate(certificate)
+    || certificate.groupId !== group.groupId
+    || certificate.targetPeerId === group.ownerPeerId
+    || (certificate.issuerPeerId !== group.ownerPeerId
+      && (group.administratorPeerIds ?? []).includes(certificate.targetPeerId))) return false;
   const issuer = [...group.members, ...(group.removedMembers ?? [])].find((member) => member.peerId === certificate.issuerPeerId);
   let issuerKey: JsonWebKey | undefined;
   if (certificate.issuerPeerId === group.ownerPeerId) {
@@ -710,7 +781,7 @@ export async function verifyGroupRevocationCertificate(
     if (!grant
       || grant.administratorPeerId !== certificate.issuerPeerId
       || grant.administratorEpoch !== certificate.administratorEpoch
-      || (group.administratorEpoch ?? 1) > certificate.administratorEpoch
+      || (!allowHistoricalAdministrator && (group.administratorEpoch ?? 1) > certificate.administratorEpoch)
       || ((group.administratorEpoch ?? 1) === certificate.administratorEpoch
         && !(group.administratorPeerIds ?? []).includes(certificate.issuerPeerId))
       || !(await verifyGroupAdministratorGrant(grant, group))) return false;

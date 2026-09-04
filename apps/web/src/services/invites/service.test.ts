@@ -79,6 +79,36 @@ describe("convites P2P descartáveis", () => {
     await vi.waitFor(() => expect(signaling.roomSize(`friend:${rendezvous}`)).toBe(0));
   });
 
+  it("aguarda uma fábrica de transporte assíncrona", async () => {
+    const signaling = new InMemorySignalingHub();
+    const data = new DataTransportHub();
+    const base = dependencies(signaling, data);
+    const createTransport = vi.fn(async (peerId: string, _ice: RTCIceServer[], events: TransportEvents) => data.create(peerId, events));
+    const service = new FriendInviteService(await identity("Ana"), [], { ...base, createTransport });
+
+    await service.createFriendInvite();
+    expect(createTransport).toHaveBeenCalledOnce();
+    expect(data.transports.size).toBe(1);
+    await service.cancel(false);
+  });
+
+  it("cleans up a partially initialized invite when transport creation fails", async () => {
+    const signalingHub = new InMemorySignalingHub();
+    const signaling = new InMemorySignalingProvider(signalingHub);
+    const disconnect = vi.spyOn(signaling, "disconnect");
+    const base = dependencies(signalingHub, new DataTransportHub());
+    const service = new FriendInviteService(await identity("Ana"), [], {
+      ...base,
+      createSignaling: () => signaling,
+      createTransport: async () => { throw new Error("transport unavailable"); },
+    });
+
+    await expect(service.createFriendInvite()).rejects.toThrow("transport unavailable");
+
+    expect(disconnect).toHaveBeenCalledOnce();
+    expect(service.state?.status).toBe("error");
+  });
+
   it("transmite grupo no aceite e permite recusar sem salvar", async () => {
     const signaling = new InMemorySignalingHub(); const data = new DataTransportHub(); const deps = dependencies(signaling, data);
     const owner = await identity("Proprietário A");

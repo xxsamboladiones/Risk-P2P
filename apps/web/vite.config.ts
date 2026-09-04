@@ -7,7 +7,7 @@ import react from "@vitejs/plugin-react";
 const envDir = fileURLToPath(new URL("../../", import.meta.url));
 const devBackendBridgeFile = fileURLToPath(new URL("../../.risk/dev-backend.json", import.meta.url));
 const DEV_API_PREFIX = "/__risk-api";
-const webVersion = process.env.npm_package_version?.trim() || "0.2.0";
+const webVersion = process.env.npm_package_version?.trim() || "0.2.1";
 
 type DevBackendBridge = {
   baseUrl: string;
@@ -114,11 +114,15 @@ export default defineConfig(({ command, mode }) => {
   const devApiUrl = process.env.RISK_DEV_API_URL?.trim() || DEV_API_PREFIX;
   const env = loadEnv(mode, envDir, "VITE_");
   const realtimeSources: string[] = [];
+  const turnCredentialSources: string[] = [];
   try {
     const url = new URL(env.VITE_SUPABASE_URL ?? "");
     realtimeSources.push(url.origin, `${url.protocol === "https:" ? "wss:" : "ws:"}//${url.host}`);
   } catch { /* validação de configuração apresenta o erro amigável no app */ }
-  const connectSources = ["'self'", "http://127.0.0.1:*", ...(command === "serve" ? ["http://localhost:*", "ws://127.0.0.1:*", "ws://localhost:*"] : []), ...realtimeSources].join(" ");
+  try {
+    turnCredentialSources.push(new URL(env.VITE_TURN_CREDENTIALS_URL ?? "").origin);
+  } catch { /* verify-build-env apresenta o erro antes do empacotamento */ }
+  const connectSources = ["'self'", "http://127.0.0.1:*", ...(command === "serve" ? ["http://localhost:*", "ws://127.0.0.1:*", "ws://localhost:*"] : []), ...realtimeSources, ...turnCredentialSources].join(" ");
   return {
     base: "./",
     envDir,

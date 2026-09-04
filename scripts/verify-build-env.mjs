@@ -21,12 +21,23 @@ if (missing.length) {
   process.exit(1);
 }
 
-for (const name of ["VITE_API_URL", "VITE_SUPABASE_URL"]) {
+for (const name of ["VITE_API_URL", "VITE_SUPABASE_URL", "VITE_TURN_CREDENTIALS_URL"]) {
   if (!values[name]?.trim()) continue;
-  try { new URL(values[name]); }
+  let url;
+  try { url = new URL(values[name]); }
   catch {
     console.error(`Build interrompido: ${name} precisa ser uma URL válida.`);
     process.exit(1);
+  }
+  if (name === "VITE_TURN_CREDENTIALS_URL") {
+    if (url.protocol !== "https:") {
+      console.error("Build interrompido: VITE_TURN_CREDENTIALS_URL precisa usar HTTPS.");
+      process.exit(1);
+    }
+    if (url.username || url.password || url.hash) {
+      console.error("Build interrompido: VITE_TURN_CREDENTIALS_URL não pode conter credenciais nem fragmento.");
+      process.exit(1);
+    }
   }
 }
 
@@ -48,4 +59,4 @@ if (values.RISK_REQUIRE_WINDOWS_SIGNING === "true") {
   }
 }
 
-console.log(`Variáveis públicas do build validadas. Modo: ${values.VITE_API_URL?.trim() ? "híbrido (API + P2P)" : "P2P local"}.${values.RISK_REQUIRE_WINDOWS_SIGNING === "true" ? " Assinatura Windows obrigatória." : ""}`);
+console.log(`Variáveis públicas do build validadas. Modo: ${values.VITE_API_URL?.trim() ? "híbrido (API + P2P)" : "P2P local"}.${values.VITE_TURN_CREDENTIALS_URL?.trim() ? " TURN temporário habilitado." : ""}${values.RISK_REQUIRE_WINDOWS_SIGNING === "true" ? " Assinatura Windows obrigatória." : ""}`);

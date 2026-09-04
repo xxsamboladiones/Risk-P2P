@@ -1,5 +1,6 @@
 import { validGroupAdministratorGrant, validGroupRevocationCertificate, verifyGroupAdministratorGrant, type GroupInviteMetadata, type LocalIdentity, type PublicPeerIdentity } from "../offline/social-storage";
 import { validAvatarDataUrl } from "../offline/profile";
+import { P2P_CLOCK_SKEW_TOLERANCE_MS } from "../p2p-clock";
 
 export type InviteProtocolType = "friend.request" | "friend.accept" | "friend.reject" | "group.join.request" | "group.join.accept" | "group.join.reject" | "invite.ack" | "invite.busy";
 export type SignedInviteMessage = {
@@ -11,7 +12,6 @@ export type SignedInviteMessage = {
 // precisa aceitar exatamente a mesma faixa para nunca descartar silenciosamente
 // uma mensagem que o transporte acabou de entregar com sucesso.
 export const MAX_INVITE_MESSAGE_BYTES = 64 * 1024;
-const MAX_CLOCK_SKEW_MS = 2 * 60_000;
 
 export async function createSignedInviteMessage(
   identity: LocalIdentity,
@@ -39,7 +39,7 @@ export async function parseAndVerifyInviteMessage(raw: string, now = Date.now())
   if (new TextEncoder().encode(raw).byteLength > MAX_INVITE_MESSAGE_BYTES) return null;
   let value: unknown;
   try { value = JSON.parse(raw); } catch { return null; }
-  if (!isMessage(value) || Math.abs(now - value.timestamp) > MAX_CLOCK_SKEW_MS) return null;
+  if (!isMessage(value) || Math.abs(now - value.timestamp) > P2P_CLOCK_SKEW_TOLERANCE_MS) return null;
   try {
     const { signature, ...unsigned } = value;
     const key = await crypto.subtle.importKey("jwk", value.identity.publicKey, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);

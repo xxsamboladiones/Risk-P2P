@@ -80,6 +80,10 @@ fn empty_json_array() -> Value {
     Value::Array(Vec::new())
 }
 
+fn empty_json_object() -> Value {
+    Value::Object(Default::default())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct P2pMessage {
@@ -90,11 +94,65 @@ struct P2pMessage {
     created_at: String,
     author_peer_id: Option<String>,
     signature: Option<String>,
+    #[serde(default)]
+    reply_to_id: Option<String>,
+    #[serde(default)]
+    edited_content: Option<String>,
+    #[serde(default)]
+    edited_at: Option<String>,
+    #[serde(default)]
+    deleted_at: Option<String>,
+    #[serde(default)]
+    pinned_at: Option<String>,
+    #[serde(default)]
+    pinned_by_peer_id: Option<String>,
+    #[serde(default = "empty_json_object")]
+    reactions: Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct P2pChatEvent {
+    version: i64,
+    #[serde(rename = "type")]
+    event_type: String,
+    channel_id: String,
+    id: String,
+    target_message_id: String,
+    actor_peer_id: String,
+    action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    emoji: Option<String>,
+    timestamp: i64,
+    signature: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct MessagePageQuery {
     before: Option<String>,
+    #[serde(rename = "beforeId")]
+    before_id: Option<String>,
+    #[serde(rename = "messageId")]
+    message_id: Option<String>,
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageSaveQuery {
+    #[serde(default)]
+    insert_only: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EventPageQuery {
+    before_timestamp: Option<i64>,
+    before_id: Option<String>,
     limit: Option<i64>,
 }
 
@@ -110,6 +168,11 @@ pub fn router() -> Router<AppState> {
             "/p2p/messages/{channel_id}",
             get(list_messages).post(save_message),
         )
+        .route(
+            "/p2p/chat-events/{channel_id}",
+            get(list_chat_events).post(save_chat_event),
+        )
+        .route("/p2p/channels/{channel_id}", post(purge_p2p_channel))
         .merge(attachments::router())
         .merge(screen_audio::router())
 }
@@ -360,6 +423,7 @@ async fn delete_p2p_group(
     .await
     .map_err(internal)?;
 
+    let mut removed_channel_ids = Vec::new();
     let mut transaction = state.db.begin().await.map_err(internal)?;
     if let Some(channels_json) = channels_json {
         if let Ok(Value::Array(channels)) = serde_json::from_str::<Value>(&channels_json) {
@@ -368,6 +432,15 @@ async fn delete_p2p_group(
                     continue;
                 };
                 sqlx::query("DELETE FROM p2p_messages WHERE owner_user_id=? AND channel_id=?")
+                    .bind(owner)
+                    .bind(channel_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(internal)?;
+                if valid_id(channel_id) {
+                    removed_channel_ids.push(channel_id.to_owned());
+                }
+                sqlx::query("DELETE FROM p2p_chat_events WHERE owner_user_id=? AND channel_id=?")
                     .bind(owner)
                     .bind(channel_id)
                     .execute(&mut *transaction)
@@ -383,6 +456,44 @@ async fn delete_p2p_group(
         .await
         .map_err(internal)?;
     transaction.commit().await.map_err(internal)?;
+    let _quota_guard = state.attachment_quota_lock.lock().await;
+    for channel_id in &removed_channel_ids {
+        if let Err(error) = attachments::purge_channel_files(channel_id).await {
+            tracing::warn!(channel_id, error = %error, "não foi possível remover transferências temporárias do canal apagado");
+        }
+    }
+    Ok(Json(
+        json!({ "ok": true, "channelIds": removed_channel_ids }),
+    ))
+}
+
+async fn purge_p2p_channel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let owner = bearer(&headers, &state)?;
+    if !valid_id(&channel_id) {
+        return Err(ApiError::Bad("Canal P2P inválido".into()));
+    }
+    let mut transaction = state.db.begin().await.map_err(internal)?;
+    sqlx::query("DELETE FROM p2p_messages WHERE owner_user_id=? AND channel_id=?")
+        .bind(owner)
+        .bind(&channel_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+    sqlx::query("DELETE FROM p2p_chat_events WHERE owner_user_id=? AND channel_id=?")
+        .bind(owner)
+        .bind(&channel_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+    transaction.commit().await.map_err(internal)?;
+    let _quota_guard = state.attachment_quota_lock.lock().await;
+    if let Err(error) = attachments::purge_channel_files(&channel_id).await {
+        tracing::warn!(channel_id, error = %error, "não foi possível remover transferências temporárias do canal apagado");
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -480,23 +591,39 @@ async fn list_messages(
         return Err(ApiError::Bad("Canal P2P inválido".into()));
     }
     let limit = page.limit.unwrap_or(100).clamp(1, 200);
-    let rows = if let Some(before) = page
-        .before
-        .filter(|value| !value.is_empty() && value.len() <= 64)
-    {
-        sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>)>(
-            "SELECT id,author,content,created_at,author_peer_id,signature FROM p2p_messages WHERE owner_user_id=? AND channel_id=? AND created_at<? ORDER BY created_at DESC LIMIT ?",
+    let rows = if let Some(message_id) = page.message_id {
+        if !valid_id(&message_id) {
+            return Err(ApiError::Bad("Mensagem P2P inválida".into()));
+        }
+        sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, String)>(
+            "SELECT id,author,content,created_at,author_peer_id,signature,reply_to_id,edited_content,edited_at,deleted_at,pinned_at,pinned_by_peer_id,reactions_json FROM p2p_messages WHERE owner_user_id=? AND channel_id=? AND id=? LIMIT 1",
         )
         .bind(owner)
         .bind(&channel_id)
-        .bind(before)
+        .bind(message_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(internal)?
+    } else if let (Some(before), Some(before_id)) = (
+        page.before
+            .filter(|value| !value.is_empty() && value.len() <= 64),
+        page.before_id.filter(|value| valid_id(value)),
+    ) {
+        sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, String)>(
+            "SELECT id,author,content,created_at,author_peer_id,signature,reply_to_id,edited_content,edited_at,deleted_at,pinned_at,pinned_by_peer_id,reactions_json FROM p2p_messages WHERE owner_user_id=? AND channel_id=? AND (created_at<? OR (created_at=? AND id<?)) ORDER BY created_at DESC,id DESC LIMIT ?",
+        )
+        .bind(owner)
+        .bind(&channel_id)
+        .bind(&before)
+        .bind(&before)
+        .bind(before_id)
         .bind(limit)
         .fetch_all(&state.db)
         .await
         .map_err(internal)?
     } else {
-        sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>)>(
-            "SELECT id,author,content,created_at,author_peer_id,signature FROM p2p_messages WHERE owner_user_id=? AND channel_id=? ORDER BY created_at DESC LIMIT ?",
+        sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, String)>(
+            "SELECT id,author,content,created_at,author_peer_id,signature,reply_to_id,edited_content,edited_at,deleted_at,pinned_at,pinned_by_peer_id,reactions_json FROM p2p_messages WHERE owner_user_id=? AND channel_id=? ORDER BY created_at DESC,id DESC LIMIT ?",
         )
         .bind(owner)
         .bind(&channel_id)
@@ -509,7 +636,21 @@ async fn list_messages(
         rows.into_iter()
             .rev()
             .map(
-                |(id, author, content, created_at, author_peer_id, signature)| P2pMessage {
+                |(
+                    id,
+                    author,
+                    content,
+                    created_at,
+                    author_peer_id,
+                    signature,
+                    reply_to_id,
+                    edited_content,
+                    edited_at,
+                    deleted_at,
+                    pinned_at,
+                    pinned_by_peer_id,
+                    reactions_json,
+                )| P2pMessage {
                     id,
                     channel_id: channel_id.clone(),
                     author,
@@ -517,6 +658,14 @@ async fn list_messages(
                     created_at,
                     author_peer_id,
                     signature,
+                    reply_to_id,
+                    edited_content,
+                    edited_at,
+                    deleted_at,
+                    pinned_at,
+                    pinned_by_peer_id,
+                    reactions: serde_json::from_str(&reactions_json)
+                        .unwrap_or_else(|_| empty_json_object()),
                 },
             )
             .collect(),
@@ -527,6 +676,7 @@ async fn save_message(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(channel_id): Path<String>,
+    Query(options): Query<MessageSaveQuery>,
     Json(message): Json<P2pMessage>,
 ) -> Result<Json<P2pMessage>, ApiError> {
     let owner = bearer(&headers, &state)?;
@@ -550,24 +700,193 @@ async fn save_message(
         || message.content.chars().count() > 4_000
         || chrono::DateTime::parse_from_rfc3339(&message.created_at).is_err()
         || !signed_metadata_valid
+        || !valid_optional_id(&message.reply_to_id)
+        || !valid_optional_id(&message.pinned_by_peer_id)
+        || !valid_optional_timestamp(&message.edited_at)
+        || !valid_optional_timestamp(&message.deleted_at)
+        || !valid_optional_timestamp(&message.pinned_at)
+        || message
+            .edited_content
+            .as_ref()
+            .is_some_and(|value| value.chars().count() > 4_000)
+        || !valid_reactions(&message.reactions)
     {
         return Err(ApiError::Bad("Mensagem P2P inválida".into()));
     }
+    let sql = if options.insert_only {
+        "INSERT OR IGNORE INTO p2p_messages(owner_user_id,channel_id,id,author,content,created_at,author_peer_id,signature,reply_to_id,edited_content,edited_at,deleted_at,pinned_at,pinned_by_peer_id,reactions_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    } else {
+        "INSERT INTO p2p_messages(owner_user_id,channel_id,id,author,content,created_at,author_peer_id,signature,reply_to_id,edited_content,edited_at,deleted_at,pinned_at,pinned_by_peer_id,reactions_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(owner_user_id,channel_id,id) DO UPDATE SET reply_to_id=excluded.reply_to_id,edited_content=excluded.edited_content,edited_at=excluded.edited_at,deleted_at=excluded.deleted_at,pinned_at=excluded.pinned_at,pinned_by_peer_id=excluded.pinned_by_peer_id,reactions_json=excluded.reactions_json"
+    };
+    sqlx::query(sql)
+        .bind(owner)
+        .bind(&message.channel_id)
+        .bind(&message.id)
+        .bind(&message.author)
+        .bind(&message.content)
+        .bind(&message.created_at)
+        .bind(&message.author_peer_id)
+        .bind(&message.signature)
+        .bind(&message.reply_to_id)
+        .bind(&message.edited_content)
+        .bind(&message.edited_at)
+        .bind(&message.deleted_at)
+        .bind(&message.pinned_at)
+        .bind(&message.pinned_by_peer_id)
+        .bind(
+            serde_json::to_string(&message.reactions)
+                .map_err(|error| ApiError::Internal(error.into()))?,
+        )
+        .execute(&state.db)
+        .await
+        .map_err(internal)?;
+    Ok(Json(message))
+}
+
+async fn list_chat_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+    Query(page): Query<EventPageQuery>,
+) -> Result<Json<Vec<P2pChatEvent>>, ApiError> {
+    let owner = bearer(&headers, &state)?;
+    if !valid_id(&channel_id) {
+        return Err(ApiError::Bad("Canal P2P inválido".into()));
+    }
+    let limit = page.limit.unwrap_or(500).clamp(1, 500);
+    let rows = if let (Some(timestamp), Some(before_id)) = (
+        page.before_timestamp.filter(|value| *value > 0),
+        page.before_id.filter(|value| valid_id(value)),
+    ) {
+        sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, Option<String>, i64, String)>(
+            "SELECT id,target_message_id,actor_peer_id,action,content,reference_message_id,emoji,timestamp,signature FROM p2p_chat_events WHERE owner_user_id=? AND channel_id=? AND (timestamp<? OR (timestamp=? AND id<?)) ORDER BY timestamp DESC,id DESC LIMIT ?",
+        )
+        .bind(owner)
+        .bind(&channel_id)
+        .bind(timestamp)
+        .bind(timestamp)
+        .bind(before_id)
+        .bind(limit)
+        .fetch_all(&state.db)
+        .await
+        .map_err(internal)?
+    } else {
+        sqlx::query_as::<_, (String, String, String, String, Option<String>, Option<String>, Option<String>, i64, String)>(
+            "SELECT id,target_message_id,actor_peer_id,action,content,reference_message_id,emoji,timestamp,signature FROM p2p_chat_events WHERE owner_user_id=? AND channel_id=? ORDER BY timestamp DESC,id DESC LIMIT ?",
+        )
+        .bind(owner)
+        .bind(&channel_id)
+        .bind(limit)
+        .fetch_all(&state.db)
+        .await
+        .map_err(internal)?
+    };
+    Ok(Json(
+        rows.into_iter()
+            .rev()
+            .map(
+                |(
+                    id,
+                    target_message_id,
+                    actor_peer_id,
+                    action,
+                    content,
+                    reference_message_id,
+                    emoji,
+                    timestamp,
+                    signature,
+                )| P2pChatEvent {
+                    version: 3,
+                    event_type: "chat.event".into(),
+                    channel_id: channel_id.clone(),
+                    id,
+                    target_message_id,
+                    actor_peer_id,
+                    action,
+                    content,
+                    reference_message_id,
+                    emoji,
+                    timestamp,
+                    signature,
+                },
+            )
+            .collect(),
+    ))
+}
+
+async fn save_chat_event(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+    Json(event): Json<P2pChatEvent>,
+) -> Result<Json<P2pChatEvent>, ApiError> {
+    let owner = bearer(&headers, &state)?;
+    let payload_valid = match event.action.as_str() {
+        "edit" => {
+            event
+                .content
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty() && value.chars().count() <= 4_000)
+                && event.reference_message_id.is_none()
+                && event.emoji.is_none()
+        }
+        "reply" => {
+            event
+                .reference_message_id
+                .as_ref()
+                .is_some_and(|value| valid_id(value))
+                && event.content.is_none()
+                && event.emoji.is_none()
+        }
+        "reaction.add" | "reaction.remove" => {
+            event
+                .emoji
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty() && value.chars().count() <= 16)
+                && event.content.is_none()
+                && event.reference_message_id.is_none()
+        }
+        "delete" | "pin" | "unpin" => {
+            event.content.is_none() && event.reference_message_id.is_none() && event.emoji.is_none()
+        }
+        _ => false,
+    };
+    let signature_valid = (16..=256).contains(&event.signature.len())
+        && event
+            .signature
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if event.version != 3
+        || event.event_type != "chat.event"
+        || event.channel_id != channel_id
+        || !valid_id(&channel_id)
+        || !valid_id(&event.id)
+        || !valid_id(&event.target_message_id)
+        || !valid_id(&event.actor_peer_id)
+        || event.timestamp <= 0
+        || !payload_valid
+        || !signature_valid
+    {
+        return Err(ApiError::Bad("Evento de chat P2P inválido".into()));
+    }
     sqlx::query(
-        "INSERT OR IGNORE INTO p2p_messages(owner_user_id,channel_id,id,author,content,created_at,author_peer_id,signature) VALUES(?,?,?,?,?,?,?,?)",
+        "INSERT OR IGNORE INTO p2p_chat_events(owner_user_id,channel_id,id,target_message_id,actor_peer_id,action,content,reference_message_id,emoji,timestamp,signature) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
     )
     .bind(owner)
-    .bind(&message.channel_id)
-    .bind(&message.id)
-    .bind(&message.author)
-    .bind(&message.content)
-    .bind(&message.created_at)
-    .bind(&message.author_peer_id)
-    .bind(&message.signature)
+    .bind(&event.channel_id)
+    .bind(&event.id)
+    .bind(&event.target_message_id)
+    .bind(&event.actor_peer_id)
+    .bind(&event.action)
+    .bind(&event.content)
+    .bind(&event.reference_message_id)
+    .bind(&event.emoji)
+    .bind(event.timestamp)
+    .bind(&event.signature)
     .execute(&state.db)
     .await
     .map_err(internal)?;
-    Ok(Json(message))
+    Ok(Json(event))
 }
 
 fn validate_peer(peer_id: &str, display_name: &str, public_key: &Value) -> Result<(), ApiError> {
@@ -579,6 +898,31 @@ fn validate_peer(peer_id: &str, display_name: &str, public_key: &Value) -> Resul
         return Err(ApiError::Bad("Identidade P2P inválida".into()));
     }
     Ok(())
+}
+
+fn valid_optional_id(value: &Option<String>) -> bool {
+    value.as_ref().is_none_or(|item| valid_id(item))
+}
+
+fn valid_optional_timestamp(value: &Option<String>) -> bool {
+    value
+        .as_ref()
+        .is_none_or(|item| chrono::DateTime::parse_from_rfc3339(item).is_ok())
+}
+
+fn valid_reactions(value: &Value) -> bool {
+    let Some(reactions) = value.as_object() else {
+        return false;
+    };
+    reactions.len() <= 100
+        && reactions.iter().all(|(emoji, peers)| {
+            !emoji.trim().is_empty()
+                && emoji.chars().count() <= 16
+                && peers.as_array().is_some_and(|items| {
+                    items.len() <= 100
+                        && items.iter().all(|peer| peer.as_str().is_some_and(valid_id))
+                })
+        })
 }
 
 fn valid_id(value: &str) -> bool {

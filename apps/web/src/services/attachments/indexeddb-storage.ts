@@ -6,6 +6,7 @@ import {
   deleteAllByIndex,
   deleteFromStore,
   getAllByIndex,
+  getAllPrimaryKeysByIndex,
   getFromStore,
   putInStore,
 } from "../offline/database";
@@ -65,6 +66,18 @@ export class IndexedDbAttachmentStorage implements AttachmentChunkSink {
   async hasChunk(transferId: string, index: number): Promise<boolean> {
     const record = await this.requireTransfer(transferId);
     return Boolean(await getFromStore<StoredAttachmentChunk>(OFFLINE_STORES.attachmentChunks, chunkId(record.attachmentId, index)));
+  }
+
+  async listMissingChunks(transferId: string, chunkCount: number): Promise<number[]> {
+    const record = await this.requireTransfer(transferId);
+    const prefix = `${record.attachmentId}:`;
+    const present = new Set((await getAllPrimaryKeysByIndex(OFFLINE_STORES.attachmentChunks, "attachmentId", record.attachmentId))
+      .filter((key): key is string => typeof key === "string" && key.startsWith(prefix))
+      .map((key) => Number(key.slice(prefix.length)))
+      .filter((index) => Number.isSafeInteger(index) && index >= 0 && index < chunkCount));
+    const missing: number[] = [];
+    for (let index = 0; index < chunkCount; index += 1) if (!present.has(index)) missing.push(index);
+    return missing;
   }
 
   async writeChunk(transferId: string, frame: AttachmentChunkFrame): Promise<void> {

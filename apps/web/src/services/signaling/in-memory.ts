@@ -121,6 +121,8 @@ export class InMemorySignalingProvider implements SignalingProvider {
       peerId: this.peerId ?? null, roomId: this.roomId ?? null,
       connectedPeers: [...this.peers.keys()], presencePeers: [...this.peers.keys()],
       processedMessages: this.processed.size,
+      clockSkewMs: null,
+      clockSkewRejectedMessages: 0,
     };
   }
 

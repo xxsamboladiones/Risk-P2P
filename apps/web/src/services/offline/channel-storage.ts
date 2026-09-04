@@ -1,4 +1,5 @@
 import { canManageLocalGroup, loadLocalGroups, loadLocalIdentity, nextGroupManifestRevision, saveLocalGroup, type LocalGroupChannel } from "./social-storage";
+import { purgeLocalChannelData } from "./data-purge";
 
 function validateChannelName(name: string): string {
   const normalized = name.trim();
@@ -43,4 +44,5 @@ export async function deleteLocalGroupChannel(groupId: string, channelId: string
   group.channels.splice(index, 1);
   Object.assign(group, nextGroupManifestRevision(group, identity.peerId));
   await saveLocalGroup(group);
+  await purgeLocalChannelData(channelId);
 }

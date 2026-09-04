@@ -1,27 +1,42 @@
 # Arquitetura e operação
 
-O Risk Desktop usa Electron para a aplicação principal, React no renderer e um sidecar Rust/Axum para persistência local.
+O Risk Desktop usa Electron para a aplicação principal, React no renderer e um sidecar Rust/Axum para persistência local. A direção desejada das dependências é:
 
 ```text
+                Supabase Realtime
+                 rendezvous only
+                        │ signaling
+                        ▼
 ┌──────────────────────────── Risk Desktop ────────────────────────────┐
-│                                                                      │
-│  Electron Main                                                       │
-│      │                                                               │
-│      ├── frontend React em risk://app                                │
-│      │       │                                                       │
-│      │       └── HTTP loopback + token efêmero para o sidecar       │
-│      │                                                               │
-│      └── risk-desktop-backend                                        │
-│              │                                                       │
-│              └── SQLite em app.getPath("userData")                  │
-│                                                                      │
+│ React views ──> Application Services ──> RTC contracts              │
+│                         │                    │                        │
+│                         ▼                    └──> outros peers        │
+│                  RiskGateway                         │               │
+│                         │                      TURN / SFU opcional    │
+│                         ▼                                            │
+│ Electron Main ── bridge seguro ──> Rust local API ──> SQLite/files  │
 └──────────────────────────────────────────────────────────────────────┘
-                │                              │
-                │ Supabase Realtime            │ STUN/TURN
-                │ Presence/Broadcast            │
-                └────────── WebRTC Mesh P2P ────┘
-                  áudio / vídeo / tela / dados
 ```
+
+## Fronteiras do renderer
+
+`application/runtime.ts` é o composition root do renderer: somente ele escolhe
+os adapters concretos de Supabase, Mesh e gateway HTTP/loopback. O React recebe
+uma única `RiskApplication` por context e depende dos contratos declarados em
+`application/contracts.ts`.
+
+Os primeiros casos de uso extraídos são `SessionService`, que serializa e
+invalida restaurações de sessão, e `InviteApplicationService`, que resolve
+identidade, ICE e transporte de convites sem expor esses detalhes aos
+componentes. Um teste de fronteira impede que views voltem a importar `api`,
+Supabase ou `@risk/rtc`, ou que construam controllers diretamente.
+
+O gateway concreto vive em `infrastructure/risk-gateway.ts`; `api.ts` permanece
+somente como fachada temporária de compatibilidade. `main.tsx` agora é apenas o
+bootstrap do React. `App.tsx` cuida da sessão e do roteamento de alto nível, as
+telas ficam em `views/` e avisos globais reutilizáveis ficam em `components/`.
+`HomeView` ainda concentra a composição social e poderá ser subdividida por
+contexto sem devolver infraestrutura para a UI.
 
 ## Desktop backend
 
@@ -74,6 +89,36 @@ Presence usa apenas identidade efêmera de transporte. Chats e chamadas de grupo
 
 `MeshWebRTCTransport` mantém no máximo cinco peers remotos, totalizando seis participantes por cliente.
 
+A chamada não instancia mais essa classe diretamente. `CallTransport` define o
+ciclo de sessão (`join`, `leave`), publicação de tracks, DataChannel, recuperação
+e diagnóstico. `CallTransportRegistry` registra implementações por tipo e a
+política `selectCallTransport` decide a topologia:
+
+```text
+2–4 participantes                 5+ participantes ou rede degradada
+          │                                      │
+          ▼                                      ▼
+      Mesh P2P                          SFU, quando registrado
+                                                 │
+                                      fallback explícito para Mesh
+```
+
+O build atual registra somente `MeshTransport`, portanto não anuncia nem tenta
+usar um SFU inexistente. A tela de diagnóstico informa quando SFU seria o
+transporte recomendado. Uma integração futura adiciona seu creator ao registro;
+não precisa alterar os controladores de microfone, câmera, tela ou DataChannel.
+SDP, ICE e Perfect Negotiation permanecem na extensão `MeshCallTransport` e são
+ignorados por implementações SFU.
+
+A camada de aplicação da chamada também é composta por responsabilidades
+independentes. `apps/web/src/call.ts` é apenas a fachada pública; o fluxo de
+sessão permanece em `CallController`, enquanto `CallSession` invalida operações
+assíncronas antigas, `MediaManager` controla microfone/câmera/tela,
+`ParticipantManager` atualiza os peers remotos, `AuthenticationManager` valida
+challenge/proof ECDSA, `ConnectionRecovery` acompanha falhas por peer e
+`CallDiagnostics` consolida as métricas. Os adapters específicos ficam em
+`call/media`, `call/auth` e `call/signaling`.
+
 O transporte implementa:
 
 - Perfect Negotiation;
@@ -81,21 +126,50 @@ O transporte implementa:
 - limite de peers;
 - backpressure simples de DataChannel;
 - limpeza de tracks, peer connections e callbacks;
-- diagnóstico sem expor SDP ou credenciais completas.
+- diagnóstico sem expor SDP ou credenciais completas;
 - autorização de mídia por peer;
 - ICE restart após desconexão prolongada;
 - bitrate de vídeo adaptado à quantidade de peers;
 - métricas locais de RTT, jitter, perda e bitrate.
+- política de rota persistente para automático, internet direta ou VPN privada;
+- aplicação da política em candidates trickle e candidates já presentes no SDP.
+
+`packages/rtc/src/index.ts` é somente o barrel da API pública. A implementação
+está dividida entre `transport/` (contratos, Mesh, seleção, peer, negociação e
+ICE), `media/` (áudio, vídeo, dispositivos e tela), `data/` (mensagens e
+arquivos) e `diagnostics/` (estatísticas e qualidade). Os caminhos públicos
+antigos dos utilitários de arquivo continuam exportados por compatibilidade.
 
 ## Chat P2P
 
 O chat negocia um DataChannel ordenado usando o mesmo modelo de signaling. Mensagens trafegam diretamente pelo WebRTC.
 
-Mensagens versão 2 são assinadas pela identidade ECDSA permanente. Antes de aceitar conteúdo ou histórico, os peers concluem um desafio bilateral e conferem a chave pública com a lista local de membros/amigos. Até oito canais locais podem manter sessões leves em segundo plano para não lidas e notificações.
+`apps/web/src/chat.ts` é somente a fachada compatível. `chat/ChatController.ts`
+orquestra a sessão e o signaling, enquanto `MessageProtocol` valida e serializa
+os envelopes, `MessageService` cuida de mensagens locais, `OutboxService` de
+ACK/reenvio, `HistoryService` da paginação entre peers, `SyncService` do
+handshake de identidade, `GroupChatService` dos manifestos e revogações, e
+`AttachmentService` adapta transferências ao ciclo de vida do chat. Assim novos
+tipos de mensagem podem evoluir no protocolo sem devolver persistência, grupos e
+transferências para dentro do controller.
+
+Mensagens versão 2 são assinadas pela identidade ECDSA permanente. Respostas,
+edições, exclusões, reações e fixações são eventos versão 3 assinados e
+persistidos separadamente da mensagem original; isso conserva a assinatura do
+conteúdo base e permite refazer a projeção após uma reconexão. O indicador de
+digitação é efêmero e nunca entra no histórico. Antes de aceitar conteúdo ou
+histórico, os peers concluem um desafio bilateral e conferem a chave pública com
+a lista local de membros/amigos. Até oito canais locais podem manter sessões
+leves em segundo plano para não lidas e notificações.
 
 O proprietário e administradores autorizados podem assinar snapshots de membership. Cada administrador possui uma delegação ECDSA assinada pelo proprietário para um `administratorEpoch`; ao mudar cargos, o proprietário avança o epoch e renova todas as delegações restantes. O certificado de remoção inclui essa cadeia, portanto um peer atrasado consegue verificar a autoridade sem confiar cegamente no snapshot atual. Revisões usam versão, autor e ID de operação para desempatar edições concorrentes. Remoções são *remove-wins*, rotacionam o segredo efêmero de rendezvous do grupo e produzem um certificado retransmissível. Uma identidade revogada abre apenas o caminho restrito necessário para receber esse certificado: histórico, outbox, anexos e mídia permanecem bloqueados.
 
-Antes de autorizar DataChannel ou mídia, os peers anunciam versão do aplicativo e versões dos protocolos de chamada, chat e manifesto. Versões incompatíveis são recusadas com diagnóstico explícito, em vez de falharem silenciosamente durante SDP/ICE.
+Antes de autorizar DataChannel ou mídia, os peers anunciam versão do aplicativo,
+versões dos protocolos de chamada, chat e manifesto e capacidades granulares
+como `chat-events-v1`, `files-v2`, `screen-audio` e `rnnoise`. A geração principal
+e os protocolos base determinam compatibilidade; recursos opcionais são enviados
+somente quando os dois lados os anunciam. Assim versões Alpha menores diferentes
+podem continuar trocando texto sem interpretar envelopes que não suportam.
 
 Nesta fase Alpha, cada grupo aceita no máximo 48 membros ativos e conserva até 48 certificados de revogação. Uma chave revogada não pode ser readmitida no mesmo grupo: o retorno exige uma nova identidade P2P. O monitor de atividade acompanha até 32 grupos e o cliente mantém até oito chats autenticados em segundo plano.
 
@@ -116,12 +190,25 @@ Após conexão WebRTC, as mensagens de convite usam ECDSA P-256 e ACK bilateral:
 
 O sidecar local não deve possuir `TURN_SECRET` de um relay público. Qualquer segredo permanente distribuído dentro do aplicativo pode ser extraído.
 
-Para redes em que conexão direta/STUN falha, o Risk deve usar:
+Para redes em que conexão direta/STUN falha, o Risk usa um emissor remoto de
+credenciais temporárias configurado por `VITE_TURN_CREDENTIALS_URL`:
 
-- serviço TURN gerenciado; ou
-- um emissor remoto mínimo de credenciais TURN temporárias.
+```text
+Risk ── HTTPS ──> emissor de credenciais ── TURN_SECRET ──> Coturn
+  │                      │
+  │                      └── username com expiração + HMAC-SHA1
+  └── recebe somente URLs e credenciais válidas por até uma hora
+```
 
-Esse serviço não precisa armazenar amigos, mensagens ou grupos.
+O cliente aceita respostas compactas ou `iceServers`, valida esquemas, tamanho,
+TTL e consistência das credenciais, usa `cache: no-store` e conserva o resultado
+somente em memória. Tokens de sessão local não são enviados ao emissor público.
+Instalações autenticadas podem enviar seu bearer; instalações P2P podem usar um
+endpoint explicitamente público e protegido por rate limit.
+
+O Coturn de produção aceita TURN/UDP e TURN/TCP em `3478`, TURN/TLS em `5349` e
+TURN/TLS em `443`. O segredo REST, o IP externo e os caminhos dos certificados
+são injetados no host e não entram no repositório ou no pacote Electron.
 
 Sem uma URL `turn:`/`turns:` válida, o produto se declara `Somente STUN`; ele não promete conectividade universal e orienta o usuário quando ICE falha por NAT/CGNAT/firewall.
 
@@ -140,7 +227,17 @@ O processo desktop usa:
 - single-instance lock;
 - sidecar iniciado antes da UI ficar disponível.
 
-Se o sidecar encerrar depois do readiness, o processo principal faz uma única tentativa controlada de reinício, renova o endpoint/token de loopback e notifica o renderer. Se o renderer falhar, a janela tenta uma recarga; erros React restantes caem em uma tela de recuperação com relatório sanitizado.
+`main.ts` é o composition root do processo principal. Janela, tray, protocolo,
+GPU/VM, sidecar, permissões, captura de tela e IPC vivem em módulos próprios.
+Isso mantém explícitas as mesmas verificações de origem e opções seguras do
+`BrowserWindow` sem concentrar o ciclo completo em um arquivo.
+
+Se o sidecar encerrar depois do readiness, o gerenciador faz até três tentativas
+controladas, renova o endpoint/token de loopback e notifica o renderer. Após 30
+segundos estáveis o orçamento de tentativas é restaurado, permitindo recuperar
+uma nova queda durante a mesma execução. Se o renderer falhar, a janela tenta
+uma recarga; erros React restantes caem em uma tela de recuperação com relatório
+sanitizado.
 
 ## Empacotamento
 

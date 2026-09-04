@@ -22,8 +22,14 @@ export function configuredIceServers(raw = import.meta.env.VITE_ICE_SERVERS_JSON
   if (!Array.isArray(value) || value.length === 0) {
     throw new Error("VITE_ICE_SERVERS_JSON precisa ser um array não vazio de servidores ICE.");
   }
-  const servers = value.map(validateIceServer);
-  return servers;
+  return validateIceServers(value);
+}
+
+export function validateIceServers(value: unknown): RTCIceServer[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 12) {
+    throw new Error("A configuração ICE precisa ter entre 1 e 12 servidores.");
+  }
+  return value.map(validateIceServer);
 }
 
 export function resolveStaticIceConfiguration(raw = import.meta.env.VITE_ICE_SERVERS_JSON): ResolvedIceConfiguration {
@@ -38,7 +44,7 @@ function validateIceServer(value: unknown): RTCIceServer {
   const urls = normalizeUrls(item.urls);
   const username = typeof item.username === "string" ? item.username : undefined;
   const credential = typeof item.credential === "string" ? item.credential : undefined;
-  if (urls.some((url) => url.startsWith("turn:") || url.startsWith("turns:"))) {
+  if (urls.some((url) => /^turns?:/i.test(url))) {
     if (!username || !credential) {
       throw new Error("Servidores TURN configurados no frontend precisam de username e credential.");
     }
@@ -47,12 +53,13 @@ function validateIceServer(value: unknown): RTCIceServer {
 }
 
 function normalizeUrls(value: unknown): string[] {
-  const urls = typeof value === "string"
+  const rawUrls = typeof value === "string"
     ? [value]
     : Array.isArray(value) && value.every((entry) => typeof entry === "string")
       ? value
       : null;
-  if (!urls?.length || urls.some((url) => !/^(stun|stuns|turn|turns):/i.test(url))) {
+  const urls = rawUrls?.map((url) => url.trim());
+  if (!urls?.length || urls.length > 12 || urls.some((url) => url.length > 512 || !/^(stun|stuns|turn|turns):/i.test(url))) {
     throw new Error("Servidor ICE precisa usar URL stun:, stuns:, turn: ou turns:.");
   }
   return urls;

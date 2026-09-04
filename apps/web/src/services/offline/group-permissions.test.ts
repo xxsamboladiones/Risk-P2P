@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { bytesToBase64Url } from "../../chat/MessageProtocol";
 import {
   canManageLocalGroup,
+  canonicalGroupRevocation,
   compareGroupManifestRevisions,
   createGroupAdministratorGrant,
   createGroupRevocationCertificate,
@@ -183,6 +185,57 @@ describe("permissões de grupo local", () => {
     expect(merged.administratorPeerIds).toEqual([]);
   });
 
+  it("não permite que um manifesto de administrador remova o dono ou outro administrador", () => {
+    const owner = peer("owner_12345678", "Proprietário", "owner");
+    const adminA = peer("admin_a12345678", "Admin A", "admin-a");
+    const adminB = peer("admin_b12345678", "Admin B", "admin-b");
+    const current: LocalGroup = {
+      ...group,
+      ownerPeerId: owner.peerId,
+      members: [owner, adminA, adminB],
+      administratorPeerIds: [adminA.peerId, adminB.peerId],
+      joinedAt: 1,
+      administratorEpoch: 1,
+      revocations: [],
+    };
+    for (const protectedPeerId of [owner.peerId, adminB.peerId]) {
+      const malicious: LocalGroup = {
+        ...current,
+        members: current.members.filter((member) => member.peerId !== protectedPeerId),
+        removedPeerIds: [protectedPeerId],
+        manifestVersion: 2,
+        manifestActorPeerId: adminA.peerId,
+        manifestOperationId: `remove_${protectedPeerId}`,
+      };
+      expect(resolveLocalGroupManifest(current, malicious, adminA.peerId)).toBe(current);
+    }
+  });
+
+  it("não aceita uma remoção nova sem certificado mesmo quando o manifesto vem do dono", () => {
+    const owner = peer("owner_12345678", "Proprietário", "owner");
+    const member = peer("member_12345678", "Membro", "member");
+    const current: LocalGroup = {
+      ...group,
+      ownerPeerId: owner.peerId,
+      members: [owner, member],
+      joinedAt: 1,
+      manifestActorPeerId: owner.peerId,
+      manifestOperationId: "operation_before_12345678",
+      revocations: [],
+    };
+    const unsignedRemoval: LocalGroup = {
+      ...current,
+      members: [owner],
+      removedPeerIds: [member.peerId],
+      removedMembers: [member],
+      membershipVersion: 2,
+      manifestVersion: 2,
+      manifestOperationId: "operation_after_12345678",
+    };
+
+    expect(resolveLocalGroupManifest(current, unsignedRemoval, owner.peerId)).toBe(current);
+  });
+
   it("converge para o rendezvous rotacionado do proprietário", () => {
     const owner = peer("owner_12345678", "Proprietário", "owner");
     const current: LocalGroup = {
@@ -230,6 +283,73 @@ describe("permissões de grupo local", () => {
     expect(await verifyGroupRevocationCertificate({ ...certificate, targetPeerId: "tampered_12345678" }, localGroup)).toBe(false);
   });
 
+  it("recusa revogar o proprietário tanto na criação quanto na verificação", async () => {
+    const owner = await createIdentity("owner_12345678", "Proprietário");
+    const administrator = await createIdentity("admin_12345678", "Administrador");
+    const localGroup: LocalGroup = {
+      ...group,
+      ownerPeerId: owner.peerId,
+      members: [owner, administrator],
+      administratorPeerIds: [administrator.peerId],
+      joinedAt: Date.now(),
+      manifestActorPeerId: owner.peerId,
+      manifestOperationId: "owner_protection_12345678",
+      administratorEpoch: 1,
+      revocations: [],
+    };
+    const grant = await createGroupAdministratorGrant(localGroup, administrator, owner, 1);
+    localGroup.administratorGrants = [grant];
+
+    await expect(createGroupRevocationCertificate(localGroup, owner, administrator, 2))
+      .rejects.toThrow("proprietário");
+
+    const unsigned = {
+      version: 1 as const,
+      groupId: localGroup.groupId,
+      targetPeerId: owner.peerId,
+      targetPublicKey: owner.publicKey,
+      issuerPeerId: administrator.peerId,
+      membershipVersion: 2,
+      administratorEpoch: 1,
+      administratorGrant: grant,
+      messageId: "malicious_owner_revocation_12345678",
+      timestamp: Date.now(),
+    };
+    const signature = await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" },
+      administrator.privateKey,
+      new TextEncoder().encode(canonicalGroupRevocation(unsigned)),
+    );
+    expect(await verifyGroupRevocationCertificate({
+      ...unsigned,
+      signature: bytesToBase64Url(new Uint8Array(signature)),
+    }, localGroup)).toBe(false);
+  });
+
+  it("impede um administrador de revogar outro administrador", async () => {
+    const owner = await createIdentity("owner_12345678", "Proprietário");
+    const administrator = await createIdentity("admin_12345678", "Administrador");
+    const otherAdministrator = await createIdentity("admin_other_12345678", "Outro administrador");
+    const localGroup: LocalGroup = {
+      ...group,
+      ownerPeerId: owner.peerId,
+      members: [owner, administrator, otherAdministrator],
+      administratorPeerIds: [administrator.peerId, otherAdministrator.peerId],
+      joinedAt: Date.now(),
+      manifestActorPeerId: owner.peerId,
+      manifestOperationId: "admin_protection_12345678",
+      administratorEpoch: 2,
+      revocations: [],
+    };
+    localGroup.administratorGrants = [
+      await createGroupAdministratorGrant(localGroup, administrator, owner, 2),
+      await createGroupAdministratorGrant(localGroup, otherAdministrator, owner, 2),
+    ];
+
+    await expect(createGroupRevocationCertificate(localGroup, otherAdministrator, administrator, 2))
+      .rejects.toThrow("Somente o proprietário");
+  });
+
   it("aceita a revogação de um administrador somente no epoch em que ele estava autorizado", async () => {
     const owner = await createIdentity("owner_12345678", "Proprietário");
     const administrator = await createIdentity("admin_12345678", "Administrador");
@@ -256,12 +376,14 @@ describe("permissões de grupo local", () => {
       administratorGrants: [],
       administratorEpoch: 1,
     })).toBe(true);
-    expect(await verifyGroupRevocationCertificate(certificate, {
+    const laterEpoch = {
       ...authorized,
       administratorPeerIds: [],
       administratorGrants: [],
       administratorEpoch: 3,
-    })).toBe(false);
+    };
+    expect(await verifyGroupRevocationCertificate(certificate, laterEpoch)).toBe(false);
+    expect(await verifyGroupRevocationCertificate(certificate, laterEpoch, true)).toBe(true);
     expect(await verifyGroupRevocationCertificate({
       ...certificate,
       administratorGrant: { ...administratorGrant, administratorPublicKey: member.publicKey },

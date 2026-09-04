@@ -9,12 +9,12 @@ services:
 
   coturn:
     profiles: ["relay"]
-    image: coturn/coturn:4.6-alpine
+    image: coturn/coturn:4.17.0-alpine
     ports:
       - "3478:3478/tcp"
       - "3478:3478/udp"
       - "49160-49200:49160-49200/udp"
-    volumes: ["./infrastructure/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro"]
+    volumes: ["./infrastructure/coturn/turnserver.dev.conf:/etc/coturn/turnserver.conf:ro"]
     command: ["-c", "/etc/coturn/turnserver.conf", "--static-auth-secret=${TURN_SECRET:?Defina TURN_SECRET no arquivo .env}"]
 
   backend:

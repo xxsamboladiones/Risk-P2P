@@ -38,6 +38,8 @@ export type SignalingDiagnostics = {
   connectedPeers: string[];
   presencePeers: string[];
   processedMessages: number;
+  clockSkewMs: number | null;
+  clockSkewRejectedMessages: number;
 };
 
 export interface SignalingProvider {

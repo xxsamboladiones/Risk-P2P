@@ -78,7 +78,7 @@ export type InviteDependencies = {
     peerId: string,
     iceServers: RTCIceServer[],
     events: TransportEvents,
-  ): InviteTransport;
+  ): InviteTransport | Promise<InviteTransport>;
   now(): number;
   setTimer(callback: () => void, delay: number): ReturnType<typeof setTimeout>;
   clearTimer(timer: ReturnType<typeof setTimeout>): void;
@@ -209,41 +209,40 @@ export class InviteService {
     this.request = undefined;
     this.requestId = undefined;
     this.emitState();
-    this.localPeerId = crypto.randomUUID();
-    this.signaling = this.dependencies.createSignaling();
-    this.transport = this.dependencies.createTransport(
-      this.localPeerId,
-      this.iceServers,
-      this.transportEvents(),
-    );
-    this.bindSignaling();
-    const rendezvous = await deriveInviteRendezvousId(type, code);
-
     try {
+      this.localPeerId = crypto.randomUUID();
+      this.signaling = this.dependencies.createSignaling();
+      this.transport = await this.dependencies.createTransport(
+        this.localPeerId,
+        this.iceServers,
+        this.transportEvents(),
+      );
+      this.bindSignaling();
+      const rendezvous = await deriveInviteRendezvousId(type, code);
       await this.signaling.connect(rendezvous, this.localPeerId, type);
+
+      this.expiryTimer = this.dependencies.setTimer(() => {
+        if (!this.snapshot || isTerminalStatus(this.snapshot.status)) return;
+        this.update("expired", "Convite expirado");
+        void this.cleanup();
+      }, ttlMs);
+
+      if (role === "joiner") {
+        this.availabilityTimer = this.dependencies.setTimer(() => {
+          if (!this.candidatePeerId && this.snapshot?.status === "connecting") {
+            this.update("error", "Convite não encontrado, expirado ou o criador está offline.");
+            void this.cleanup();
+          }
+        }, Math.min(12_000, ttlMs));
+      }
+
+      this.reconcilePresentCandidates();
+      return this.snapshot;
     } catch (error) {
-      this.update("error", "Não foi possível conectar ao serviço de convites.");
+      this.update("error", "Não foi possível iniciar o serviço de convites.");
       await this.cleanup();
       throw error;
     }
-
-    this.expiryTimer = this.dependencies.setTimer(() => {
-      if (!this.snapshot || isTerminalStatus(this.snapshot.status)) return;
-      this.update("expired", "Convite expirado");
-      void this.cleanup();
-    }, ttlMs);
-
-    if (role === "joiner") {
-      this.availabilityTimer = this.dependencies.setTimer(() => {
-        if (!this.candidatePeerId && this.snapshot?.status === "connecting") {
-          this.update("error", "Convite não encontrado, expirado ou o criador está offline.");
-          void this.cleanup();
-        }
-      }, Math.min(12_000, ttlMs));
-    }
-
-    this.reconcilePresentCandidates();
-    return this.snapshot;
   }
 
   private bindSignaling(): void {

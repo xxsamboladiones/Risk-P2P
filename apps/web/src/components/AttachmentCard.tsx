@@ -94,16 +94,17 @@ export function AttachmentCard(props: AttachmentCardProps) {
     {(activeTransfer || record.state === "paused") && <div className="attachment-progress">
       <div><i style={{ width: `${Math.max(0, Math.min(100, percent))}%` }}/></div>
       <span>{formatBytes(record.bytesTransferred)} / {formatBytes(record.totalBytes)}</span>
-      <span>{speed > 0 ? `${formatBytes(speed)}/s` : "Aguardando dados"}{eta && Number.isFinite(eta) ? ` · ${formatEta(eta)}` : ""}</span>
+      <span>{record.state === "paused" ? "Pausado" : speed > 0 ? `${formatBytes(speed)}/s` : "Aguardando dados"}{record.state !== "paused" && eta && Number.isFinite(eta) ? ` · ${formatEta(eta)}` : ""}</span>
     </div>}
 
     {record.lastError && <div className="attachment-error">{record.lastError}</div>}
     <div className="attachment-actions">
       {record.state === "waiting" && <button disabled={!connected} onClick={() => void props.onRequest(record)}><Download size={15}/> Baixar</button>}
+      {record.state === "cancelled" && record.direction === "incoming" && <button disabled={!connected} onClick={() => void props.onRequest(record)}><RotateCcw size={15}/> Baixar novamente</button>}
       {record.state === "paused" && <button disabled={!connected} onClick={() => void props.onResume(record)}><Play size={15}/> Retomar</button>}
       {activeTransfer && record.state !== "verifying" && <button onClick={() => void props.onPause(record)}><Pause size={15}/> Pausar</button>}
       {record.state === "failed" && <button disabled={!connected} onClick={() => void props.onResume(record)}><RotateCcw size={15}/> Tentar novamente</button>}
-      {activeTransfer && <button className="danger" onClick={() => void props.onCancel(record)}><X size={15}/> Cancelar</button>}
+      {(activeTransfer || record.state === "paused") && <button className="danger" onClick={() => void props.onCancel(record)}><X size={15}/> Cancelar</button>}
       {downloadable && <button onClick={() => void props.onDownload(record)}><Download size={15}/> Salvar arquivo</button>}
     </div>
   </div>;

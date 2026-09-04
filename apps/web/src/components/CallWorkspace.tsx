@@ -18,8 +18,8 @@ import {
   VolumeX,
   X,
 } from "lucide-react";
-import type { ChatMessage } from "../api";
-import { api } from "../api";
+import type { ChatMessage } from "../application/contracts";
+import { useRiskApplication } from "../application/ApplicationContext";
 import type { CallController, CallDiagnostics } from "../call";
 import type {
   ChatAttachmentProgress,
@@ -30,6 +30,7 @@ import type {
 import { loadLocalGroups } from "../services/offline/social-storage";
 import { incompatiblePeerMessage } from "../services/protocol-compatibility";
 import { observeVoiceActivity } from "../services/audio/voice-activity";
+import { networkPreferenceLabel } from "../services/network/settings";
 import {
   isScreenQuality,
   SCREEN_QUALITY_PROFILES as QUALITY_PROFILES,
@@ -316,6 +317,7 @@ function ScreenSourcePicker({
 }
 
 export function CallWorkspace({ call, chat, onMinimize }: { call: CallController; chat: ChatController; onMinimize(): void }) {
+  const { gateway: api } = useRiskApplication();
   const token = useCallStore((state) => state.token)!;
   const roomId = useCallStore((state) => state.roomId)!;
   const callContext = useCallStore((state) => state.callContext);
@@ -343,6 +345,8 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
   const [deafened, setDeafened] = useState(false);
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [diagnostics, setDiagnostics] = useState<CallDiagnostics | null>(null);
+  const [replyingTo, setReplyingTo] = useState<ChatMessage | null>(null);
+  const [typingUsers, setTypingUsers] = useState<string[]>([]);
 
   const context = callContext;
 
@@ -404,10 +408,17 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
     }
     let alive = true;
     const offMessage = chat.onMessage((message) => {
-      if (!alive) return;
-      setMessages((current) => current.some((item) => item.id === message.id)
-        ? current
-        : [...current, message].sort((left, right) => left.createdAt.localeCompare(right.createdAt)));
+      if (!alive || message.channelId !== channelId) return;
+      setMessages((current) => {
+        const index = current.findIndex((item) => item.id === message.id);
+        if (index < 0) return [...current, message].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+        const next = [...current];
+        next[index] = message;
+        return next;
+      });
+    });
+    const offTyping = chat.onTyping((participants) => {
+      if (alive) setTypingUsers(participants.map((participant) => participant.displayName));
     });
     const offStatus = chat.onStatus((status) => {
       if (!alive) return;
@@ -443,9 +454,12 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
     return () => {
       alive = false;
       offMessage();
+      offTyping();
       offStatus();
       offAttachment();
       offProgress();
+      setReplyingTo(null);
+      setTypingUsers([]);
       void chat.disconnect();
     };
   }, [chat, context?.displayName, context?.textChannelId, setError, token]);
@@ -525,8 +539,10 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
     const content = input.value.trim();
     if (!content) return;
     try {
-      await chat.send(content);
+      await chat.send(content, replyingTo ? { replyToId: replyingTo.id } : {});
       input.value = "";
+      chat.setTyping(false);
+      setReplyingTo(null);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Falha ao enviar mensagem.");
     }
@@ -545,6 +561,11 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
     catch (cause) { setError(cause instanceof Error ? cause.message : "Falha na operação com o arquivo."); }
   }
 
+  async function messageAction(action: () => Promise<void>, fallback: string): Promise<void> {
+    try { await action(); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : fallback); }
+  }
+
   const focused = focusedTile && tileIds.includes(focusedTile) ? focusedTile : null;
   const responsiveGrid = responsiveCallGrid(tileIds.length);
   const stageStyle = {
@@ -558,12 +579,19 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
     attachments={attachments}
     progress={attachmentProgress}
     connected={chatStatus === "ready"}
+    localPeerId={chat.localPeerId()}
+    typingUsers={typingUsers}
     loadBlob={(record) => chat.attachmentBlob(record)}
     onDownload={(record) => attachmentAction((item) => chat.downloadAttachment(item), record)}
     onRequest={(record) => attachmentAction((item) => chat.requestAttachment(item), record)}
     onPause={(record) => attachmentAction((item) => chat.pauseAttachment(item), record)}
     onResume={(record) => attachmentAction((item) => chat.resumeAttachment(item), record)}
     onCancel={(record) => attachmentAction((item) => chat.cancelAttachment(item), record)}
+    onReply={setReplyingTo}
+    onEdit={(message, content) => messageAction(() => chat.editMessage(message.id, content), "Falha ao editar a mensagem.")}
+    onDelete={(message) => messageAction(() => chat.deleteMessage(message.id), "Falha ao excluir a mensagem.")}
+    onReaction={(message, emoji, active) => messageAction(() => chat.setReaction(message.id, emoji, active), "Falha ao reagir à mensagem.")}
+    onPin={(message, pinned) => messageAction(() => chat.setPinned(message.id, pinned), "Falha ao fixar a mensagem.")}
   />;
 
   return <main className="room call-workspace">
@@ -655,6 +683,10 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
         canAttach={chatStatus === "ready"}
         onSubmit={submitMessage}
         onFiles={sendFiles}
+        replyingTo={replyingTo}
+        onCancelReply={() => setReplyingTo(null)}
+        onTyping={(active) => chat.setTyping(active)}
+        mentionCandidates={[context?.displayName ?? "", ...peers.map((peer) => peer.displayName)]}
       />
     </section>
 
@@ -694,7 +726,17 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
       <p>Signaling: <b>{diagnostics?.signaling?.status ?? "indisponível"}</b></p>
       <p>Canal Supabase: <b>{diagnostics?.signaling?.channelStatus ?? "indisponível"}</b></p>
       <p>Peers presentes: <b>{diagnostics?.signaling?.presencePeers.length ?? 0}</b></p>
+      <p>Transporte: <b>{diagnostics?.transport.label ?? "verificando"}</b></p>
+      {diagnostics?.transport.migrationRecommended && <p>
+        Mudança de topologia recomendada: <b>{diagnostics.transport.active?.toUpperCase()} → {diagnostics.transport.selected.toUpperCase()}</b>
+      </p>}
+      {diagnostics?.signaling?.clockSkewMs !== null && diagnostics?.signaling?.clockSkewMs !== undefined && <p>
+        Diferença de relógio: <b>{Math.round(Math.abs(diagnostics.signaling.clockSkewMs) / 1_000)}s ({diagnostics.signaling.clockSkewMs > 0 ? "peer adiantado" : "peer atrasado"})</b>
+        {diagnostics.signaling.clockSkewRejectedMessages > 0 ? ` · ${diagnostics.signaling.clockSkewRejectedMessages} mensagens rejeitadas` : ""}
+      </p>}
       <p>Conectividade: <b>{diagnostics?.connectivity.label ?? "verificando"}</b></p>
+      <p>Preferência de rede: <b>{diagnostics ? networkPreferenceLabel(diagnostics.network.preference) : "verificando"}</b></p>
+      <p>VPN local: <b>{diagnostics?.network.vpnProviders.length ? diagnostics.network.vpnProviders.map((provider) => provider === "zerotier" ? "ZeroTier" : provider === "tailscale" ? "Tailscale" : provider === "wireguard" ? "WireGuard" : "VPN").join(", ") : "não detectada"}</b></p>
       {(diagnostics?.peerConnections ?? []).map((peer) => {
         const path = peer.selectedConnectionPath;
         const routeLabel = path.kind === "unknown" && ["new", "connecting"].includes(peer.connectionState)

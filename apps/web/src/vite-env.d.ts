@@ -6,6 +6,7 @@ interface ImportMetaEnv {
   readonly VITE_SUPABASE_ANON_KEY?: string;
   readonly VITE_DEBUG_SIGNALING?: string;
   readonly VITE_ICE_SERVERS_JSON?: string;
+  readonly VITE_TURN_CREDENTIALS_URL?: string;
   readonly VITE_RISK_APP_VERSION?: string;
 }
 
@@ -47,6 +48,7 @@ interface Window {
     setWindowFullscreen(enabled: boolean): Promise<{ fullscreen: boolean }>;
     getBackendConfig(): Promise<RiskDesktopBackendConfig>;
     getNetworkInterfaces(): Promise<RiskDesktopNetworkInterface[]>;
+    openExternal(url: string): Promise<void>;
     onBackendStatus(callback: (status: RiskDesktopBackendStatus) => void): () => void;
   };
 }

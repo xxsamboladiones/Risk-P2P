@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { api } from "../api";
+import { useRiskApplication } from "../application/ApplicationContext";
 import {
   ensureLocalGroup,
   getOrCreateLocalIdentity,
@@ -29,6 +29,7 @@ export function GroupInvitePanel({
   preferredGroupChannels?: LocalGroupChannel[];
   onComplete?(): void;
 }) {
+  const { gateway: api } = useRiskApplication();
   const [groups, setGroups] = useState<LocalGroup[]>([]);
   const preferredMetadata = useMemo<PublicGroupMetadata | undefined>(() => groups.find((group) => group.groupId === preferredGroupId), [groups, preferredGroupId]);
   const [selectedId, setSelectedId] = useState(preferredGroupId ?? "");

@@ -21,6 +21,7 @@ export type AttachmentTransferSenderOptions = {
   retryDelayMs?: number;
   getBufferedAmount?: (peerId: string) => number;
   waitForBufferedAmountLow?: (peerId: string) => Promise<void>;
+  waitForPendingData?: (peerId: string) => Promise<void>;
 };
 
 export type TransferSource = Blob & { name?: string; type: string; lastModified?: number };
@@ -246,7 +247,8 @@ export class AttachmentTransferSender extends EventTarget {
   private async run(transfer: QueuedTransfer): Promise<void> {
     transfer.startedAt ??= new Date().toISOString();
     await this.sendControl(transfer.peerId, { type: "file.manifest", transferId: transfer.transferId, manifest: transfer.manifest });
-    this.emitProgress(transfer, "transferring");
+    if (transfer.cancelled) return;
+    this.emitProgress(transfer, transfer.paused ? "paused" : "transferring");
 
     try {
       for await (const frame of iterateAttachmentChunks(transfer.source, transfer.manifest, transfer.missingChunks)) {
@@ -254,11 +256,15 @@ export class AttachmentTransferSender extends EventTarget {
         while (transfer.paused) await delay(100);
         if (transfer.cancelled) return;
         await this.applyBackpressure(transfer.peerId);
+        if (transfer.cancelled) return;
         frame.transferId = transfer.transferId;
-        await this.sendWithRetry(transfer, frame);
+        if (!(await this.sendWithRetry(transfer, frame))) return;
         transfer.bytesTransferred = Math.min(transfer.manifest.size, transfer.bytesTransferred + frame.size);
-        this.emitProgress(transfer, "transferring");
+        if (transfer.cancelled) return;
+        this.emitProgress(transfer, transfer.paused ? "paused" : "transferring");
       }
+      if (transfer.cancelled) return;
+      await this.options.waitForPendingData?.(transfer.peerId);
       if (transfer.cancelled) return;
       transfer.awaitingVerification = true;
       this.emitProgress(transfer, "verifying");
@@ -280,11 +286,14 @@ export class AttachmentTransferSender extends EventTarget {
     }
   }
 
-  private async sendWithRetry(transfer: QueuedTransfer, frame: AttachmentChunkFrame): Promise<void> {
+  private async sendWithRetry(transfer: QueuedTransfer, frame: AttachmentChunkFrame): Promise<boolean> {
     for (;;) {
+      if (transfer.cancelled) return false;
+      while (transfer.paused) await delay(100);
+      if (transfer.cancelled) return false;
       try {
         await this.sendChunk(transfer.peerId, frame);
-        return;
+        return true;
       } catch (error) {
         transfer.retryCount += 1;
         if (transfer.retryCount > this.retryLimit) throw error;

@@ -20,6 +20,7 @@ describe("configuração ICE local", () => {
 
   it("rejeita TURN sem credenciais e protocolos inválidos", () => {
     expect(() => configuredIceServers('[{"urls":"turn:example.test:3478"}]')).toThrow(/username/);
+    expect(() => configuredIceServers('[{"urls":"TURN:example.test:3478"}]')).toThrow(/username/);
     expect(() => configuredIceServers('[{"urls":"https://example.test"}]')).toThrow(/stun/);
   });
 });

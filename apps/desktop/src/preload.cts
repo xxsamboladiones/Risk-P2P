@@ -232,6 +232,7 @@ contextBridge.exposeInMainWorld("desktop", {
   setWindowFullscreen: (enabled: boolean): Promise<{ fullscreen: boolean }> => ipcRenderer.invoke("window:fullscreen", enabled),
   getBackendConfig: (): Promise<DesktopBackendConfig> => ipcRenderer.invoke("backend:config"),
   getNetworkInterfaces: (): Promise<DesktopNetworkInterface[]> => ipcRenderer.invoke("network:interfaces"),
+  openExternal: (url: string): Promise<void> => ipcRenderer.invoke("shell:open-external", url),
   onBackendStatus: (callback: (status: DesktopBackendStatus) => void): (() => void) => {
     const listener = (_event: Electron.IpcRendererEvent, status: DesktopBackendStatus) => callback(status);
     ipcRenderer.on("backend:status", listener);

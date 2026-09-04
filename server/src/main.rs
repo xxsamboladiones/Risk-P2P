@@ -6,7 +6,7 @@ use argon2::{
     Argon2,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -27,6 +27,7 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::{
     collections::HashMap,
     env,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration as StdDuration, Instant},
 };
@@ -41,16 +42,30 @@ use uuid::Uuid;
 const DEFAULT_ACCESS_TOKEN_TTL_SECONDS: i64 = 15 * 60;
 const LOGIN_WINDOW: StdDuration = StdDuration::from_secs(10 * 60);
 const MAX_LOGIN_ATTEMPTS: u32 = 10;
+const TURN_REQUEST_WINDOW: StdDuration = StdDuration::from_secs(60);
+const DEFAULT_TURN_CREDENTIAL_TTL_SECONDS: i64 = 60 * 60;
+const DEFAULT_TURN_REQUESTS_PER_MINUTE: u32 = 30;
 
 #[derive(Clone)]
 struct Config {
     jwt: String,
-    turn_host: String,
-    turn_port: u16,
-    turn_secret: String,
+    turn: TurnConfig,
     refresh_days: i64,
     access_token_ttl_seconds: i64,
     cookie_secure: bool,
+}
+
+#[derive(Clone)]
+struct TurnConfig {
+    host: String,
+    port: u16,
+    tls_port: Option<u16>,
+    tls_alt_port: Option<u16>,
+    secret: String,
+    credential_ttl_seconds: i64,
+    allow_unauthenticated: bool,
+    trust_proxy_headers: bool,
+    requests_per_minute: u32,
 }
 
 #[derive(Clone)]
@@ -58,6 +73,7 @@ struct AppState {
     db: PgPool,
     config: Config,
     login_attempts: Arc<Mutex<HashMap<String, LoginWindow>>>,
+    turn_attempts: Arc<Mutex<HashMap<IpAddr, LoginWindow>>>,
 }
 
 struct LoginWindow {
@@ -132,6 +148,26 @@ struct TokenResponse {
     access_token: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnCredentialsResponse {
+    ice_servers: Vec<TurnIceServer>,
+    username: String,
+    credential: String,
+    ttl: i64,
+    expires_at: i64,
+    urls: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TurnIceServer {
+    urls: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential: Option<String>,
+}
+
 type AuthResponse = (HeaderMap, Json<TokenResponse>);
 
 #[derive(Debug, thiserror::Error)]
@@ -175,10 +211,7 @@ async fn main() -> anyhow::Result<()> {
     if jwt.len() < 32 {
         anyhow::bail!("JWT_SECRET deve ter ao menos 32 caracteres");
     }
-    let turn_secret = env::var("TURN_SECRET")?;
-    if turn_secret.len() < 16 {
-        anyhow::bail!("TURN_SECRET deve ter ao menos 16 caracteres");
-    }
+    let turn = load_turn_config()?;
 
     let db = PgPoolOptions::new()
         .max_connections(20)
@@ -188,12 +221,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config {
         jwt,
-        turn_host: env::var("TURN_HOST").unwrap_or_else(|_| "localhost".into()),
-        turn_port: env::var("TURN_PORT")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(3478),
-        turn_secret,
+        turn,
         refresh_days: env::var("REFRESH_TOKEN_TTL_DAYS")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -216,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         config,
         login_attempts: Arc::new(Mutex::new(HashMap::new())),
+        turn_attempts: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app = Router::new()
@@ -260,7 +289,11 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
     tracing::info!("listening on 8080");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -278,6 +311,142 @@ fn configured_origins() -> anyhow::Result<Vec<HeaderValue>> {
         anyhow::bail!("WEB_ORIGINS não pode ficar vazio");
     }
     Ok(origins)
+}
+
+fn load_turn_config() -> anyhow::Result<TurnConfig> {
+    turn_config_from_values(
+        &env::var("TURN_HOST").unwrap_or_else(|_| "localhost".into()),
+        env::var("TURN_PORT").ok().as_deref(),
+        env::var("TURN_TLS_PORT").ok().as_deref(),
+        env::var("TURN_TLS_ALT_PORT").ok().as_deref(),
+        &env::var("TURN_SECRET")?,
+        env::var("TURN_CREDENTIAL_TTL_SECONDS").ok().as_deref(),
+        env_flag("TURN_ALLOW_UNAUTHENTICATED_CREDENTIALS", false),
+        env_flag("TURN_TRUST_PROXY_HEADERS", false),
+        env::var("TURN_CREDENTIAL_REQUESTS_PER_MINUTE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn turn_config_from_values(
+    host: &str,
+    port: Option<&str>,
+    tls_port: Option<&str>,
+    tls_alt_port: Option<&str>,
+    secret: &str,
+    credential_ttl_seconds: Option<&str>,
+    allow_unauthenticated: bool,
+    trust_proxy_headers: bool,
+    requests_per_minute: Option<&str>,
+) -> anyhow::Result<TurnConfig> {
+    if secret.len() < 32 {
+        anyhow::bail!("TURN_SECRET deve ter ao menos 32 caracteres aleatórios");
+    }
+    let credential_ttl_seconds = parse_number(
+        "TURN_CREDENTIAL_TTL_SECONDS",
+        credential_ttl_seconds,
+        DEFAULT_TURN_CREDENTIAL_TTL_SECONDS,
+        300,
+        24 * 60 * 60,
+    )?;
+    let requests_per_minute = parse_number(
+        "TURN_CREDENTIAL_REQUESTS_PER_MINUTE",
+        requests_per_minute,
+        i64::from(DEFAULT_TURN_REQUESTS_PER_MINUTE),
+        1,
+        600,
+    )? as u32;
+    Ok(TurnConfig {
+        host: normalize_turn_host(host)?,
+        port: parse_port("TURN_PORT", port, 3478)?,
+        tls_port: parse_optional_port("TURN_TLS_PORT", tls_port)?,
+        tls_alt_port: parse_optional_port("TURN_TLS_ALT_PORT", tls_alt_port)?,
+        secret: secret.into(),
+        credential_ttl_seconds,
+        allow_unauthenticated,
+        trust_proxy_headers,
+        requests_per_minute,
+    })
+}
+
+fn normalize_turn_host(value: &str) -> anyhow::Result<String> {
+    let host = value.trim();
+    if host.is_empty() || host.len() > 253 || host.contains(['/', '?', '#', '@']) {
+        anyhow::bail!("TURN_HOST precisa conter somente um hostname ou endereço IP");
+    }
+    let unwrapped = host
+        .strip_prefix('[')
+        .and_then(|item| item.strip_suffix(']'));
+    if let Ok(address) = unwrapped.unwrap_or(host).parse::<IpAddr>() {
+        return Ok(match address {
+            IpAddr::V4(address) => address.to_string(),
+            IpAddr::V6(address) => format!("[{address}]"),
+        });
+    }
+    let valid_dns = host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    });
+    if !valid_dns {
+        anyhow::bail!("TURN_HOST precisa conter um hostname DNS válido");
+    }
+    Ok(host.to_ascii_lowercase())
+}
+
+fn parse_port(name: &str, value: Option<&str>, default: u16) -> anyhow::Result<u16> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0)
+            .ok_or_else(|| anyhow::anyhow!("{name} precisa ser uma porta entre 1 e 65535")),
+        None => Ok(default),
+    }
+}
+
+fn parse_optional_port(name: &str, value: Option<&str>) -> anyhow::Result<Option<u16>> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| parse_port(name, Some(value), 0))
+        .transpose()
+}
+
+fn parse_number(
+    name: &str,
+    value: Option<&str>,
+    default: i64,
+    minimum: i64,
+    maximum: i64,
+) -> anyhow::Result<i64> {
+    let parsed = match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value
+            .parse::<i64>()
+            .map_err(|_| anyhow::anyhow!("{name} precisa ser um número inteiro"))?,
+        None => default,
+    };
+    if !(minimum..=maximum).contains(&parsed) {
+        anyhow::bail!("{name} precisa ficar entre {minimum} e {maximum}");
+    }
+    Ok(parsed)
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
 }
 
 async fn register(
@@ -1205,27 +1374,125 @@ fn validate_named_resource(value: &str, maximum: usize, message: &str) -> Result
 
 async fn turn_credentials(
     State(state): State<AppState>,
+    ConnectInfo(peer_address): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    let user = bearer(&headers, &state.config)?;
-    let username = format!("{}:{}", (Utc::now() + Duration::hours(1)).timestamp(), user);
-    let mut mac = Hmac::<Sha1>::new_from_slice(state.config.turn_secret.as_bytes())
+) -> Result<(HeaderMap, Json<TurnCredentialsResponse>), ApiError> {
+    let client_ip = credential_client_ip(
+        &headers,
+        peer_address.ip(),
+        state.config.turn.trust_proxy_headers,
+    );
+    enforce_turn_credential_rate_limit(&state, client_ip).await?;
+    let user = if headers.contains_key(header::AUTHORIZATION)
+        || !state.config.turn.allow_unauthenticated
+    {
+        bearer(&headers, &state.config)?
+    } else {
+        Uuid::new_v4()
+    };
+    let credentials = issue_turn_credentials(&state.config.turn, user, Utc::now())?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, private, max-age=0"),
+    );
+    Ok((response_headers, Json(credentials)))
+}
+
+fn issue_turn_credentials(
+    config: &TurnConfig,
+    user: Uuid,
+    now: DateTime<Utc>,
+) -> Result<TurnCredentialsResponse, ApiError> {
+    let expires_at = (now + Duration::seconds(config.credential_ttl_seconds)).timestamp();
+    let username = format!("{expires_at}:{user}");
+    let mut mac = Hmac::<Sha1>::new_from_slice(config.secret.as_bytes())
         .map_err(|error| ApiError::Internal(anyhow::anyhow!(error.to_string())))?;
     mac.update(username.as_bytes());
     let credential = STANDARD.encode(mac.finalize().into_bytes());
-    Ok(Json(json!({
-        "iceServers": [
-            {"urls": [format!("stun:{}:{}", state.config.turn_host, state.config.turn_port)]},
-            {
-                "urls": [
-                    format!("turn:{}:{}?transport=udp", state.config.turn_host, state.config.turn_port),
-                    format!("turn:{}:{}?transport=tcp", state.config.turn_host, state.config.turn_port)
-                ],
-                "username": username,
-                "credential": credential
-            }
-        ]
-    })))
+    let mut urls = vec![
+        format!("turn:{}:{}?transport=udp", config.host, config.port),
+        format!("turn:{}:{}?transport=tcp", config.host, config.port),
+    ];
+    for port in [config.tls_port, config.tls_alt_port].into_iter().flatten() {
+        let url = format!("turns:{}:{port}?transport=tcp", config.host);
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    Ok(TurnCredentialsResponse {
+        ice_servers: vec![
+            TurnIceServer {
+                urls: vec![format!("stun:{}:{}", config.host, config.port)],
+                username: None,
+                credential: None,
+            },
+            TurnIceServer {
+                urls: urls.clone(),
+                username: Some(username.clone()),
+                credential: Some(credential.clone()),
+            },
+        ],
+        username,
+        credential,
+        ttl: config.credential_ttl_seconds,
+        expires_at,
+        urls,
+    })
+}
+
+async fn enforce_turn_credential_rate_limit(
+    state: &AppState,
+    address: IpAddr,
+) -> Result<(), ApiError> {
+    let mut attempts = state.turn_attempts.lock().await;
+    let now = Instant::now();
+    if attempts.len() >= 10_000 {
+        attempts.retain(|_, window| now.duration_since(window.started_at) < TURN_REQUEST_WINDOW);
+    }
+    if !attempts.contains_key(&address) && attempts.len() >= 10_000 {
+        return Err(ApiError::TooMany(
+            "Emissor TURN temporariamente sobrecarregado".into(),
+        ));
+    }
+    let window = attempts.entry(address).or_insert(LoginWindow {
+        started_at: now,
+        attempts: 0,
+    });
+    if now.duration_since(window.started_at) >= TURN_REQUEST_WINDOW {
+        window.started_at = now;
+        window.attempts = 0;
+    }
+    if window.attempts >= state.config.turn.requests_per_minute {
+        return Err(ApiError::TooMany(
+            "Muitas solicitações de credenciais TURN; aguarde um minuto".into(),
+        ));
+    }
+    window.attempts += 1;
+    Ok(())
+}
+
+fn credential_client_ip(
+    headers: &HeaderMap,
+    direct_address: IpAddr,
+    trust_proxy_headers: bool,
+) -> IpAddr {
+    if !trust_proxy_headers {
+        return direct_address;
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .and_then(|value| value.parse().ok())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(direct_address)
 }
 
 #[cfg(test)]
@@ -1257,5 +1524,111 @@ mod tests {
         assert_eq!(first, token_hash(token));
         assert_ne!(first, token);
         assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn validates_production_turn_configuration() {
+        let config = turn_config_from_values(
+            "TURN.RISK.EXAMPLE",
+            Some("3478"),
+            Some("5349"),
+            Some("443"),
+            "0123456789abcdef0123456789abcdef",
+            Some("3600"),
+            true,
+            true,
+            Some("30"),
+        )
+        .unwrap();
+        assert_eq!(config.host, "turn.risk.example");
+        assert_eq!(config.tls_port, Some(5349));
+        assert_eq!(config.tls_alt_port, Some(443));
+        assert!(turn_config_from_values(
+            "https://invalid",
+            None,
+            None,
+            None,
+            "short",
+            None,
+            false,
+            false,
+            None,
+        )
+        .is_err());
+        assert!(turn_config_from_values(
+            "turn.example",
+            None,
+            None,
+            None,
+            "0123456789abcdef0123456789abcdef",
+            Some("299"),
+            false,
+            false,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn emits_temporary_credentials_for_udp_tcp_and_tls() {
+        let config = turn_config_from_values(
+            "turn.risk.example",
+            Some("3478"),
+            Some("5349"),
+            Some("443"),
+            "0123456789abcdef0123456789abcdef",
+            Some("3600"),
+            false,
+            false,
+            Some("30"),
+        )
+        .unwrap();
+        let user = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let response = issue_turn_credentials(&config, user, now).unwrap();
+        assert_eq!(response.ttl, 3600);
+        assert_eq!(response.expires_at, 1_800_003_600);
+        assert_eq!(
+            response.username,
+            "1800003600:00000000-0000-4000-8000-000000000001"
+        );
+        assert!(response
+            .urls
+            .iter()
+            .any(|url| url == "turn:turn.risk.example:3478?transport=udp"));
+        assert!(response
+            .urls
+            .iter()
+            .any(|url| url == "turn:turn.risk.example:3478?transport=tcp"));
+        assert!(response
+            .urls
+            .iter()
+            .any(|url| url == "turns:turn.risk.example:5349?transport=tcp"));
+        assert!(response
+            .urls
+            .iter()
+            .any(|url| url == "turns:turn.risk.example:443?transport=tcp"));
+
+        let mut mac = Hmac::<Sha1>::new_from_slice(config.secret.as_bytes()).unwrap();
+        mac.update(response.username.as_bytes());
+        assert_eq!(
+            response.credential,
+            STANDARD.encode(mac.finalize().into_bytes())
+        );
+    }
+
+    #[test]
+    fn trusts_forwarded_address_only_when_explicitly_enabled() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.10, 127.0.0.1"),
+        );
+        let direct = "127.0.0.1".parse().unwrap();
+        assert_eq!(credential_client_ip(&headers, direct, false), direct);
+        assert_eq!(
+            credential_client_ip(&headers, direct, true),
+            "203.0.113.10".parse::<IpAddr>().unwrap()
+        );
     }
 }

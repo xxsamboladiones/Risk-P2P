@@ -24,8 +24,9 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     SqlitePool,
 };
-use std::{env, path::PathBuf, time::Duration};
+use std::{env, path::PathBuf, sync::Arc, time::Duration};
 use tokio::io::AsyncReadExt;
+use tokio::sync::Mutex;
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 use uuid::Uuid;
 
@@ -49,6 +50,11 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str)] = &[
     (6, include_str!("../migrations/0006_group_manifest.sql")),
     (7, include_str!("../migrations/0007_group_roles.sql")),
     (8, include_str!("../migrations/0008_group_consistency.sql")),
+    (9, include_str!("../migrations/0009_p2p_chat_events.sql")),
+    (
+        10,
+        include_str!("../migrations/0010_p2p_message_projection.sql"),
+    ),
 ];
 
 #[derive(Clone)]
@@ -56,6 +62,7 @@ struct AppState {
     db: SqlitePool,
     local_token: String,
     jwt_secret: String,
+    attachment_quota_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -224,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         local_token,
         jwt_secret: URL_SAFE_NO_PAD.encode(secret_bytes),
+        attachment_quota_lock: Arc::new(Mutex::new(())),
     };
 
     let protected = Router::new()
@@ -1056,6 +1064,16 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0009_p2p_chat_events.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/0010_p2p_message_projection.sql"
+        ))
+        .execute(&db)
+        .await
+        .unwrap();
 
         let row = sqlx::query_as::<_, (String, i64, String, String, String, String)>(
             "SELECT name,manifest_version,administrator_peer_ids_json,removed_peer_ids_json,removed_members_json,consistency_json FROM p2p_groups WHERE group_id=?",
@@ -1078,6 +1096,20 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(preserved, (1, 1, 1, 1));
+        let chat_events_table: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='p2p_chat_events')",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(chat_events_table, 1);
+        let projected_columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('p2p_messages') WHERE name IN ('reply_to_id','edited_content','edited_at','deleted_at','pinned_at','pinned_by_peer_id','reactions_json')",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(projected_columns, 7);
         let group_payload = sqlx::query_as::<_, (String, String, i64)>(
             "SELECT channels_json,members_json,membership_version FROM p2p_groups WHERE group_id=?",
         )

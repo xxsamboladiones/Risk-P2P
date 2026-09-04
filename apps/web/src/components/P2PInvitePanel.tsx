@@ -1,33 +1,14 @@
 import React, { useEffect, useRef, useState } from "react";
-import { MeshWebRTCTransport } from "@risk/rtc";
 import { Check, Clipboard, Link2, X } from "lucide-react";
-import { api } from "../api";
+import { useRiskApplication } from "../application/ApplicationContext";
 import { normalizeRiskInviteCode, type InviteType } from "../services/invites/code";
-import { FriendInviteService, GroupInviteService, type IncomingInviteRequest, type InviteDependencies, type InviteSnapshot, type InviteService } from "../services/invites/service";
-import { getOrCreateLocalIdentity, type PublicGroupMetadata } from "../services/offline/social-storage";
-import { resolveStaticIceConfiguration } from "../services/rtc/ice";
-import { SupabaseSignalingProvider } from "../services/supabase/signaling";
-
-const resilientDesktopInviteDependencies: InviteDependencies = {
-  createSignaling: () => new SupabaseSignalingProvider(),
-  createTransport: (peerId, iceServers, events) => new MeshWebRTCTransport(peerId, iceServers, {
-    ...events,
-    // MeshWebRTCTransport executa ICE restart quando a conexão entra em `failed`.
-    // O serviço mantém seus próprios timeouts e também reage ao fechamento real
-    // do DataChannel, então deixamos o transporte tentar a recuperação primeiro.
-    onConnectionState: (remotePeerId, state) => {
-      if (state === "failed") return;
-      events.onConnectionState(remotePeerId, state);
-    },
-  }),
-  now: () => Date.now(),
-  setTimer: (callback, delay) => setTimeout(callback, delay),
-  clearTimer: (timer) => clearTimeout(timer),
-};
+import type { IncomingInviteRequest, InviteSnapshot, InviteService } from "../services/invites/service";
+import type { PublicGroupMetadata } from "../services/offline/social-storage";
 
 export function P2PInvitePanel({ type, token, displayName, group, initialMode = "create", onComplete }: {
   type: InviteType; token: string; displayName: string; group?: PublicGroupMetadata; initialMode?: "create" | "join"; onComplete?(): void;
 }) {
+  const { invites } = useRiskApplication();
   const [mode, setMode] = useState<"create" | "join">(initialMode);
   const [code, setCode] = useState(""); const [state, setState] = useState<InviteSnapshot>();
   const [request, setRequest] = useState<IncomingInviteRequest>(); const [error, setError] = useState("");
@@ -68,20 +49,7 @@ export function P2PInvitePanel({ type, token, displayName, group, initialMode = 
     const previous = service.current;
     service.current = undefined;
     await previous?.cancel(false);
-    const identityPromise = getOrCreateLocalIdentity(displayName);
-    // O sidecar desktop local não possui credenciais TURN dinâmicas e seu endpoint
-    // /rtc/credentials responde 503 de propósito. Para convites no Electron usamos
-    // diretamente a configuração ICE estática, evitando transformar esse fallback
-    // esperado em erro no backend. Web/API externa continua podendo fornecer TURN.
-    const desktop = Boolean(window.desktop?.getBackendConfig);
-    const icePromise = desktop
-      ? Promise.resolve(resolveStaticIceConfiguration().iceServers)
-      : api.turnCredentials(token).then((result) => result.iceServers);
-    const [identity, iceServers] = await Promise.all([identityPromise, icePromise]);
-    const dependencies = desktop ? resilientDesktopInviteDependencies : undefined;
-    const next = type === "friend"
-      ? new FriendInviteService(identity, iceServers, dependencies)
-      : new GroupInviteService(identity, iceServers, dependencies);
+    const next = await invites.create({ type, token, displayName, group });
     next.onState(setState);
     next.onRequest(setRequest);
     service.current = next;

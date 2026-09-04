@@ -1,9 +1,9 @@
 # WebRTC direto por VPN overlay
 
-O Risk desktop permite que o ICE do WebRTC considere interfaces locais, inclusive
-ZeroTier e outras VPNs overlay. Não existe integração com conta, API ou SDK da VPN:
-o usuário conecta a VPN no sistema operacional e o Risk trata o adaptador como uma
-interface de rede normal.
+O Risk desktop permite que o ICE do WebRTC considere e priorize interfaces
+locais, inclusive ZeroTier, Tailscale e WireGuard. Não existe integração com
+conta, API ou SDK da VPN: o usuário conecta a VPN no sistema operacional e o
+Risk trata o adaptador como uma interface de rede normal.
 
 O fluxo de signaling e a autenticação de identidade do Risk não mudam. Áudio,
 vídeo, compartilhamento de tela, chat e transferência de arquivos continuam no
@@ -30,16 +30,40 @@ ICE realmente selecionou:
 A rota é recalculada a cada coleta de `getStats()`. Assim, um ICE restart pode
 trocar VPN por STUN/TURN (ou o inverso) e o painel acompanha o novo candidate pair.
 
+## Preferência de conexão
+
+Em **Configurações → Rede**, existem três modos persistentes:
+
+- **Automático**: não altera os candidates e deixa o Chromium escolher a rota;
+- **Internet direta**: não sinaliza candidates `host` pertencentes aos
+  adaptadores VPN detectados; STUN, conexão direta comum e TURN continuam ativos;
+- **VPN privada quando disponível**: eleva a prioridade dos candidates `host`
+  ZeroTier, Tailscale, WireGuard ou VPN genérica, sem remover os fallbacks.
+
+A política é aplicada tanto aos candidates trickle quanto às linhas já presentes
+no SDP. Uma rota VPN priorizada somente vence se for alcançável pelos dois peers;
+caso contrário, a negociação continua pelas opções normais. A preferência é
+consultada ao criar uma sessão WebRTC e vale para chamadas, chats, sincronização
+em segundo plano, convites e transferências. Conexões que já estavam abertas
+precisam ser reconectadas para adotar uma nova escolha.
+
+O painel mostra nome, provedor e IP das interfaces VPN somente no dispositivo
+local. A lista de interfaces não é anexada à presença Supabase nem ao relatório
+sanitizado da chamada.
+
 ## Teste manual em dois computadores
 
 ### Mesma rede ZeroTier
 
 1. Conecte os dois computadores à mesma rede ZeroTier.
 2. Confirme conectividade nos dois sentidos com `ping <IP-ZeroTier-remoto>`.
-3. Abra a mesma chamada no Risk desktop nos dois computadores.
-4. Abra **Rede** e confirme `VPN direta (ZeroTier)`, candidates `host → host` e,
+3. Nos dois computadores, escolha **Configurações → Rede → VPN privada quando
+   disponível**.
+4. Entre novamente na mesma chamada nos dois computadores para que a nova
+   preferência seja aplicada à sessão WebRTC.
+5. Abra **Rede** durante a chamada e confirme `VPN direta (ZeroTier)`, candidates `host → host` e,
    normalmente, transporte `UDP`.
-5. Teste áudio, câmera, compartilhamento de tela, chat e transferência de arquivo.
+6. Teste áudio, câmera, compartilhamento de tela, chat e transferência de arquivo.
 
 ### Sem VPN
 
@@ -64,5 +88,7 @@ trocar VPN por STUN/TURN (ou o inverso) e o painel acompanha o novo candidate pa
 
 O comportamento de descoberta de candidates depende do Chromium/Electron e da
 configuração do sistema. O Risk usa a API oficial
-`setWebRTCIPHandlingPolicy("default")` e não desabilita mDNS nem reescreve SDP ou
-candidates.
+`setWebRTCIPHandlingPolicy("default")`, não desabilita mDNS e altera somente a
+prioridade/filtragem de linhas ICE locais conforme a escolha explícita do usuário.
+Se o Chromium mascarar um endereço `host` com um nome mDNS, o Risk mantém esse
+candidate inalterado em vez de associá-lo por suposição à interface errada.

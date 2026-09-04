@@ -1,6 +1,9 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { CallTransportRegistry, type MeshCallTransport } from "@risk/rtc";
 import type { PeerState } from "@risk/protocol";
 import type { LocalGroup } from "./services/offline/social-storage";
+import { InMemorySignalingHub, InMemorySignalingProvider } from "./services/signaling/in-memory";
+import { useCallStore } from "./store";
 
 const callRuntime = vi.hoisted(() => ({ groups: [] as LocalGroup[] }));
 
@@ -115,6 +118,91 @@ describe("recuperação da conexão da chamada", () => {
   it("mantém a recomendação de TURN somente para conexões sem VPN privada", () => {
     expect(callConnectionRecoveryMessage(false, [{ provider: "unknown" }])).toContain("configure TURN");
   });
+
+  it("expõe no diagnóstico quando o grupo deveria usar SFU", () => {
+    const controller = new CallController();
+    const internals = controller as unknown as {
+      expectedParticipantCount: number;
+      transport: { kind: "mesh"; getDiagnostics(): [] };
+    };
+    internals.expectedParticipantCount = 5;
+    internals.transport = { kind: "mesh", getDiagnostics: () => [] };
+
+    expect(controller.getDiagnostics().transport).toMatchObject({
+      active: "mesh",
+      selected: "mesh",
+      recommended: "sfu",
+      reason: "sfu-unavailable",
+    });
+  });
+
+  it("cleans up signaling and transport when call initialization fails", async () => {
+    const signaling = new InMemorySignalingProvider(new InMemorySignalingHub());
+    const disconnect = vi.spyOn(signaling, "disconnect");
+    const leave = vi.fn(async () => undefined);
+    const transport = {
+      kind: "mesh",
+      join: vi.fn(async () => { throw new Error("transport initialization failed"); }),
+      leave,
+      connectPeer: vi.fn(async () => undefined),
+      disconnectPeer: vi.fn(async () => undefined),
+      recoverPeer: vi.fn(async () => undefined),
+      publishTrack: vi.fn(async () => undefined),
+      configurePublishedVideoTrack: vi.fn(async () => undefined),
+      unpublishTrack: vi.fn(async () => undefined),
+      replaceTrack: vi.fn(async () => undefined),
+      replacePublishedTrack: vi.fn(async () => undefined),
+      sendData: vi.fn(() => 0),
+      requireMediaAuthorization: vi.fn(),
+      authorizePeerMedia: vi.fn(async () => undefined),
+      revokePeerMedia: vi.fn(),
+      getDiagnostics: vi.fn(() => []),
+      collectDiagnostics: vi.fn(async () => []),
+      acceptOffer: vi.fn(async () => undefined),
+      acceptAnswer: vi.fn(async () => undefined),
+      addIceCandidate: vi.fn(async () => undefined),
+      restartIce: vi.fn(async () => undefined),
+    } satisfies MeshCallTransport;
+    const registry = new CallTransportRegistry({ mesh: () => transport });
+    const controller = new CallController(
+      () => signaling,
+      { me: vi.fn(async () => { throw new Error("profile must not be requested"); }) },
+      registry,
+    );
+
+    await expect(controller.join("token", "room_cleanup_12345678", [])).rejects.toThrow("transport initialization failed");
+
+    expect(disconnect).toHaveBeenCalledOnce();
+    expect(leave).toHaveBeenCalledOnce();
+    expect(controller.getDiagnostics().signaling).toBeNull();
+  });
+
+  it("does not allow SDP from a seventh Mesh participant to bypass the hard limit", () => {
+    const localPeerId = "peer_capacity_00000000";
+    let presencePeers = Array.from({ length: 6 }, (_, index) => `peer_capacity_${String(index + 1).padStart(8, "0")}`);
+    const disconnectPeer = vi.fn(async () => undefined);
+    const controller = new CallController();
+    const internals = controller as unknown as {
+      peerId: string;
+      signaling: { getDiagnostics(): { presencePeers: string[] } };
+      transport: { kind: "mesh"; getDiagnostics(): Array<{ peerId: string }>; disconnectPeer: typeof disconnectPeer };
+      enforceMeshCapacity(candidatePeerId?: string): boolean;
+    };
+    internals.peerId = localPeerId;
+    internals.signaling = { getDiagnostics: () => ({ presencePeers }) };
+    internals.transport = {
+      kind: "mesh",
+      getDiagnostics: () => presencePeers.map((peerId) => ({ peerId })),
+      disconnectPeer,
+    };
+
+    expect(internals.enforceMeshCapacity(presencePeers.at(-1))).toBe(false);
+    expect(useCallStore.getState().error).toContain("limite seguro de 6 participantes");
+
+    presencePeers = presencePeers.slice(0, 5);
+    expect(internals.enforceMeshCapacity()).toBe(true);
+    expect(useCallStore.getState().error).toBeNull();
+  });
 });
 
 describe("sincronização de membros durante a chamada", () => {
@@ -137,7 +225,7 @@ describe("sincronização de membros durante a chamada", () => {
       removedMembers: [],
       joinedAt: Date.now(),
     }];
-    const connect = vi.fn(async () => undefined);
+    const connectPeer = vi.fn(async () => undefined);
     const reconnectSignaling = vi.fn(async () => undefined);
     const sendPeerState = vi.fn(async () => undefined);
     const signaling = {
@@ -153,7 +241,8 @@ describe("sincronização de membros durante a chamada", () => {
       groupId: string;
       peerId: string;
       signaling: typeof signaling;
-      transport: { connect: typeof connect };
+      transport: { connectPeer: typeof connectPeer };
+      transportReady: boolean;
       refreshGroupSecurity(): Promise<void>;
     };
     internals.lifecycleId = 1;
@@ -162,13 +251,14 @@ describe("sincronização de membros durante a chamada", () => {
     internals.groupId = groupId;
     internals.peerId = localPeerId;
     internals.signaling = signaling;
-    internals.transport = { connect };
+    internals.transport = { connectPeer };
+    internals.transportReady = true;
 
     await internals.refreshGroupSecurity();
 
-    expect(connect).toHaveBeenCalledTimes(2);
-    expect(connect).toHaveBeenCalledWith(peerB, true);
-    expect(connect).toHaveBeenCalledWith(peerC, true);
+    expect(connectPeer).toHaveBeenCalledTimes(2);
+    expect(connectPeer).toHaveBeenCalledWith(peerB, true);
+    expect(connectPeer).toHaveBeenCalledWith(peerC, true);
     expect(sendPeerState).toHaveBeenCalledOnce();
   });
 
@@ -184,8 +274,8 @@ describe("sincronização de membros durante a chamada", () => {
     const transport = {
       sendData: vi.fn(() => 0),
       recoverPeer,
-      disconnect: vi.fn(async () => undefined),
-      connect: vi.fn(async () => undefined),
+      disconnectPeer: vi.fn(async () => undefined),
+      connectPeer: vi.fn(async () => undefined),
     };
     const signaling = {
       getDiagnostics: () => ({ presencePeers: remotePeerIds }),
@@ -228,8 +318,8 @@ describe("sincronização de membros durante a chamada", () => {
     const transport = {
       sendData: vi.fn(() => 1),
       recoverPeer,
-      disconnect: vi.fn(async () => undefined),
-      connect: vi.fn(async () => undefined),
+      disconnectPeer: vi.fn(async () => undefined),
+      connectPeer: vi.fn(async () => undefined),
     };
     const signaling = { getDiagnostics: () => ({ presencePeers: [remotePeerId] }) };
     const controller = new CallController();
@@ -271,8 +361,8 @@ describe("sincronização de membros durante a chamada", () => {
     const transport = {
       sendData: vi.fn(() => 0),
       recoverPeer,
-      disconnect: vi.fn(async () => undefined),
-      connect: vi.fn(async () => undefined),
+      disconnectPeer: vi.fn(async () => undefined),
+      connectPeer: vi.fn(async () => undefined),
     };
     const signaling = {
       getDiagnostics: () => ({ presencePeers: [remotePeerId] }),

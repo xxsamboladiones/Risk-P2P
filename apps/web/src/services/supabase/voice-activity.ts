@@ -1,17 +1,10 @@
 import type { RealtimeChannel, SupabaseClient } from "@supabase/supabase-js";
+import type { VoiceActivity } from "../../application/contracts";
+export type { VoiceActivity } from "../../application/contracts";
 import { groupRendezvousId, type LocalGroup } from "../offline/social-storage";
 import { getSupabaseRealtimeClient } from "./client";
 
 type VoicePresence = { peerId: string; roomId: string; channelId: string; joinedAt: number };
-
-export type VoiceActivity = {
-  groupId: string;
-  groupName: string;
-  channelId: string;
-  channelName: string;
-  roomId: string;
-  participantCount: number;
-};
 
 type GroupSubscription = { group: LocalGroup; rendezvousId: string; channel: RealtimeChannel; subscribed: Promise<void> };
 const MAX_GROUP_SUBSCRIPTIONS = 32;

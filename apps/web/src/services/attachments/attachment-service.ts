@@ -1,5 +1,6 @@
 import {
   DEFAULT_ATTACHMENT_CHUNK_SIZE,
+  MAX_ATTACHMENT_CONTROL_WIRE_BYTES,
   RISK_ATTACHMENT_PROTOCOL_VERSION,
   classifyAttachment,
   isFileControlMessage,
@@ -32,6 +33,7 @@ import { IndexedDbAttachmentStorage, type StoredAttachmentRecord } from "./index
 const LOCAL_CAPABILITIES: RiskCapability[] = ["file-transfer-v1", "attachment-sync-v1", "transfer-resume-v1"];
 const MAX_MANIFEST_CHUNK_HASHES = 512;
 const MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024 * 1024;
+const MAX_AUTOMATIC_DOWNLOAD_BYTES = 25 * 1024 * 1024;
 
 export type AttachmentRuntimeState = {
   record: StoredAttachmentRecord;
@@ -40,8 +42,15 @@ export type AttachmentRuntimeState = {
   etaSeconds?: number;
 };
 
-type ProgressSample = { bytes: number; timestamp: number; speed: number };
+type ProgressPoint = { bytes: number; timestamp: number };
+type ProgressSample = {
+  state: AttachmentTransferProgress["state"];
+  points: ProgressPoint[];
+  speed: number;
+};
 type SyncRequestState = { peerId: string; stateHash: string };
+
+const SPEED_SAMPLE_WINDOW_MS = 5_000;
 
 export interface AttachmentStorage extends AttachmentChunkSink {
   persistOutgoingSource(transferId: string, channelId: string, peerId: string, source: Blob, manifest: AttachmentManifest): Promise<StoredAttachmentRecord>;
@@ -63,7 +72,9 @@ export class AttachmentService extends EventTarget {
   private readonly sourceByAttachment = new Map<string, TransferSource>();
   private readonly peerCapabilities = new Map<string, ReadonlySet<RiskCapability>>();
   private readonly progressSamples = new Map<string, ProgressSample>();
+  private readonly progressUpdates = new Map<string, Promise<void>>();
   private readonly syncRequests = new Map<string, SyncRequestState>();
+  private readonly requestedAttachments = new Set<string>();
 
   constructor(
     private readonly transport: MeshWebRTCTransport,
@@ -84,6 +95,7 @@ export class AttachmentService extends EventTarget {
       {
         getBufferedAmount: (peerId) => this.transport.getTransferBufferedAmount(peerId),
         waitForBufferedAmountLow: (peerId) => this.transport.waitForTransferBufferedAmountLow(peerId),
+        waitForPendingData: (peerId) => this.transport.waitForTransferBufferedAmountLow(peerId, 0),
       },
     );
     this.receiver = new AttachmentTransferReceiver(
@@ -91,13 +103,23 @@ export class AttachmentService extends EventTarget {
       (peerId, message) => this.sendControl(peerId, message),
       {
         maxFileSizeBytes: MAX_FILE_SIZE_BYTES,
-        autoAccept: (peerId, manifest) => this.isAuthenticated(peerId)
-          && manifest.senderPeerId === peerId
-          && manifest.channelId === this.channelId,
+        onOffer: (peerId, transferId, manifest) => this.recordIncomingOffer(peerId, transferId, manifest),
+        autoAccept: (peerId, manifest) => {
+          const requestedKey = this.requestedAttachmentKey(peerId, manifest.id);
+          const explicitlyRequested = this.requestedAttachments.delete(requestedKey);
+          return this.isAuthenticated(peerId)
+            && manifest.senderPeerId === peerId
+            && manifest.channelId === this.channelId
+            && (explicitlyRequested || manifest.size <= MAX_AUTOMATIC_DOWNLOAD_BYTES);
+        },
       },
     );
-    this.sender.addEventListener("progress", (event) => { void this.onProgress((event as CustomEvent<AttachmentTransferProgress>).detail); });
-    this.receiver.addEventListener("progress", (event) => { void this.onProgress((event as CustomEvent<AttachmentTransferProgress>).detail); });
+    this.sender.addEventListener("progress", (event) => {
+      this.queueProgress((event as CustomEvent<AttachmentTransferProgress>).detail, performance.now());
+    });
+    this.receiver.addEventListener("progress", (event) => {
+      this.queueProgress((event as CustomEvent<AttachmentTransferProgress>).detail, performance.now());
+    });
     this.receiver.addEventListener("offer", (event) => {
       const detail = (event as CustomEvent<{ transferId: string; peerId: string; manifest: AttachmentManifest }>).detail;
       this.dispatchEvent(new CustomEvent("offer", { detail }));
@@ -163,7 +185,17 @@ export class AttachmentService extends EventTarget {
     if (!this.isAuthenticated(record.peerId)) throw new Error("O peer que possui este arquivo não está conectado.");
     const capabilities = this.peerCapabilities.get(record.peerId);
     if (!capabilities?.has("file-transfer-v1")) throw new Error("O peer conectado não oferece transferência de arquivos nesta versão.");
-    await this.sendControl(record.peerId, { type: "file.request", attachmentId: record.attachmentId });
+    if (record.direction === "incoming" && this.receiver.canAccept(record.transferId)) {
+      await this.receiver.accept(record.transferId);
+      return;
+    }
+    this.requestedAttachments.add(this.requestedAttachmentKey(record.peerId, record.attachmentId));
+    try {
+      await this.sendControl(record.peerId, { type: "file.request", attachmentId: record.attachmentId });
+    } catch (error) {
+      this.requestedAttachments.delete(this.requestedAttachmentKey(record.peerId, record.attachmentId));
+      throw error;
+    }
     const updated = { ...record, state: "waiting" as const, lastError: undefined, updatedAt: new Date().toISOString() };
     await this.storage.saveRecord(updated);
     this.emitRecord(updated);
@@ -177,6 +209,7 @@ export class AttachmentService extends EventTarget {
       await this.receiver.handleControl(record.peerId, { type: "file.pause", transferId: record.transferId });
     }
     await this.sendControl(record.peerId, { type: "file.pause", transferId: record.transferId });
+    await this.flushProgress(record.transferId);
   }
 
   async resume(record: StoredAttachmentRecord): Promise<void> {
@@ -187,6 +220,7 @@ export class AttachmentService extends EventTarget {
       await this.receiver.handleControl(record.peerId, { type: "file.resume", transferId: record.transferId });
     }
     await this.sendControl(record.peerId, { type: "file.resume", transferId: record.transferId });
+    await this.flushProgress(record.transferId);
   }
 
   async cancel(record: StoredAttachmentRecord): Promise<void> {
@@ -196,9 +230,13 @@ export class AttachmentService extends EventTarget {
       this.emitRecord(updated);
       return;
     }
-    if (record.direction === "outgoing") this.sender.cancel(record.transferId);
-    else await this.receiver.cancel(record.transferId);
+    if (record.direction === "outgoing") {
+      this.sender.cancel(record.transferId);
+    } else {
+      await this.cancelIncoming(record.transferId, record);
+    }
     await this.sendControl(record.peerId, { type: "file.cancel", transferId: record.transferId, reason: "cancelled_by_user" });
+    await this.flushProgress(record.transferId);
   }
 
   async getBlob(record: StoredAttachmentRecord): Promise<Blob> {
@@ -227,6 +265,8 @@ export class AttachmentService extends EventTarget {
 
   async handleControlString(peerId: string, data: string): Promise<boolean> {
     if (!this.isAuthenticated(peerId)) return false;
+    if (data.length > MAX_ATTACHMENT_CONTROL_WIRE_BYTES
+      || new TextEncoder().encode(data).byteLength > MAX_ATTACHMENT_CONTROL_WIRE_BYTES) return false;
     let value: unknown;
     try { value = JSON.parse(data); }
     catch { return false; }
@@ -286,6 +326,10 @@ export class AttachmentService extends EventTarget {
         return;
       }
     }
+    if (message.type === "file.cancel") {
+      await this.cancelIncoming(message.transferId);
+      return;
+    }
     await this.receiver.handleControl(peerId, message);
   }
 
@@ -316,11 +360,39 @@ export class AttachmentService extends EventTarget {
   }
 
   private async markRequestedAttachmentError(peerId: string, attachmentId: string, message: string): Promise<void> {
+    this.requestedAttachments.delete(this.requestedAttachmentKey(peerId, attachmentId));
     const record = await this.storage.findAnyByAttachmentId(attachmentId);
     if (!record || record.channelId !== this.channelId || record.peerId !== peerId || record.state === "completed") return;
     const updated = { ...record, state: "failed" as const, lastError: message, updatedAt: new Date().toISOString() };
     await this.storage.saveRecord(updated);
     this.emitRecord(updated);
+  }
+
+  private async recordIncomingOffer(peerId: string, transferId: string, manifest: AttachmentManifest): Promise<void> {
+    const existing = await this.storage.findByTransferId(transferId);
+    if (existing) return;
+    const now = new Date().toISOString();
+    const record: StoredAttachmentRecord = {
+      recordId: `${this.channelId}:${manifest.id}:${transferId}`,
+      attachmentId: manifest.id,
+      transferId,
+      channelId: this.channelId,
+      peerId,
+      direction: "incoming",
+      manifest,
+      state: "waiting",
+      bytesTransferred: 0,
+      totalBytes: manifest.size,
+      retryCount: 0,
+      createdAt: manifest.createdAt,
+      updatedAt: now,
+    };
+    await this.storage.saveRecord(record);
+    this.emitRecord(record);
+  }
+
+  private requestedAttachmentKey(peerId: string, attachmentId: string): string {
+    return `${peerId}:${attachmentId}`;
   }
 
   private async sendSyncHello(peerId: string): Promise<void> {
@@ -483,16 +555,44 @@ export class AttachmentService extends EventTarget {
     this.emitRecord(updated);
   }
 
-  private async onProgress(progress: AttachmentTransferProgress): Promise<void> {
+  private queueProgress(progress: AttachmentTransferProgress, observedAt: number): void {
+    const previous = this.progressUpdates.get(progress.transferId) ?? Promise.resolve();
+    const update = previous
+      .catch(() => undefined)
+      .then(() => this.onProgress(progress, observedAt));
+    this.progressUpdates.set(progress.transferId, update);
+    void update
+      .catch((error) => console.warn("Não foi possível persistir o progresso do anexo.", error))
+      .finally(() => {
+        if (this.progressUpdates.get(progress.transferId) === update) this.progressUpdates.delete(progress.transferId);
+      });
+  }
+
+  private async flushProgress(transferId: string): Promise<void> {
+    await this.progressUpdates.get(transferId);
+  }
+
+  private async cancelIncoming(transferId: string, fallback?: StoredAttachmentRecord): Promise<void> {
+    await this.flushProgress(transferId);
+    const current = await this.storage.findByTransferId(transferId) ?? fallback;
+    await this.receiver.cancel(transferId);
+    await this.flushProgress(transferId);
+    if (!current) return;
+    const updated: StoredAttachmentRecord = {
+      ...current,
+      state: "cancelled",
+      updatedAt: new Date().toISOString(),
+      lastError: undefined,
+    };
+    await this.storage.saveRecord(updated);
+    this.progressSamples.delete(transferId);
+    this.emitRecord(updated);
+  }
+
+  private async onProgress(progress: AttachmentTransferProgress, observedAt: number): Promise<void> {
     const record = await this.storage.updateProgress(progress);
     if (!record) return;
-    const now = Date.now();
-    const previous = this.progressSamples.get(progress.transferId);
-    const instantaneous = previous && now > previous.timestamp
-      ? Math.max(0, (progress.bytesTransferred - previous.bytes) / ((now - previous.timestamp) / 1000))
-      : 0;
-    const speed = previous ? (previous.speed * 0.65) + (instantaneous * 0.35) : instantaneous;
-    this.progressSamples.set(progress.transferId, { bytes: progress.bytesTransferred, timestamp: now, speed });
+    const speed = this.updateTransferSpeed(progress, observedAt);
     const remaining = Math.max(0, progress.totalBytes - progress.bytesTransferred);
     const detail: AttachmentRuntimeState = {
       record,
@@ -502,6 +602,45 @@ export class AttachmentService extends EventTarget {
     };
     this.dispatchEvent(new CustomEvent<AttachmentRuntimeState>("progress", { detail }));
     this.emitRecord(record);
+  }
+
+  private updateTransferSpeed(progress: AttachmentTransferProgress, observedAt: number): number {
+    const previous = this.progressSamples.get(progress.transferId);
+    if (progress.state !== "transferring" || previous?.state !== "transferring") {
+      this.progressSamples.set(progress.transferId, {
+        state: progress.state,
+        points: [{ bytes: progress.bytesTransferred, timestamp: observedAt }],
+        speed: 0,
+      });
+      return 0;
+    }
+
+    const last = previous.points.at(-1)!;
+    if (progress.bytesTransferred < last.bytes) {
+      this.progressSamples.set(progress.transferId, {
+        state: progress.state,
+        points: [{ bytes: progress.bytesTransferred, timestamp: observedAt }],
+        speed: 0,
+      });
+      return 0;
+    }
+
+    const points = progress.bytesTransferred === last.bytes
+      ? previous.points
+      : [...previous.points, { bytes: progress.bytesTransferred, timestamp: observedAt }];
+    const cutoff = observedAt - SPEED_SAMPLE_WINDOW_MS;
+    let firstIndex = points.findIndex((point) => point.timestamp >= cutoff);
+    if (firstIndex < 0) firstIndex = points.length - 1;
+    else if (firstIndex > 0) firstIndex -= 1;
+    const window = points.slice(firstIndex);
+    const first = window[0]!;
+    const latest = window.at(-1)!;
+    const elapsedSeconds = (latest.timestamp - first.timestamp) / 1_000;
+    const speed = elapsedSeconds > 0
+      ? Math.max(0, (latest.bytes - first.bytes) / elapsedSeconds)
+      : previous.speed;
+    this.progressSamples.set(progress.transferId, { state: progress.state, points: window, speed });
+    return speed;
   }
 
   private emitRecord(record: StoredAttachmentRecord): void {

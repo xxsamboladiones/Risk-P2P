@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import {
   CALL_SOUND_SOURCES,
   CallPresenceSoundState,
-  callSoundForRoomTransition,
   playCallSound,
   preloadCallSounds,
 } from "./call-sounds";
@@ -15,15 +14,11 @@ describe("sons da chamada", () => {
     });
   });
 
-  it("toca conexão somente ao entrar ou trocar de sala", () => {
-    expect(callSoundForRoomTransition(null, "room-a")).toBe("connect");
-    expect(callSoundForRoomTransition("room-a", "room-b")).toBe("connect");
-    expect(callSoundForRoomTransition("room-a", "room-a")).toBeNull();
-  });
-
-  it("toca desconexão somente ao sair da sala", () => {
-    expect(callSoundForRoomTransition("room-a", null)).toBe("disconnect");
-    expect(callSoundForRoomTransition(null, null)).toBeNull();
+  it("ativa os sons de presença e toca uma desconexão ao sair", () => {
+    const presence = new CallPresenceSoundState();
+    presence.enable();
+    expect(presence.disable()).toBe("disconnect");
+    expect(presence.disable()).toBeNull();
   });
 
   it("não repete conexão para peers encontrados ao entrar em uma chamada existente", () => {
@@ -51,12 +46,44 @@ describe("sons da chamada", () => {
     expect(presence.leave("peer-auth")).toBeNull();
   });
 
-  it("carrega e reproduz o arquivo de conexão", () => {
+  it("silencia peers iniciais mesmo quando autenticam depois da entrada local", () => {
+    const presence = new CallPresenceSoundState();
+    presence.observe("peer-inicial-a");
+    presence.observe("peer-inicial-b");
+    presence.enable();
+    expect(presence.accept("peer-inicial-a")).toBeNull();
+    expect(presence.accept("peer-inicial-b")).toBeNull();
+    presence.observe("peer-novo");
+    expect(presence.accept("peer-novo")).toBe("connect");
+  });
+
+  it("toca para quem entra e para cada membro que já estava na chamada", () => {
+    const membroA = new CallPresenceSoundState();
+    const membroB = new CallPresenceSoundState();
+    membroA.enable();
+    membroB.enable();
+
+    const novoMembro = new CallPresenceSoundState();
+    novoMembro.observe("peer-a");
+    novoMembro.observe("peer-b");
+    novoMembro.enable();
+    expect(novoMembro.accept("peer-a")).toBeNull();
+    expect(novoMembro.accept("peer-b")).toBeNull();
+
+    membroA.observe("peer-novo");
+    membroB.observe("peer-novo");
+    expect(membroA.accept("peer-novo")).toBe("connect");
+    expect(membroB.accept("peer-novo")).toBe("connect");
+  });
+
+  it("carrega e inicia o arquivo de conexão sem adiar o play", () => {
     class FakeAudio {
       static readonly instances: FakeAudio[] = [];
       currentTime = 0;
+      muted = false;
       preload = "";
       volume = 1;
+      readonly addEventListener = vi.fn();
       readonly load = vi.fn();
       readonly pause = vi.fn();
       readonly play = vi.fn(async () => undefined);
@@ -72,6 +99,40 @@ describe("sons da chamada", () => {
       ]);
       expect(FakeAudio.instances[0]?.play).toHaveBeenCalledOnce();
       expect(FakeAudio.instances[0]?.volume).toBe(0.6);
+      expect(FakeAudio.instances[0]?.muted).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("gera o som de conexão pelo Web Audio quando disponível", () => {
+    const starts: number[] = [];
+    const frequencies: number[] = [];
+    const createOscillator = vi.fn(() => ({
+      type: "sine",
+      frequency: { setValueAtTime: (value: number) => frequencies.push(value) },
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      start: (at: number) => starts.push(at),
+      stop: vi.fn(),
+    }));
+    const createGain = vi.fn(() => ({
+      gain: { setValueAtTime: vi.fn(), exponentialRampToValueAtTime: vi.fn() },
+      connect: vi.fn(),
+    }));
+    class FakeAudioContext {
+      readonly state = "running";
+      readonly currentTime = 1;
+      readonly destination = {};
+      readonly createOscillator = createOscillator;
+      readonly createGain = createGain;
+      readonly resume = vi.fn(async () => undefined);
+    }
+    vi.stubGlobal("AudioContext", FakeAudioContext);
+    try {
+      playCallSound("connect");
+      expect(frequencies).toEqual([523.25, 783.99]);
+      expect(starts).toEqual([1.01, 1.15]);
     } finally {
       vi.unstubAllGlobals();
     }

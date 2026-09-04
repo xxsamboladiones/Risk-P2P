@@ -1,9 +1,11 @@
 export const RISK_ATTACHMENT_PROTOCOL_VERSION = 1 as const;
 
-export const DEFAULT_ATTACHMENT_CHUNK_SIZE = 64 * 1024;
+export const DEFAULT_ATTACHMENT_CHUNK_SIZE = 256 * 1024;
+export const MAX_ATTACHMENT_CHUNK_SIZE = 256 * 1024;
 export const MAX_ATTACHMENT_FILENAME_LENGTH = 255;
 export const MAX_ATTACHMENT_MIME_LENGTH = 127;
 export const MAX_ATTACHMENT_CHUNKS = 1_000_000;
+export const MAX_ATTACHMENT_CONTROL_WIRE_BYTES = 64 * 1024;
 
 export type RiskCapability =
   | "file-transfer-v1"
@@ -157,37 +159,110 @@ export function classifyAttachment(mimeType: string, filename = ""): AttachmentK
   return "other";
 }
 
-export function validateAttachmentManifest(manifest: AttachmentManifest): string[] {
+export function validateAttachmentManifest(manifest: unknown): string[] {
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) return ["invalid_manifest"];
+  const value = manifest as Partial<AttachmentManifest>;
   const errors: string[] = [];
-  if (manifest.protocolVersion !== RISK_ATTACHMENT_PROTOCOL_VERSION) errors.push("unsupported_protocol_version");
-  if (!manifest.id) errors.push("missing_attachment_id");
-  if (!manifest.senderPeerId) errors.push("missing_sender_peer_id");
-  if (!manifest.filename || manifest.filename.length > MAX_ATTACHMENT_FILENAME_LENGTH) errors.push("invalid_filename");
-  if (manifest.mimeType.length > MAX_ATTACHMENT_MIME_LENGTH) errors.push("invalid_mime_type");
-  if (!Number.isSafeInteger(manifest.size) || manifest.size < 0) errors.push("invalid_size");
-  if (!Number.isSafeInteger(manifest.chunkSize) || manifest.chunkSize <= 0) errors.push("invalid_chunk_size");
-  if (!Number.isSafeInteger(manifest.chunkCount) || manifest.chunkCount < 0 || manifest.chunkCount > MAX_ATTACHMENT_CHUNKS) errors.push("invalid_chunk_count");
-  if (!/^[a-f0-9]{64}$/i.test(manifest.contentHash)) errors.push("invalid_content_hash");
-  if (manifest.chunkHashes && manifest.chunkHashes.length !== manifest.chunkCount) errors.push("invalid_chunk_hash_count");
+  if (value.protocolVersion !== RISK_ATTACHMENT_PROTOCOL_VERSION) errors.push("unsupported_protocol_version");
+  if (typeof value.id !== "string" || !/^[a-f0-9]{64}$/i.test(value.id)) errors.push("missing_attachment_id");
+  if (typeof value.senderPeerId !== "string" || !validWireIdentifier(value.senderPeerId)) errors.push("missing_sender_peer_id");
+  if (typeof value.filename !== "string" || !value.filename || value.filename.length > MAX_ATTACHMENT_FILENAME_LENGTH) errors.push("invalid_filename");
+  if (typeof value.mimeType !== "string" || value.mimeType.length > MAX_ATTACHMENT_MIME_LENGTH) errors.push("invalid_mime_type");
+  if (!ATTACHMENT_KINDS.has(value.kind as AttachmentKind)) errors.push("invalid_kind");
+  if (!Number.isSafeInteger(value.size) || Number(value.size) < 0) errors.push("invalid_size");
+  if (!Number.isSafeInteger(value.chunkSize) || Number(value.chunkSize) <= 0 || Number(value.chunkSize) > MAX_ATTACHMENT_CHUNK_SIZE) errors.push("invalid_chunk_size");
+  if (!Number.isSafeInteger(value.chunkCount) || Number(value.chunkCount) < 0 || Number(value.chunkCount) > MAX_ATTACHMENT_CHUNKS) errors.push("invalid_chunk_count");
+  if (typeof value.contentHash !== "string" || !/^[a-f0-9]{64}$/i.test(value.contentHash)) errors.push("invalid_content_hash");
+  if (typeof value.id === "string" && typeof value.contentHash === "string"
+    && value.id.toLowerCase() !== value.contentHash.toLowerCase()) errors.push("attachment_id_hash_mismatch");
+  if (Number.isSafeInteger(value.size) && Number(value.size) >= 0
+    && Number.isSafeInteger(value.chunkSize) && Number(value.chunkSize) > 0
+    && Number.isSafeInteger(value.chunkCount)
+    && value.chunkCount !== Math.ceil(Number(value.size) / Number(value.chunkSize))) errors.push("invalid_chunk_layout");
+  if (value.chunkHashes !== undefined && (!Array.isArray(value.chunkHashes)
+    || value.chunkHashes.length !== value.chunkCount
+    || value.chunkHashes.some((hash) => typeof hash !== "string" || !/^[a-f0-9]{64}$/i.test(hash)))) errors.push("invalid_chunk_hash_count");
+  if (typeof value.createdAt !== "string" || value.createdAt.length > 64 || !Number.isFinite(Date.parse(value.createdAt))) errors.push("invalid_created_at");
+  if (value.channelId !== undefined && (typeof value.channelId !== "string" || !validWireIdentifier(value.channelId))) errors.push("invalid_channel_id");
+  if (value.messageId !== undefined && (typeof value.messageId !== "string" || !validWireIdentifier(value.messageId))) errors.push("invalid_message_id");
+  if (value.extension !== undefined && (typeof value.extension !== "string" || value.extension.length > 32)) errors.push("invalid_extension");
+  if (value.metadata !== undefined && !validAttachmentMetadata(value.metadata)) errors.push("invalid_metadata");
   return errors;
 }
 
 export function isFileControlMessage(value: unknown): value is FileControlMessage {
-  if (!value || typeof value !== "object") return false;
-  const type = (value as { type?: unknown }).type;
-  return type === "peer.capabilities"
-    || type === "file.offer"
-    || type === "file.request"
-    || type === "file.accept"
-    || type === "file.reject"
-    || type === "file.manifest"
-    || type === "file.need"
-    || type === "file.pause"
-    || type === "file.resume"
-    || type === "file.cancel"
-    || type === "file.complete"
-    || type === "file.error"
-    || type === "file.availability";
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const message = value as Record<string, unknown>;
+  const validTransfer = () => typeof message.transferId === "string" && validTransferIdentifier(message.transferId);
+  const validOptionalReason = () => message.reason === undefined
+    || (typeof message.reason === "string" && message.reason.length <= 500);
+  switch (message.type) {
+    case "peer.capabilities":
+      return message.protocolVersion === RISK_ATTACHMENT_PROTOCOL_VERSION
+        && Array.isArray(message.capabilities)
+        && message.capabilities.length <= RISK_CAPABILITIES.size
+        && message.capabilities.every((capability) => RISK_CAPABILITIES.has(capability as RiskCapability));
+    case "file.offer":
+    case "file.manifest":
+      return validTransfer() && validateAttachmentManifest(message.manifest).length === 0;
+    case "file.request":
+      return typeof message.attachmentId === "string" && SHA256_PATTERN.test(message.attachmentId);
+    case "file.accept":
+    case "file.pause":
+      return validTransfer();
+    case "file.reject":
+    case "file.cancel":
+      return validTransfer() && validOptionalReason();
+    case "file.need":
+      return validTransfer() && validChunkList(message.missingChunks);
+    case "file.resume":
+      return validTransfer() && (message.missingChunks === undefined || validChunkList(message.missingChunks));
+    case "file.complete":
+      return validTransfer() && typeof message.contentHash === "string" && SHA256_PATTERN.test(message.contentHash);
+    case "file.error":
+      return validTransfer()
+        && typeof message.code === "string" && /^[a-z0-9_-]{1,64}$/i.test(message.code)
+        && typeof message.message === "string" && message.message.length <= 1_000
+        && typeof message.retryable === "boolean";
+    case "file.availability":
+      return typeof message.attachmentId === "string" && SHA256_PATTERN.test(message.attachmentId)
+        && Number.isSafeInteger(message.chunkCount) && Number(message.chunkCount) >= 0 && Number(message.chunkCount) <= MAX_ATTACHMENT_CHUNKS
+        && validChunkList(message.availableChunks)
+        && (message.availableChunks as number[]).every((index) => index < Number(message.chunkCount))
+        && typeof message.expiresAt === "string" && message.expiresAt.length <= 64 && Number.isFinite(Date.parse(message.expiresAt));
+    default:
+      return false;
+  }
+}
+
+const SHA256_PATTERN = /^[a-f0-9]{64}$/i;
+const ATTACHMENT_KINDS = new Set<AttachmentKind>(["image", "video", "audio", "document", "archive", "executable", "other"]);
+const RISK_CAPABILITIES = new Set<RiskCapability>(["file-transfer-v1", "attachment-sync-v1", "transfer-resume-v1", "multi-source-v1"]);
+
+function validWireIdentifier(value: string): boolean {
+  return value.length >= 8 && value.length <= 128 && /^[A-Za-z0-9_-]+$/.test(value);
+}
+
+function validTransferIdentifier(value: string): boolean {
+  return value.length >= 8 && value.length <= 200 && /^[A-Za-z0-9:_-]+$/.test(value);
+}
+
+function validChunkList(value: unknown): value is number[] {
+  return Array.isArray(value)
+    && value.length <= 2_048
+    && value.every((index) => Number.isSafeInteger(index) && index >= 0 && index < MAX_ATTACHMENT_CHUNKS);
+}
+
+function validAttachmentMetadata(value: unknown): value is AttachmentMetadata {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const metadata = value as Record<string, unknown>;
+  const validPositiveNumber = (candidate: unknown) => candidate === undefined
+    || (typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0);
+  return validPositiveNumber(metadata.width)
+    && validPositiveNumber(metadata.height)
+    && validPositiveNumber(metadata.durationMs)
+    && (metadata.thumbnailHash === undefined || (typeof metadata.thumbnailHash === "string" && SHA256_PATTERN.test(metadata.thumbnailHash)))
+    && (metadata.voiceMessage === undefined || typeof metadata.voiceMessage === "boolean");
 }
 
 export function sanitizeAttachmentFilename(filename: string): string {

@@ -1,5 +1,5 @@
 const DATABASE = "risk-offline";
-const VERSION = 4;
+const VERSION = 5;
 
 export const OFFLINE_STORES = {
   messages: "chat-messages",
@@ -10,6 +10,7 @@ export const OFFLINE_STORES = {
   attachmentChunks: "attachment-chunks",
   syncCheckpoints: "sync-checkpoints",
   outbox: "chat-outbox",
+  chatEvents: "chat-events",
 } as const;
 
 export function openRiskDatabase(): Promise<IDBDatabase> {
@@ -47,6 +48,12 @@ export function openRiskDatabase(): Promise<IDBDatabase> {
         ? request.transaction!.objectStore(OFFLINE_STORES.outbox)
         : database.createObjectStore(OFFLINE_STORES.outbox, { keyPath: "key" });
       if (!outbox.indexNames.contains("channelId")) outbox.createIndex("channelId", "channelId", { unique: false });
+
+      const chatEvents = database.objectStoreNames.contains(OFFLINE_STORES.chatEvents)
+        ? request.transaction!.objectStore(OFFLINE_STORES.chatEvents)
+        : database.createObjectStore(OFFLINE_STORES.chatEvents, { keyPath: "id" });
+      if (!chatEvents.indexNames.contains("channelId")) chatEvents.createIndex("channelId", "channelId", { unique: false });
+      if (!chatEvents.indexNames.contains("targetMessageId")) chatEvents.createIndex("targetMessageId", "targetMessageId", { unique: false });
     };
     request.onsuccess = () => {
       const database = request.result;
@@ -68,6 +75,27 @@ export function getFromStore<T>(storeName: string, key: IDBValidKey): Promise<T 
 
 export function getAllByIndex<T>(storeName: string, indexName: string, key: IDBValidKey): Promise<T[]> {
   return withStore<T[]>(storeName, "readonly", (store) => store.index(indexName).getAll(key));
+}
+
+export async function getAllPrimaryKeysByIndex(storeName: string, indexName: string, key: IDBValidKey): Promise<IDBValidKey[]> {
+  const database = await openRiskDatabase();
+  try {
+    const transaction = database.transaction(storeName, "readonly");
+    const done = transactionDone(transaction);
+    const keys = await new Promise<IDBValidKey[]>((resolve, reject) => {
+      const result: IDBValidKey[] = [];
+      const request = transaction.objectStore(storeName).index(indexName).openKeyCursor(IDBKeyRange.only(key));
+      request.onerror = () => reject(request.error ?? new Error("Falha ao listar chaves do armazenamento local."));
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) { resolve(result); return; }
+        result.push(cursor.primaryKey);
+        cursor.continue();
+      };
+    });
+    await done;
+    return keys;
+  } finally { database.close(); }
 }
 
 export function putInStore<T>(storeName: string, value: T): Promise<void> {

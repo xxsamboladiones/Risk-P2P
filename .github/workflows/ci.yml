@@ -10,15 +10,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
       - uses: dtolnay/rust-toolchain@stable
       - uses: pnpm/action-setup@v4
         with: { version: 10.15.0 }
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: pnpm }
       - run: pnpm install --frozen-lockfile
+      - run: node scripts/verify-migration-integrity.mjs --base "${{ github.event.pull_request.base.sha || github.event.before }}"
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build:web
+      - run: pnpm verify:turn-config
       - name: Build desktop Rust sidecar
         run: pnpm build:backend:desktop
       - name: Validate Electron bundle with sidecar
@@ -41,6 +44,12 @@ jobs:
         run: cargo clippy --manifest-path desktop-backend/Cargo.toml --all-targets -- -D warnings
       - name: Desktop backend tests
         run: cargo test --manifest-path desktop-backend/Cargo.toml
+      - name: Format TURN credential issuer
+        run: cargo fmt --manifest-path server/Cargo.toml --check
+      - name: TURN credential issuer clippy
+        run: cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings
+      - name: TURN credential issuer tests
+        run: cargo test --manifest-path server/Cargo.toml
 
   desktop-windows:
     runs-on: windows-latest

@@ -40,6 +40,7 @@ jobs:
         with: { node-version: 22, cache: pnpm }
       - run: pnpm install --frozen-lockfile
       - run: node scripts/verify-release-version.mjs
+      - run: pnpm verify:migrations
       - run: pnpm typecheck
       - run: pnpm test
       - name: Verify ephemeral Supabase Realtime rendezvous

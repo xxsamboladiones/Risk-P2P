@@ -1,5 +1,7 @@
-# Servidor central legado
+# Servidor central legado e emissor TURN
 
-Este diretório contém a arquitetura centralizada anterior do Risk. Ele não participa do aplicativo desktop P2P, não é iniciado pelo fluxo padrão e não deve receber novas funcionalidades.
+As rotas de conta, comunidades e mensagens deste diretório pertencem à arquitetura centralizada anterior do Risk. Elas não participam do aplicativo desktop P2P e não são iniciadas pelo fluxo padrão.
 
-O caminho suportado é Electron + sidecar local em `desktop-backend` + Supabase Realtime efêmero + WebRTC P2P. O servidor permanece temporariamente apenas para referência e migração de instalações antigas.
+O endpoint `/rtc/credentials` é a exceção mantida: ele pode emitir credenciais TURN temporárias para deployments autenticados ou, quando explicitamente habilitado, para o modo P2P local protegido por rate limit. O segredo compartilhado nunca é enviado ao aplicativo.
+
+Consulte `infrastructure/coturn/README.md` para configuração, TLS, portas e variáveis de produção.

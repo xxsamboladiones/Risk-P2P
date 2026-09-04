@@ -66,4 +66,29 @@ describe("SupabaseSignalingProvider reconnect sends", () => {
     });
     vi.useRealTimers();
   });
+
+  it("não deixa a reabertura presa quando removeChannel nunca resolve", async () => {
+    vi.useFakeTimers();
+    const provider = new SupabaseSignalingProvider();
+    const state = internals(provider);
+    const replacement = {
+      on: vi.fn(function (this: unknown) { return replacement; }),
+      subscribe: vi.fn(),
+    };
+    state.roomId = "room-test";
+    state.peerId = "peer-test";
+    state.channelName = "risk:room:test";
+    state.channel = {};
+    state.client = {
+      removeChannel: vi.fn(() => new Promise(() => undefined)),
+      channel: vi.fn(() => replacement),
+    };
+
+    const reopening = state.reopenChannel();
+    await vi.advanceTimersByTimeAsync(3_100);
+    await reopening;
+    expect(state.channel).toBe(replacement);
+    expect(replacement.subscribe).toHaveBeenCalledOnce();
+    vi.useRealTimers();
+  });
 });

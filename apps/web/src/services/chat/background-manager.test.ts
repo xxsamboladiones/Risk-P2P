@@ -5,6 +5,8 @@ const runtime = vi.hoisted(() => ({
   connected: [] as string[],
   membershipConnected: [] as string[],
   disconnected: [] as string[],
+  failedOnce: new Set<string>(),
+  connectAttempts: new Map<string, number>(),
 }));
 
 vi.mock("../offline/social-storage", async () => {
@@ -36,6 +38,8 @@ vi.mock("../../chat", () => ({
     async connect(channelId: string, _displayName?: string, _iceServers?: RTCIceServer[], options?: { membershipOnly?: boolean }): Promise<void> {
       this.channelId = channelId;
       this.membershipOnly = options?.membershipOnly === true;
+      runtime.connectAttempts.set(channelId, (runtime.connectAttempts.get(channelId) ?? 0) + 1);
+      if (runtime.failedOnce.delete(channelId)) throw new Error("falha temporária");
       if (this.membershipOnly) runtime.membershipConnected.push(channelId);
       else runtime.connected.push(channelId);
       this.statusListeners.forEach((listener) => listener("connected"));
@@ -50,7 +54,11 @@ vi.mock("../../chat", () => ({
   },
 }));
 
-import { BackgroundChatManager, MAX_BACKGROUND_PRIVATE_CHATS } from "./background-manager";
+import {
+  BackgroundChatManager,
+  MAX_BACKGROUND_MEMBERSHIP_GROUPS,
+  MAX_BACKGROUND_PRIVATE_CHATS,
+} from "./background-manager";
 
 function groupWithTextChannels(...ids: string[]): LocalGroup {
   return {
@@ -82,6 +90,8 @@ describe("BackgroundChatManager", () => {
     runtime.connected.length = 0;
     runtime.membershipConnected.length = 0;
     runtime.disconnected.length = 0;
+    runtime.failedOnce.clear();
+    runtime.connectAttempts.clear();
   });
 
   it("não ocupa o canal ativo nem o canal reservado pela chamada", async () => {
@@ -140,5 +150,37 @@ describe("BackgroundChatManager", () => {
     expect(manager.privateSession("dm-lru-8")?.status).toBe("ready");
     expect(runtime.disconnected).toContain("dm-lru-1");
     await manager.disconnect();
+  });
+
+  it("limits membership sessions and reports the groups waiting for capacity", async () => {
+    const manager = new BackgroundChatManager();
+    const groups = Array.from({ length: MAX_BACKGROUND_MEMBERSHIP_GROUPS + 2 }, (_, index) => ({
+      ...groupWithTextChannels(),
+      groupId: `group_background_${String(index).padStart(8, "0")}`,
+    }));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    await manager.sync(groups, "Ana", []);
+
+    expect(runtime.membershipConnected).toHaveLength(MAX_BACKGROUND_MEMBERSHIP_GROUPS);
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("2 grupos aguardam uma vaga"));
+    warning.mockRestore();
+    await manager.disconnect();
+  });
+
+  it("retries a transient background connection failure", async () => {
+    vi.useFakeTimers();
+    const manager = new BackgroundChatManager();
+    runtime.failedOnce.add("background-retry");
+
+    await manager.sync([groupWithTextChannels("background-retry")], "Ana", []);
+    expect(runtime.connectAttempts.get("background-retry")).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    await Promise.resolve();
+    expect(runtime.connectAttempts.get("background-retry")).toBe(2);
+    expect(runtime.connected).toContain("background-retry");
+    await manager.disconnect();
+    vi.useRealTimers();
   });
 });

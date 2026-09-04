@@ -9,9 +9,18 @@ const runtime = vi.hoisted(() => ({
     openPeers: Set<string>;
     events: TransportEvents;
     closed: boolean;
+    options?: unknown;
   }>(),
   messages: [] as Array<{ id: string; content: string }>,
   appliedRevocations: [] as string[],
+  networkContext: { preference: "auto", networkInterfaces: [] } as {
+    preference: "auto" | "internet-direct" | "private-vpn";
+    networkInterfaces: Array<{ name: string; address: string; family: "IPv4" | "IPv6"; provider: "zerotier" | "tailscale" | "wireguard" | "vpn" | "unknown" }>;
+  },
+}));
+
+vi.mock("./services/network/runtime", () => ({
+  loadRtcNetworkContext: vi.fn(async () => runtime.networkContext),
 }));
 
 vi.mock("./services/offline/social-storage", async () => {
@@ -36,10 +45,11 @@ vi.mock("@risk/rtc", () => ({
       openPeers: Set<string>;
       events: TransportEvents;
       closed: boolean;
+      options?: unknown;
     };
 
-    constructor(peerId: string, _iceServers: RTCIceServer[], events: TransportEvents) {
-      this.entry = { peerId, remotes: new Set(), openPeers: new Set(), events, closed: false };
+    constructor(peerId: string, _iceServers: RTCIceServer[], events: TransportEvents, options?: unknown) {
+      this.entry = { peerId, remotes: new Set(), openPeers: new Set(), events, closed: false, options };
       runtime.transports.set(peerId, this.entry);
     }
 
@@ -98,6 +108,7 @@ vi.mock("./services/attachments/desktop-storage", () => ({
 }));
 
 vi.mock("./services/offline/chat-storage", () => ({
+  loadLocalMessage: vi.fn(async () => undefined),
   loadLocalMessages: vi.fn(async () => []),
   saveLocalMessage: vi.fn(async (message: { id: string; content: string }) => {
     runtime.messages.push(message);
@@ -135,11 +146,29 @@ describe("ciclo de conexão do ChatController", () => {
     runtime.transports.clear();
     runtime.messages.length = 0;
     runtime.appliedRevocations.length = 0;
+    runtime.networkContext = { preference: "auto", networkInterfaces: [] };
     vi.mocked(loadLocalGroups).mockReset().mockResolvedValue([]);
   });
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it("informa o estado atual a uma interface que começa a observar uma sessão já conectada", async () => {
+    const hub = new InMemorySignalingHub();
+    const local = await identity("Ana");
+    const chat = new ChatController(() => new InMemorySignalingProvider(hub));
+    await chat.connect("canal-compartilhado", local.displayName, [], {
+      identity: local,
+      namespace: "friend",
+    });
+
+    const statuses: ChatConnectionStatus[] = [];
+    const unsubscribe = chat.onStatus((status) => statuses.push(status));
+    expect(statuses).toEqual(["connected"]);
+
+    unsubscribe();
+    await chat.disconnect();
   });
 
   it("continua aguardando sem transformar ausência de peer em erro", async () => {
@@ -163,7 +192,23 @@ describe("ciclo de conexão do ChatController", () => {
     await chat.disconnect();
   });
 
-  it("autentica dois peers e entrega mensagens sem atualização de página", async () => {
+  it("aplica a preferência VPN também ao transporte do chat", async () => {
+    const hub = new InMemorySignalingHub();
+    const local = await identity("Ana");
+    runtime.networkContext = {
+      preference: "private-vpn",
+      networkInterfaces: [{ name: "ztabcdef", address: "10.147.20.5", family: "IPv4", provider: "zerotier" }],
+    };
+    const chat = new ChatController(() => new InMemorySignalingProvider(hub));
+    await chat.connect("canal-vpn", local.displayName, [], { identity: local, namespace: "friend" });
+    expect(runtime.transports.get(local.peerId)?.options).toEqual(expect.objectContaining({
+      networkPreference: "private-vpn",
+      networkInterfaces: runtime.networkContext.networkInterfaces,
+    }));
+    await chat.disconnect();
+  });
+
+  it("autentica dois peers e entrega a mesma mensagem às interfaces interna e externa", async () => {
     const hub = new InMemorySignalingHub();
     const ana = await identity("Ana");
     const beto = await identity("Beto");
@@ -171,10 +216,12 @@ describe("ciclo de conexão do ChatController", () => {
     const second = new ChatController(() => new InMemorySignalingProvider(hub));
     const firstStatuses: ChatConnectionStatus[] = [];
     const secondStatuses: ChatConnectionStatus[] = [];
-    const received: string[] = [];
+    const receivedInCall: string[] = [];
+    const receivedOutsideCall: string[] = [];
     first.onStatus((status) => firstStatuses.push(status));
     second.onStatus((status) => secondStatuses.push(status));
-    second.onMessage((message) => received.push(message.content));
+    second.onMessage((message) => receivedInCall.push(message.content));
+    second.onMessage((message) => receivedOutsideCall.push(message.content));
 
     await first.connect("canal-tempo-real", ana.displayName, [], {
       identity: ana,
@@ -192,8 +239,59 @@ describe("ciclo de conexão do ChatController", () => {
       expect(secondStatuses.at(-1)).toBe("ready");
     });
     await first.send("Olá em tempo real");
-    await vi.waitFor(() => expect(received).toEqual(["Olá em tempo real"]));
+    await vi.waitFor(() => {
+      expect(receivedInCall).toEqual(["Olá em tempo real"]);
+      expect(receivedOutsideCall).toEqual(["Olá em tempo real"]);
+    });
     expect(runtime.messages).toHaveLength(2);
+
+    await Promise.all([first.disconnect(), second.disconnect()]);
+  });
+
+  it("sincroniza respostas, edições, reações, fixações, exclusões e digitação negociadas", async () => {
+    const hub = new InMemorySignalingHub();
+    const ana = await identity("Ana");
+    const beto = await identity("Beto");
+    const first = new ChatController(() => new InMemorySignalingProvider(hub));
+    const second = new ChatController(() => new InMemorySignalingProvider(hub));
+    const remoteMessages = new Map<string, Parameters<Parameters<typeof second.onMessage>[0]>[0]>();
+    let typingNames: string[] = [];
+    second.onMessage((message) => remoteMessages.set(message.id, message));
+    second.onTyping((participants) => { typingNames = participants.map((participant) => participant.displayName); });
+
+    await first.connect("canal-recursos-chat", ana.displayName, [], {
+      identity: ana,
+      trustedPeers: [publicIdentity(beto)],
+      namespace: "friend",
+    });
+    await second.connect("canal-recursos-chat", beto.displayName, [], {
+      identity: beto,
+      trustedPeers: [publicIdentity(ana)],
+      namespace: "friend",
+    });
+    await vi.waitFor(() => {
+      expect((first as unknown as { openDataPeers: Set<string> }).openDataPeers.size).toBe(1);
+      expect((second as unknown as { openDataPeers: Set<string> }).openDataPeers.size).toBe(1);
+    });
+
+    first.setTyping(true);
+    await vi.waitFor(() => expect(typingNames).toEqual(["Ana"]));
+    first.setTyping(false);
+    await vi.waitFor(() => expect(typingNames).toEqual([]));
+
+    const original = await first.send("Texto original");
+    await vi.waitFor(() => expect(remoteMessages.get(original.id)?.content).toBe("Texto original"));
+    await first.editMessage(original.id, "Texto corrigido");
+    await vi.waitFor(() => expect(remoteMessages.get(original.id)?.editedContent).toBe("Texto corrigido"));
+    await first.setReaction(original.id, "👍", true);
+    await vi.waitFor(() => expect(remoteMessages.get(original.id)?.reactions?.["👍"]).toEqual([ana.peerId]));
+    await first.setPinned(original.id, true);
+    await vi.waitFor(() => expect(remoteMessages.get(original.id)?.pinnedAt).toBeTruthy());
+
+    const reply = await first.send("Uma resposta", { replyToId: original.id });
+    await vi.waitFor(() => expect(remoteMessages.get(reply.id)?.replyToId).toBe(original.id));
+    await first.deleteMessage(original.id);
+    await vi.waitFor(() => expect(remoteMessages.get(original.id)?.deletedAt).toBeTruthy());
 
     await Promise.all([first.disconnect(), second.disconnect()]);
   });
@@ -313,7 +411,7 @@ describe("ciclo de conexão do ChatController", () => {
     const currentIdentity = await identity("Atual");
     const oldIdentity = await identity("Antigo");
     const current = new ChatController(() => new InMemorySignalingProvider(hub));
-    const old = new ChatController(() => new InMemorySignalingProvider(hub, "0.1.0"));
+    const old = new ChatController(() => new InMemorySignalingProvider(hub, "1.0.0"));
     const statuses: ChatConnectionStatus[] = [];
     current.onStatus((status) => statuses.push(status));
 

@@ -166,11 +166,51 @@ describe("MeshWebRTCTransport", () => {
     await transport.disconnect();
   });
 
+  it("implementa o ciclo de sessão comum a Mesh e SFU", async () => {
+    const localPeerId = "00000000-0000-4000-8000-000000000001";
+    const transport = new MeshWebRTCTransport(localPeerId, [], events());
+    await transport.join({ roomId: "room-1", localPeerId });
+    await transport.connectPeer("00000000-0000-4000-8000-000000000002", false);
+    expect(transport.kind).toBe("mesh");
+    expect(transport.getDiagnostics()).toHaveLength(1);
+    await transport.leave();
+    expect(transport.getDiagnostics()).toHaveLength(0);
+    await expect(transport.join({ roomId: "room-2", localPeerId: "outro-peer" })).rejects.toThrow("outro peer local");
+  });
+
   it("preserva ICE normal com host, STUN e TURN habilitados", async () => {
     const iceServers = [{ urls: "stun:stun.example.test" }, { urls: "turn:turn.example.test" }];
     const transport = new MeshWebRTCTransport("local", iceServers, events());
     await transport.connect("remote", false);
     expect(FakePeerConnection.configurations[0]).toEqual({ iceServers, iceTransportPolicy: "all" });
+  });
+
+  it("prioriza o candidate ZeroTier antes de enviá-lo ao peer", async () => {
+    const callbacks = events();
+    const transport = new MeshWebRTCTransport("local", [], callbacks, {
+      networkPreference: "private-vpn",
+      networkInterfaces: [{ name: "ztabcd1234", address: "10.147.20.5", family: "IPv4", provider: "zerotier" }],
+    });
+    await transport.connect("remote", false);
+    FakePeerConnection.instances[0]!.onicecandidate?.({
+      candidate: { toJSON: () => ({ candidate: "candidate:1 1 udp 1800000000 10.147.20.5 50000 typ host" }) },
+    } as unknown as RTCPeerConnectionIceEvent);
+    expect(callbacks.sendIce).toHaveBeenCalledWith("remote", expect.objectContaining({
+      candidate: expect.stringContaining("udp 2130706431 10.147.20.5"),
+    }));
+  });
+
+  it("não sinaliza o candidate VPN quando internet direta foi escolhida", async () => {
+    const callbacks = events();
+    const transport = new MeshWebRTCTransport("local", [], callbacks, {
+      networkPreference: "internet-direct",
+      networkInterfaces: [{ name: "tailscale0", address: "100.64.0.8", family: "IPv4", provider: "tailscale" }],
+    });
+    await transport.connect("remote", false);
+    FakePeerConnection.instances[0]!.onicecandidate?.({
+      candidate: { toJSON: () => ({ candidate: "candidate:1 1 udp 2122260223 100.64.0.8 50000 typ host" }) },
+    } as unknown as RTCPeerConnectionIceEvent);
+    expect(callbacks.sendIce).not.toHaveBeenCalled();
   });
 
   it("reavalia a rota selecionada a cada getStats sem expor o endereço", async () => {

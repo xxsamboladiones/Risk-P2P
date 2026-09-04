@@ -19,6 +19,15 @@ export class DesktopAttachmentStorage extends IndexedDbAttachmentStorage {
     return value.exists === true;
   }
 
+  override async listMissingChunks(transferId: string, chunkCount: number): Promise<number[]> {
+    const response = await this.request(`/p2p/attachments/${encodeURIComponent(transferId)}/missing`);
+    const value = await response.json() as { missing?: unknown };
+    if (!Array.isArray(value.missing) || value.missing.some((index) => !Number.isSafeInteger(index) || index < 0 || index >= chunkCount)) {
+      throw new Error("Backend Rust retornou uma lista inválida de chunks ausentes.");
+    }
+    return value.missing as number[];
+  }
+
   override async writeChunk(transferId: string, frame: AttachmentChunkFrame): Promise<void> {
     await this.request(`/p2p/attachments/${encodeURIComponent(transferId)}/chunks/${frame.index}`, {
       method: "POST",
@@ -91,6 +100,7 @@ export class DesktopAttachmentStorage extends IndexedDbAttachmentStorage {
         chunkSize: manifest.chunkSize,
         chunkCount: manifest.chunkCount,
         contentHash: manifest.contentHash,
+        channelId: manifest.channelId,
       }),
     });
   }

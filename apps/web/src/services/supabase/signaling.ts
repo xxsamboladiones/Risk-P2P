@@ -39,6 +39,7 @@ const CLIENT_VERSION = import.meta.env.VITE_RISK_APP_VERSION ?? "0.2.1";
 const PRESENCE_LEAVE_GRACE_MS = 10_000;
 const SESSION_TIMESTAMP_TOLERANCE_MS = 1_500;
 const SIGNALING_RECONNECT_SEND_TIMEOUT_MS = 20_000;
+const SIGNALING_CHANNEL_CLEANUP_TIMEOUT_MS = 3_000;
 
 export class SupabaseSignalingProvider implements SignalingProvider {
   private readonly callbacks: CallbackSets = {
@@ -131,8 +132,8 @@ export class SupabaseSignalingProvider implements SignalingProvider {
     const channel = this.channel;
     this.channel = undefined;
     if (channel) {
-      try { await channel.untrack(); } catch { /* channel may already be closed */ }
-      if (this.client) await this.client.removeChannel(channel);
+      await this.settleChannelOperation(() => channel.untrack());
+      await this.removeChannelBestEffort(channel);
     }
     for (const peerId of this.presencePeers.keys()) this.emit("peerLeft", peerId);
     this.presencePeers.clear();
@@ -198,8 +199,16 @@ export class SupabaseSignalingProvider implements SignalingProvider {
   private async reopenChannel(): Promise<void> {
     if (this.disconnecting || !this.client || !this.channelName || !this.peerId) return;
     const previous = this.channel;
-    if (previous) await this.client.removeChannel(previous).catch(() => undefined);
-    const channel = this.client.channel(this.channelName, { config: { presence: { key: this.peerId }, broadcast: { self: false, ack: true } } });
+    if (previous) await this.removeChannelBestEffort(previous);
+    if (this.disconnecting || !this.client || !this.channelName || !this.peerId) return;
+    let channel: RealtimeChannel;
+    try {
+      channel = this.client.channel(this.channelName, { config: { presence: { key: this.peerId }, broadcast: { self: false, ack: true } } });
+    } catch {
+      this.setStatus("reconnecting");
+      this.scheduleReconnect();
+      return;
+    }
     this.channel = channel;
     this.registerChannelListeners(channel);
     channel.subscribe(async (status) => {
@@ -208,6 +217,8 @@ export class SupabaseSignalingProvider implements SignalingProvider {
       if (status === "SUBSCRIBED") {
         try {
           await channel.track({ peerId: this.peerId!, joinedAt: this.sessionStartedAt, clientVersion: CLIENT_VERSION });
+          if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+          this.reconnectTimer = undefined;
           this.reconnectAttempts = 0;
           this.reconcilePresence();
           this.setStatus("connected");
@@ -220,6 +231,26 @@ export class SupabaseSignalingProvider implements SignalingProvider {
         this.scheduleReconnect();
       }
     });
+  }
+
+  private async removeChannelBestEffort(channel: RealtimeChannel): Promise<void> {
+    const client = this.client;
+    if (!client) return;
+    await this.settleChannelOperation(() => client.removeChannel(channel));
+  }
+
+  private async settleChannelOperation(operation: () => Promise<unknown>): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.resolve().then(operation).catch(() => undefined),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, SIGNALING_CHANNEL_CLEANUP_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private reconcilePresence(): void {

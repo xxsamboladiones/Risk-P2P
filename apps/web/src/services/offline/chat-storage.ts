@@ -6,36 +6,44 @@ export type LocalChatMessage = {
   createdAt: string;
   authorPeerId?: string | null;
   signature?: string | null;
+  replyToId?: string | null;
+  editedContent?: string | null;
+  editedAt?: string | null;
+  deletedAt?: string | null;
+  pinnedAt?: string | null;
+  pinnedByPeerId?: string | null;
+  reactions?: Record<string, string[]>;
 };
 
-import { OFFLINE_STORES, openRiskDatabase } from "./database";
+import { OFFLINE_STORES, getFromStore, openRiskDatabase } from "./database";
+import { backendRequest, desktopConfig, resetDesktopBackendClient } from "./desktop-backend-client";
 const STORE = OFFLINE_STORES.messages;
-type DesktopBackendConfig = { baseUrl: string; token?: string };
-let configPromise: Promise<DesktopBackendConfig | null> | undefined;
 const migratedChannels = new Set<string>();
-const DEV_BACKEND_PROXY = "/__risk-api";
 
 export function resetChatStorageRuntime(): void {
-  configPromise = undefined;
+  resetDesktopBackendClient();
 }
 
-export type MessagePageOptions = { before?: string; limit?: number };
+export type MessagePageOptions = { before?: string; beforeId?: string; limit?: number };
 
 export async function loadLocalMessages(channelId: string, options: MessagePageOptions = {}): Promise<LocalChatMessage[]> {
   const limit = Math.max(1, Math.min(200, Math.trunc(options.limit ?? 100)));
   const config = await desktopConfig();
-  if (!config) return loadLegacyMessages(channelId, options.before, limit);
-  const query = `?limit=${limit}${options.before ? `&before=${encodeURIComponent(options.before)}` : ""}`;
-  const current = await backendRequest<LocalChatMessage[]>(config, channelId, { method: "GET" }, query);
+  if (!config) return loadLegacyMessages(channelId, options.before, options.beforeId, limit);
+  const query = `?limit=${limit}${options.before ? `&before=${encodeURIComponent(options.before)}` : ""}${options.beforeId ? `&beforeId=${encodeURIComponent(options.beforeId)}` : ""}`;
+  const current = await backendRequest<LocalChatMessage[]>(config, "messages", channelId, { method: "GET" }, query);
   if (options.before) return current;
   if (!migratedChannels.has(channelId)) {
     migratedChannels.add(channelId);
-    const legacy = await loadLegacyMessages(channelId, undefined, 200);
+    const legacy = await loadAllLegacyMessages(channelId);
     const missing = legacy.filter((message) => !current.some((item) => item.id === message.id));
     for (const message of missing) {
-      await backendRequest(config, channelId, { method: "POST", body: JSON.stringify(message) });
+      // A migração pode reencontrar uma mensagem antiga que já existe fora da
+      // primeira página do SQLite. INSERT OR IGNORE preserva sua projeção de
+      // edição/exclusão/reação em vez de restaurar os campos legados vazios.
+      await backendRequest(config, "messages", channelId, { method: "POST", body: JSON.stringify(message) }, "?insertOnly=true");
     }
-    if (missing.length) return backendRequest<LocalChatMessage[]>(config, channelId, { method: "GET" }, query);
+    if (missing.length) return backendRequest<LocalChatMessage[]>(config, "messages", channelId, { method: "GET" }, query);
   }
   return current;
 }
@@ -43,70 +51,50 @@ export async function loadLocalMessages(channelId: string, options: MessagePageO
 export async function saveLocalMessage(message: LocalChatMessage): Promise<void> {
   const config = await desktopConfig();
   if (config) {
-    await backendRequest(config, message.channelId, { method: "POST", body: JSON.stringify(message) });
+    await backendRequest(config, "messages", message.channelId, { method: "POST", body: JSON.stringify(message) });
     return;
   }
   await saveLegacyMessage(message);
 }
 
-async function desktopConfig(): Promise<DesktopBackendConfig | null> {
-  if (window.desktop?.getBackendConfig) {
-    if (!configPromise) {
-      configPromise = window.desktop.getBackendConfig()
-        .then((config) => ({ baseUrl: config.baseUrl.replace(/\/$/, ""), token: config.token }))
-        .catch((error) => {
-          configPromise = undefined;
-          throw error;
-        });
-    }
-    return configPromise;
+export async function loadLocalMessage(channelId: string, messageId: string): Promise<LocalChatMessage | undefined> {
+  const config = await desktopConfig();
+  if (config) {
+    const messages = await backendRequest<LocalChatMessage[]>(
+      config,
+      "messages",
+      channelId,
+      { method: "GET" },
+      `?messageId=${encodeURIComponent(messageId)}&limit=1`,
+    );
+    return messages[0];
   }
-
-  if (import.meta.env.DEV && import.meta.env.VITE_API_URL === DEV_BACKEND_PROXY) {
-    return { baseUrl: DEV_BACKEND_PROXY };
-  }
-
-  return null;
+  const message = await getFromStore<LocalChatMessage>(STORE, messageId);
+  return message?.channelId === channelId ? message : undefined;
 }
 
-async function backendRequest<T>(config: DesktopBackendConfig, channelId: string, init: RequestInit, query = ""): Promise<T> {
-  const perform = async (accessToken: string | null) => {
-    const headers = new Headers({ "content-type": "application/json", ...init.headers });
-    if (config.token) headers.set("x-risk-desktop-token", config.token);
-    if (accessToken) headers.set("authorization", `Bearer ${accessToken}`);
-    return fetch(`${config.baseUrl}/p2p/messages/${encodeURIComponent(channelId)}${query}`, { ...init, headers });
-  };
-  let accessToken = sessionStorage.getItem("accessToken");
-  let response = await perform(accessToken);
-  if (response.status === 401) {
-    const refreshHeaders = new Headers();
-    if (config.token) refreshHeaders.set("x-risk-desktop-token", config.token);
-    const refresh = await fetch(`${config.baseUrl}/auth/refresh`, {
-      method: "POST",
-      headers: refreshHeaders,
-    });
-    if (refresh.ok) {
-      const session = await refresh.json() as { accessToken: string };
-      sessionStorage.setItem("accessToken", session.accessToken);
-      accessToken = session.accessToken;
-      response = await perform(accessToken);
-    }
-  }
-  const body = await response.json().catch(() => ({})) as T & { message?: string };
-  if (!response.ok) throw new Error(body.message ?? `Falha no histórico SQLite (HTTP ${response.status}).`);
-  return body;
-}
-
-async function loadLegacyMessages(channelId: string, before: string | undefined, limit: number): Promise<LocalChatMessage[]> {
+async function loadLegacyMessages(channelId: string, before: string | undefined, beforeId: string | undefined, limit: number): Promise<LocalChatMessage[]> {
   const database = await openRiskDatabase();
   return new Promise((resolve, reject) => {
     const transaction = database.transaction(STORE, "readonly");
     const index = transaction.objectStore(STORE).index("channelId");
     const request = index.getAll(IDBKeyRange.only(channelId));
     request.onsuccess = () => resolve((request.result as LocalChatMessage[])
-      .filter((message) => !before || message.createdAt < before)
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt)).slice(-limit));
+      .filter((message) => !before || message.createdAt < before || (message.createdAt === before && Boolean(beforeId) && message.id < beforeId!))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)).slice(-limit));
     request.onerror = () => reject(request.error ?? new Error("Falha ao ler o histórico local."));
+    transaction.oncomplete = () => database.close();
+  });
+}
+
+async function loadAllLegacyMessages(channelId: string): Promise<LocalChatMessage[]> {
+  const database = await openRiskDatabase();
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(STORE, "readonly");
+    const request = transaction.objectStore(STORE).index("channelId").getAll(IDBKeyRange.only(channelId));
+    request.onsuccess = () => resolve((request.result as LocalChatMessage[])
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt)));
+    request.onerror = () => reject(request.error ?? new Error("Falha ao migrar o histórico local completo."));
     transaction.oncomplete = () => database.close();
   });
 }

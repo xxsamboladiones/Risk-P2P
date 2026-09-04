@@ -13,6 +13,8 @@
 - compartilhamento de tela com presets de qualidade até 1080p/60 FPS;
 - modo de tela cheia com foco em uma transmissão e zoom pelo scroll do mouse;
 - chat integrado durante chamadas;
+- respostas, edição, exclusão, reações, menções, mensagens fixadas e indicador de digitação;
+- Markdown seguro, links externos validados, drag-and-drop, galeria e busca de anexos;
 - envio P2P de arquivos e anexos pelo DataChannel;
 - previews de imagens, vídeos e áudios;
 - grupos com canais de texto e voz;
@@ -30,6 +32,7 @@
 - busca local, diagnóstico de conexão e estimativa de armazenamento;
 - histórico local paginado, carregado em blocos de 100 mensagens;
 - controle de ensurdecer durante chamadas.
+- preferência oficial de rota entre seleção automática, internet direta e VPN privada (ZeroTier, Tailscale ou WireGuard).
 
 No Windows, o compartilhamento de tela pode capturar o áudio do sistema usando o caminho nativo do Electron. No Linux existe um caminho experimental via PipeWire para compartilhar áudio do sistema sem retransmitir o próprio áudio reproduzido pelo Risk; quando esse caminho não está disponível, o compartilhamento continua somente com vídeo.
 
@@ -102,7 +105,22 @@ O desktop aplica por padrão uma quota total de 50 GiB para anexos e remove tran
 
 ## Chamadas
 
-O transporte atual usa WebRTC Mesh e limita cada cliente a cinco peers remotos, totalizando até **seis participantes por chamada**.
+O transporte ativo atual usa WebRTC Mesh e limita cada cliente a cinco peers
+remotos, totalizando até **seis participantes por chamada**. A camada de chamada
+agora depende do contrato `CallTransport`, não da implementação Mesh concreta.
+Uma política seleciona Mesh para até quatro participantes e recomenda SFU a
+partir do quinto ou quando RTT/jitter indicam rede degradada. Como nenhum
+provedor SFU está registrado nesta versão, o fallback continua sendo Mesh e essa
+condição aparece explicitamente no diagnóstico.
+
+O código da chamada é modular: a fachada `call.ts` delega a sessão para
+`CallController`, e mídia, participantes, autenticação, recuperação,
+diagnóstico e binding de signaling possuem módulos próprios em `src/call/`.
+
+No renderer, `application/runtime.ts` é o único composition root. As views
+recebem gateway, chamadas, chats, convites e sessão através de
+`RiskApplicationProvider`, sem importar diretamente Supabase, Mesh ou o adapter
+HTTP do backend local.
 
 A interface de chamada suporta:
 
@@ -121,6 +139,12 @@ A interface de chamada suporta:
 - autenticação ECDSA dos membros antes de publicar mídia;
 - indicador local de qualidade baseado em RTT, jitter e perda;
 - bitrate adaptado automaticamente ao tamanho da chamada.
+
+Em **Configurações → Rede**, o usuário pode deixar a seleção automática,
+ignorar adaptadores VPN ou priorizar uma VPN privada. O modo VPN eleva a
+prioridade dos candidates do adaptador detectado, mas conserva conexão direta,
+STUN e TURN como fallback. A preferência também vale para chats, convites e
+transferências iniciados depois da alteração.
 
 ## Componentes
 
@@ -159,17 +183,28 @@ VITE_SUPABASE_URL=https://seu-projeto.supabase.co
 VITE_SUPABASE_ANON_KEY=sua-chave-publica
 VITE_DEBUG_SIGNALING=false
 VITE_ENABLE_LEGACY_SERVER=false
+# VITE_TURN_CREDENTIALS_URL=https://auth.risk.example/rtc/credentials
 ```
 
-Configuração pública de ICE também pode ser definida por build:
+`VITE_TURN_CREDENTIALS_URL` contém somente a URL HTTPS de um emissor remoto. O
+Risk busca credenciais TURN temporárias, valida o contrato, mantém o resultado
+apenas em memória e renova antes do vencimento. A origem do endpoint é incluída
+automaticamente na CSP do aplicativo.
+
+Uma configuração pública de ICE também pode ser definida como fallback de build:
 
 ```dotenv
 VITE_ICE_SERVERS_JSON=[{"urls":["stun:stun.example.com:3478"]}]
 ```
 
-Nunca coloque `service_role`, senha de banco, `JWT_SECRET` ou `TURN_SECRET` no frontend.
+Nunca coloque `service_role`, senha de banco, `JWT_SECRET`, `TURN_SECRET` ou uma
+credencial TURN permanente no frontend.
 
 Se a lista ICE contiver apenas `stun:`, o Risk opera em **STUN direto**. Isso funciona em muitas redes domésticas, mas não garante conexão entre CGNAT, NAT simétrico ou firewalls restritivos. A tela de diagnóstico identifica explicitamente `Somente STUN`; TURN só aparece como disponível quando uma URL `turn:`/`turns:` foi realmente entregue ao app.
+
+A implantação Coturn de produção, incluindo UDP/TCP `3478`, TLS `5349`, TLS
+sobre `443`, firewall, certificados e emissor temporário, está documentada em
+[`infrastructure/coturn/README.md`](infrastructure/coturn/README.md).
 
 ## Desenvolvimento
 
@@ -257,9 +292,10 @@ O desktop mantém:
 ```powershell
 pnpm typecheck
 pnpm test
+pnpm verify:turn-config
 ```
 
-A CI valida TypeScript, testes Web/P2P, build Web, migração de um banco 0.1 preenchido e duas instâncias empacotadas do Electron. Cada instância precisa renderizar React, iniciar o sidecar Rust saudável e conseguir gravar `localStorage` e IndexedDB na origem persistente.
+A CI valida TypeScript, testes Web/P2P, emissor de credenciais TURN, configuração Coturn, build Web, migração de um banco 0.1 preenchido e duas instâncias empacotadas do Electron. Cada instância precisa renderizar React, iniciar o sidecar Rust saudável e conseguir gravar `localStorage` e IndexedDB na origem persistente.
 O backend desktop também é verificado no Windows para cobrir os caminhos específicos de captura de áudio desse sistema.
 
 Tags `v*` executam o workflow de release para gerar NSIS, AppImage, DEB, atestados de proveniência e `SHA256SUMS.txt`. Releases Windows exigem `CSC_LINK` e `CSC_KEY_PASSWORD`: o pipeline interrompe o build se faltarem e valida a assinatura Authenticode dos executáveis antes da publicação. Builds locais continuam podendo ser não assinados. O servidor PostgreSQL antigo só é ativado explicitamente com `VITE_ENABLE_LEGACY_SERVER=true` e o profile Docker `legacy-server`.
@@ -283,6 +319,7 @@ Esta versão adiciona e melhora principalmente:
 - delegações de administrador assinadas pelo proprietário e verificáveis mesmo por peers atrasados;
 - rendezvous de grupo rotacionado após remoções, evitando que ex-membros continuem descobrindo a sala;
 - negociação explícita de versão/capacidades antes de liberar chat ou mídia;
+- negociação granular de recursos, mantendo texto básico compatível entre versões Alpha com o mesmo protocolo;
 - recuperação visual de falhas do renderer e uma tentativa controlada de reinício do sidecar;
 - revogação P2P retransmissível também ao reconectar diretamente em uma chamada;
 - reparo manual e seguro de aliases antigos da identidade local;

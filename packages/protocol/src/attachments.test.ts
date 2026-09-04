@@ -3,6 +3,7 @@ import {
   RISK_ATTACHMENT_PROTOCOL_VERSION,
   classifyAttachment,
   inferAttachmentMimeType,
+  isFileControlMessage,
   sanitizeAttachmentFilename,
   validateAttachmentManifest,
   type AttachmentManifest,
@@ -34,6 +35,25 @@ describe("attachment protocol validation", () => {
     expect(validateAttachmentManifest(manifest({ contentHash: "nope", chunkCount: -1 }))).toEqual(
       expect.arrayContaining(["invalid_content_hash", "invalid_chunk_count"]),
     );
+  });
+
+  it("rejects divergent ids, oversized chunks and inconsistent layouts", () => {
+    expect(validateAttachmentManifest(manifest({
+      id: "b".repeat(64),
+      chunkSize: 256 * 1024 + 1,
+      chunkCount: 2,
+    }))).toEqual(expect.arrayContaining([
+      "attachment_id_hash_mismatch",
+      "invalid_chunk_size",
+      "invalid_chunk_layout",
+    ]));
+  });
+
+  it("does not accept malformed control envelopes by type alone", () => {
+    expect(isFileControlMessage({ type: "file.offer" })).toBe(false);
+    expect(isFileControlMessage({ type: "file.need", transferId: "transfer_12345678", missingChunks: new Array(2_049).fill(0) })).toBe(false);
+    expect(isFileControlMessage({ type: "file.offer", transferId: "transfer_12345678", manifest: manifest() })).toBe(true);
+    expect(isFileControlMessage({ type: "peer.capabilities", protocolVersion: 999, capabilities: [] })).toBe(false);
   });
 
   it("removes path traversal and reserved filename characters", () => {

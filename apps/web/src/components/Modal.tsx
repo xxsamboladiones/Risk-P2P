@@ -22,7 +22,11 @@ export function Modal({ title, children, onClose }: { title: string; children: R
   }, [onClose]);
   return <div className="modal-backdrop" onMouseDown={onClose}>
     <section ref={dialog} className="modal" role="dialog" aria-modal="true" aria-labelledby={titleId} onMouseDown={(event) => event.stopPropagation()}>
-      <button className="modal-close" aria-label="Fechar" onClick={onClose}>×</button><h2 id={titleId}>{title}</h2>{children}
+      <header className="modal-header">
+        <h2 id={titleId}>{title}</h2>
+        <button className="modal-close" aria-label="Fechar" onClick={onClose}>×</button>
+      </header>
+      <div className="modal-content">{children}</div>
     </section>
   </div>;
 }

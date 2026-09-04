@@ -1,0 +1,44 @@
+services:
+  coturn:
+    image: coturn/coturn:4.17.0-alpine@sha256:8f80ed9d6867319340ca612b9d005aaea2444755aa4ce3dd79ddfb5f31f6e1b5
+    container_name: risk-coturn
+    restart: unless-stopped
+    network_mode: host
+    # A fase de inicialização precisa ler a chave 0600/root e abrir a porta 443.
+    # O runtime config manda o Coturn abandonar privilégios para nobody:nogroup.
+    user: "0:0"
+    read_only: true
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      TURN_REALM: ${TURN_REALM:?Defina TURN_REALM}
+      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:?Defina TURN_EXTERNAL_IP}
+      TURN_USER_QUOTA: ${TURN_USER_QUOTA:-24}
+      TURN_TOTAL_QUOTA: ${TURN_TOTAL_QUOTA:-1200}
+      TURN_MAX_BPS: ${TURN_MAX_BPS:-0}
+      TURN_BPS_CAPACITY: ${TURN_BPS_CAPACITY:-0}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+      - /var/lib/coturn:rw,noexec,nosuid,size=16m
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - ./risk-entrypoint.sh:/etc/coturn/risk-entrypoint.sh:ro
+      - ${TURN_CERT_FILE:?Defina TURN_CERT_FILE}:/etc/coturn/tls/fullchain.pem:ro
+      - ${TURN_KEY_FILE:?Defina TURN_KEY_FILE}:/etc/coturn/tls/privkey.pem:ro
+    secrets:
+      - turn_secret
+    entrypoint:
+      - /bin/sh
+      - /etc/coturn/risk-entrypoint.sh
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+secrets:
+  turn_secret:
+    file: ${TURN_SECRET_FILE:?Defina TURN_SECRET_FILE}

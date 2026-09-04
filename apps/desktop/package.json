@@ -37,8 +37,16 @@
     "files": [
       "dist/main.js",
       "dist/preload.cjs",
+      "dist/backend.js",
       "dist/desktop-lifecycle.js",
-      "dist/network-interfaces.js"
+      "dist/gpu.js",
+      "dist/ipc/index.js",
+      "dist/network-interfaces.js",
+      "dist/permissions.js",
+      "dist/protocol.js",
+      "dist/screen-capture.js",
+      "dist/tray.js",
+      "dist/window.js"
     ],
     "extraResources": [
       {

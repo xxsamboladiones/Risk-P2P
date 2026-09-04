@@ -119,6 +119,48 @@ O receptor valida canal, UUID da mensagem, tamanho, conteúdo, timestamp e assin
 
 Na versão 2, mensagens que ainda não receberam `chat.message.ack` permanecem em uma caixa de saída local. Elas são reenviadas quando um DataChannel autenticado abre e só são removidas após a confirmação do peer. IDs repetidos são deduplicados pelo receptor. Nada dessa fila passa pelo banco do Supabase.
 
+Recursos que alteram uma mensagem usam um envelope assinado independente. A
+mensagem versão 2 nunca é regravada, portanto sua assinatura original continua
+verificável:
+
+```ts
+{
+  version: 3;
+  type: "chat.event";
+  channelId: string;
+  id: string;
+  targetMessageId: string;
+  actorPeerId: string;
+  action: "reply" | "edit" | "delete" | "reaction.add" |
+          "reaction.remove" | "pin" | "unpin";
+  content?: string;
+  referenceMessageId?: string;
+  emoji?: string;
+  timestamp: number;
+  signature: string;
+}
+```
+
+Edição, exclusão e vínculo de resposta só são aplicados quando o ator também é
+o autor da mensagem alvo. Reações e fixações exigem uma identidade autenticada.
+Eventos participam de ACK, outbox e sincronização de histórico e ficam na tabela
+SQLite `p2p_chat_events` (IndexedDB no fallback web). `chat.typing` é efêmero,
+expira localmente em cinco segundos e não é persistido.
+
+O handshake preserva os campos legados e acrescenta negociação granular:
+
+```json
+{
+  "protocol": 2,
+  "client": "0.2.1",
+  "capabilities": ["files-v2", "chat-events-v1", "typing-indicator-v1"]
+}
+```
+
+O protocolo base precisa ser compatível. Recursos opcionais só são transmitidos
+a peers que os anunciam; peers sem `chat-events-v1` continuam recebendo a
+mensagem de texto original.
+
 O perfil usa `chat.profile.update`, assinado pela identidade P2P. Avatares são limitados e não fazem parte dos snapshots recorrentes de membros, evitando inflar o manifesto do grupo.
 
 ## Manifesto de grupo v2
@@ -131,7 +173,7 @@ O manifesto Alpha limita a lista ativa a 48 membros e o conjunto retransmissíve
 
 O transporte rejeita payloads acima de 64 KiB. O chat usa limite menor na validação e mensagens de até 4.000 caracteres. Quando `RTCDataChannel.bufferedAmount` ultrapassa o limite local de segurança, novas mensagens deixam de ser enfileiradas e o envio retorna falha ao chamador.
 
-O conteúdo do chat não passa pelo Supabase. No desktop, a cópia recebida é salva no SQLite local do sidecar; no modo web sem sidecar, o fallback usa IndexedDB. O histórico é lido em páginas de até 100 mensagens pela interface, com limite defensivo de 200 itens por consulta.
+O conteúdo do chat não passa pelo Supabase. No desktop, a cópia recebida é salva no SQLite local do sidecar; no modo web sem sidecar, o fallback usa IndexedDB. O histórico é lido em páginas de até 100 mensagens pela interface, com limite defensivo de 200 itens por consulta. A interface renderiza apenas um subconjunto seguro de Markdown sem `innerHTML`; links aceitam somente HTTP/HTTPS e o Electron os abre fora do renderer após nova validação no processo principal.
 
 ## Convites temporários
 

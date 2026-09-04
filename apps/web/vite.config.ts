@@ -114,11 +114,15 @@ export default defineConfig(({ command, mode }) => {
   const devApiUrl = process.env.RISK_DEV_API_URL?.trim() || DEV_API_PREFIX;
   const env = loadEnv(mode, envDir, "VITE_");
   const realtimeSources: string[] = [];
+  const turnCredentialSources: string[] = [];
   try {
     const url = new URL(env.VITE_SUPABASE_URL ?? "");
     realtimeSources.push(url.origin, `${url.protocol === "https:" ? "wss:" : "ws:"}//${url.host}`);
   } catch { /* validação de configuração apresenta o erro amigável no app */ }
-  const connectSources = ["'self'", "http://127.0.0.1:*", ...(command === "serve" ? ["http://localhost:*", "ws://127.0.0.1:*", "ws://localhost:*"] : []), ...realtimeSources].join(" ");
+  try {
+    turnCredentialSources.push(new URL(env.VITE_TURN_CREDENTIALS_URL ?? "").origin);
+  } catch { /* verify-build-env apresenta o erro antes do empacotamento */ }
+  const connectSources = ["'self'", "http://127.0.0.1:*", ...(command === "serve" ? ["http://localhost:*", "ws://127.0.0.1:*", "ws://localhost:*"] : []), ...realtimeSources, ...turnCredentialSources].join(" ");
   return {
     base: "./",
     envDir,

@@ -4,6 +4,7 @@ node_modules/
 dist/
 target/
 .env
+infrastructure/coturn/.env.production
 *.log
 coverage/
 *.tsbuildinfo

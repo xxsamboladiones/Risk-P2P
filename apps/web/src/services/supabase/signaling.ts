@@ -261,7 +261,12 @@ export class SupabaseSignalingProvider implements SignalingProvider {
     const state = channel.presenceState();
     for (const entries of Object.values(state)) {
       for (const entry of entries) {
-        if (isValidPeer(entry) && entry.peerId !== ownPeerId) next.set(entry.peerId, entry);
+        if (!isValidPeer(entry) || entry.peerId === ownPeerId) continue;
+        const selected = next.get(entry.peerId);
+        // Durante uma saída/entrada rápida o Realtime pode devolver por alguns
+        // instantes os dois metas da mesma chave. Sempre considerar a sessão
+        // mais nova, independentemente da ordem do presenceState.
+        if (!selected || entry.joinedAt > selected.joinedAt) next.set(entry.peerId, entry);
       }
     }
 
@@ -279,7 +284,10 @@ export class SupabaseSignalingProvider implements SignalingProvider {
         continue;
       }
 
-      if (Math.abs(existing.joinedAt - peer.joinedAt) > SESSION_TIMESTAMP_TOLERANCE_MS) {
+      // Reconnect do próprio canal preserva sessionStartedAt. Qualquer outro
+      // timestamp representa uma nova instância do app, inclusive quando o
+      // usuário sai e entra novamente em menos de 1,5 segundo.
+      if (existing.joinedAt !== peer.joinedAt) {
         this.peerDepartedAt.set(peerId, Math.max(Date.now(), peer.joinedAt));
         this.presencePeers.set(peerId, peer);
         this.log("peer session replaced", peerId);
@@ -321,20 +329,26 @@ export class SupabaseSignalingProvider implements SignalingProvider {
     if (clockSkew !== null && Math.abs(clockSkew) >= P2P_CLOCK_SKEW_WARNING_MS) {
       this.lastObservedClockSkewMs = clockSkew;
     }
-    if (!withinP2PClockTolerance(message.timestamp, now)) {
+
+    if (!this.presencePeers.has(message.fromPeerId)) this.reconcilePresence();
+    const presentPeer = this.presencePeers.get(message.fromPeerId);
+    // Para um peer presente, `joinedAt` e `message.timestamp` vêm do mesmo
+    // relógio remoto. Compará-los entre si mantém a proteção contra mensagens
+    // de uma sessão anterior sem exigir que os relógios dos dois PCs estejam
+    // sincronizados (inclusive quando há uma hora de diferença).
+    if (presentPeer && message.timestamp + SESSION_TIMESTAMP_TOLERANCE_MS < presentPeer.joinedAt) {
+      this.log("discarding signaling from older peer session", message.fromPeerId);
+      return false;
+    }
+    // Antes de a presença confirmar o remetente, ainda usamos a janela UTC
+    // estrita. Isso preserva a proteção para mensagens avulsas de peer ausente.
+    if (!presentPeer && !withinP2PClockTolerance(message.timestamp, now)) {
       this.clockSkewRejectedMessages += 1;
-      console.warn("Signaling WebRTC rejeitado por diferença excessiva entre os relógios.", {
+      console.warn("Signaling WebRTC rejeitado por diferença excessiva entre os relógios e peer ausente.", {
         fromPeerId: message.fromPeerId,
         clockSkewMs: clockSkew,
         type: message.type,
       });
-      return false;
-    }
-
-    if (!this.presencePeers.has(message.fromPeerId)) this.reconcilePresence();
-    const presentPeer = this.presencePeers.get(message.fromPeerId);
-    if (presentPeer && message.timestamp + SESSION_TIMESTAMP_TOLERANCE_MS < presentPeer.joinedAt) {
-      this.log("discarding signaling from older peer session", message.fromPeerId);
       return false;
     }
     const lastDeparture = this.peerDepartedAt.get(message.fromPeerId);

@@ -1,6 +1,8 @@
 export const RISK_ATTACHMENT_PROTOCOL_VERSION = 1 as const;
 
-export const DEFAULT_ATTACHMENT_CHUNK_SIZE = 256 * 1024;
+// O payload precisa deixar espaço para o cabeçalho binário, IDs e SHA-256
+// dentro do limite conservador de 64 KiB do SCTP/DataChannel.
+export const DEFAULT_ATTACHMENT_CHUNK_SIZE = 60 * 1024;
 export const MAX_ATTACHMENT_CHUNK_SIZE = 256 * 1024;
 export const MAX_ATTACHMENT_FILENAME_LENGTH = 255;
 export const MAX_ATTACHMENT_MIME_LENGTH = 127;

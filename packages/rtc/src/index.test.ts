@@ -427,6 +427,53 @@ describe("MeshWebRTCTransport", () => {
     vi.useRealTimers();
   });
 
+  it("usa o outro lado como fallback quando o peer prioritário não recupera a conexão", async () => {
+    vi.useFakeTimers();
+    const callbacks = events();
+    const peerId = "00000000-0000-4000-8000-000000000001";
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000002", [], callbacks);
+    await transport.connect(peerId, false);
+    await transport.acceptOffer(peerId, { type: "offer", sdp: "offer-inicial" });
+    callbacks.sendOffer.mockClear();
+    const connection = FakePeerConnection.instances[0]!;
+    connection.connectionState = "failed";
+    connection.onconnectionstatechange?.();
+
+    await vi.advanceTimersByTimeAsync(7_999);
+    expect(FakePeerConnection.restartIceCalls).toBe(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(FakePeerConnection.restartIceCalls).toBe(1);
+    expect(callbacks.sendOffer).toHaveBeenCalledOnce();
+
+    connection.connectionState = "connected";
+    connection.onconnectionstatechange?.();
+    await transport.disconnect();
+    vi.useRealTimers();
+  });
+
+  it("recria uma negociação que permanece em WebRTC new sem receber offer", async () => {
+    vi.useFakeTimers();
+    const callbacks = { ...events(), onDataMessage: vi.fn(), onPeerReset: vi.fn() };
+    const peerId = "00000000-0000-4000-8000-000000000001";
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000002", [], callbacks);
+    await transport.connect(peerId, false);
+
+    await vi.advanceTimersByTimeAsync(19_999);
+    expect(FakePeerConnection.instances).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(FakePeerConnection.instances).toHaveLength(2);
+    expect(callbacks.onPeerReset).toHaveBeenCalledWith(peerId);
+    expect(callbacks.sendOffer).toHaveBeenCalledOnce();
+    expect(FakePeerConnection.dataChannels).toHaveLength(1);
+
+    const replacement = FakePeerConnection.instances[1]!;
+    replacement.connectionState = "connected";
+    replacement.onconnectionstatechange?.();
+    await transport.disconnect();
+    vi.useRealTimers();
+  });
+
   it("permite recriar explicitamente um peer cujo DataChannel ficou travado", async () => {
     const callbacks = { ...events(), onDataMessage: vi.fn(), onDataState: vi.fn(), onPeerReset: vi.fn() };
     const peerId = "00000000-0000-4000-8000-000000000002";

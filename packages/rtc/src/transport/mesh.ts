@@ -36,6 +36,8 @@ import {
 
 const DEFAULT_MAX_REMOTE_PEERS = 5;
 const DISCONNECTED_RECOVERY_DELAY_MS = 4_000;
+const NEGOTIATION_WATCHDOG_DELAY_MS = 12_000;
+const SECONDARY_RECOVERY_FALLBACK_DELAY_MS = 8_000;
 const MAX_RECOVERY_DELAY_MS = 30_000;
 const RECREATE_PEER_EVERY_ATTEMPTS = 3;
 
@@ -96,6 +98,12 @@ export class MeshWebRTCTransport implements MeshCallTransport {
     if (initiator) { entry.canNegotiate = true; entry.initiator = true; }
     if (initiator && this.events.onDataMessage && !entry.dataChannel) {
       this.bindControlDataChannel(peerId, entry, entry.pc.createDataChannel(CONTROL_CHANNEL_LABEL, { ordered: true }));
+    }
+    // `new` não evolui para `failed` quando uma offer some no signaling. Arme
+    // a recuperação desde a criação do peer para que a negociação não possa
+    // permanecer parada indefinidamente sem disparar eventos do WebRTC.
+    if (entry.pc.connectionState === "new") {
+      this.schedulePeerRecovery(peerId, entry, NEGOTIATION_WATCHDOG_DELAY_MS);
     }
     if (initiator) {
       entry.needsNegotiation = true;
@@ -444,6 +452,8 @@ export class MeshWebRTCTransport implements MeshCallTransport {
       this.events.onConnectionState(peerId, pc.connectionState);
       if (pc.connectionState === "connected") this.clearPeerRecovery(peerId);
       if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
+        // Uma falha explícita deve antecipar o watchdog de negociação.
+        this.cancelPeerRecoveryTimer(peerId);
         this.schedulePeerRecovery(
           peerId,
           entry,
@@ -455,13 +465,17 @@ export class MeshWebRTCTransport implements MeshCallTransport {
   }
 
   private schedulePeerRecovery(peerId: string, entry: PeerEntry, delayMs: number): void {
-    // Um único lado inicia a recuperação para evitar glare. O outro recebe a
-    // oferta de ICE restart pela sinalização e responde normalmente.
-    if (this.localPeerId >= peerId
-      || this.peers.get(peerId) !== entry
+    if (this.peers.get(peerId) !== entry
       || entry.pc.connectionState === "connected"
       || entry.pc.connectionState === "closed"
       || this.recoveryTimers.has(peerId)) return;
+    // O peer de menor ID continua tendo prioridade para evitar duas offers ao
+    // mesmo tempo. O outro lado, porém, também tenta depois de uma margem: sem
+    // esse fallback ele podia ficar bloqueado para sempre quando o peer
+    // prioritário ou o signaling não concluíam o ICE restart.
+    const secondaryFallback = this.localPeerId > peerId && !this.recoveryAttempts.has(peerId)
+      ? SECONDARY_RECOVERY_FALLBACK_DELAY_MS
+      : 0;
     const timer = setTimeout(() => {
       this.recoveryTimers.delete(peerId);
       void this.recoverPeerConnection(peerId, entry).finally(() => {
@@ -471,7 +485,7 @@ export class MeshWebRTCTransport implements MeshCallTransport {
         const retryDelay = Math.min(MAX_RECOVERY_DELAY_MS, 2_000 * 2 ** Math.min(attempts, 4));
         this.schedulePeerRecovery(peerId, current, retryDelay);
       });
-    }, delayMs);
+    }, delayMs + secondaryFallback);
     this.recoveryTimers.set(peerId, timer);
   }
 
@@ -481,7 +495,10 @@ export class MeshWebRTCTransport implements MeshCallTransport {
     const attempt = (this.recoveryAttempts.get(peerId) ?? 0) + 1;
     this.recoveryAttempts.set(peerId, attempt);
     try {
-      if (attempt % RECREATE_PEER_EVERY_ATTEMPTS === 0) {
+      // Se este lado nunca recebeu uma offer, ele ainda não tem permissão nem
+      // DataChannel para negociar. Recriar já na primeira tentativa o promove
+      // a iniciador e rompe o impasse `WebRTC new / ICE new`.
+      if (!entry.canNegotiate || attempt % RECREATE_PEER_EVERY_ATTEMPTS === 0) {
         await this.recreatePeerForRecovery(peerId, entry, attempt);
       } else {
         await this.restartIce(peerId);
@@ -514,10 +531,14 @@ export class MeshWebRTCTransport implements MeshCallTransport {
   }
 
   private clearPeerRecovery(peerId: string): void {
+    this.cancelPeerRecoveryTimer(peerId);
+    this.recoveryAttempts.delete(peerId);
+  }
+
+  private cancelPeerRecoveryTimer(peerId: string): void {
     const timer = this.recoveryTimers.get(peerId);
     if (timer) clearTimeout(timer);
     this.recoveryTimers.delete(peerId);
-    this.recoveryAttempts.delete(peerId);
   }
 
   private applyAdaptiveVideoParameters(): Promise<void> {

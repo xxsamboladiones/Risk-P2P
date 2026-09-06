@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { DEFAULT_ATTACHMENT_CHUNK_SIZE } from "@risk/protocol/attachments";
 import { decodeAttachmentChunkFrame, encodeAttachmentChunkFrame, isAttachmentChunkFrame } from "./file-chunk-codec";
 
 const HASH = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
@@ -43,5 +44,20 @@ describe("attachment binary chunk codec", () => {
       hash: HASH,
       payload,
     })).toThrow(/tamanho/i);
+  });
+
+  it("keeps a default chunk frame below the conservative 64 KiB SCTP limit", () => {
+    const payload = new ArrayBuffer(DEFAULT_ATTACHMENT_CHUNK_SIZE);
+    const encoded = encodeAttachmentChunkFrame({
+      transferId: "t".repeat(128),
+      attachmentId: "a".repeat(128),
+      index: 999_999,
+      offset: Number.MAX_SAFE_INTEGER - DEFAULT_ATTACHMENT_CHUNK_SIZE,
+      size: payload.byteLength,
+      hash: HASH,
+      payload,
+    });
+
+    expect(encoded.byteLength).toBeLessThanOrEqual(64 * 1024);
   });
 });

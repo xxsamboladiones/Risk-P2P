@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { parseIceCandidate, parseOffer, parsePeerState } from "./validation";
 
 const FROM = "00000000-0000-4000-8000-000000000001";
@@ -17,10 +17,10 @@ describe("validação de signaling externo", () => {
     expect(parseOffer(envelope("webrtc.offer", { sdp: { type: "offer", sdp: "v=0" } }))).not.toBeNull();
   });
 
-  it("recusa mensagens antigas, IDs inválidos e SDP excessivo", () => {
-    const old = envelope("webrtc.offer", { sdp: { type: "offer", sdp: "v=0" } });
-    old.timestamp = Date.now() - 121_000;
-    expect(parseOffer(old)).toBeNull();
+  it("recusa timestamp inválido, IDs inválidos e SDP excessivo", () => {
+    const invalidTimestamp = envelope("webrtc.offer", { sdp: { type: "offer", sdp: "v=0" } });
+    invalidTimestamp.timestamp = Number.NaN;
+    expect(parseOffer(invalidTimestamp)).toBeNull();
     expect(parseOffer({ ...envelope("webrtc.offer", { sdp: { type: "offer", sdp: "v=0" } }), fromPeerId: "email@example.test" })).toBeNull();
     expect(parseOffer(envelope("webrtc.offer", { sdp: { type: "offer", sdp: "x".repeat(60_001) } }))).toBeNull();
   });
@@ -30,12 +30,9 @@ describe("validação de signaling externo", () => {
     expect(parsePeerState(envelope("peer.state", { state: { microphone: "yes", camera: false, screenShare: false } }))).toBeNull();
   });
 
-  it("recusa timestamp futuro", () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
-    const future = envelope("webrtc.offer", { sdp: { type: "offer", sdp: "v=0" } });
-    future.timestamp = Date.now() + 31_000;
-    expect(parseOffer(future)).toBeNull();
-    vi.useRealTimers();
+  it("deixa a política temporal para o provider registrar diferença de relógio", () => {
+    const skewed = envelope("webrtc.offer", { sdp: { type: "offer", sdp: "v=0" } });
+    skewed.timestamp = Date.now() + 4 * 60_000;
+    expect(parseOffer(skewed)).not.toBeNull();
   });
 });

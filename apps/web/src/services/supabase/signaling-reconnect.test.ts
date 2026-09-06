@@ -30,7 +30,7 @@ describe("SupabaseSignalingProvider reconnect sends", () => {
     expect(send).toHaveBeenCalledOnce();
   });
 
-  it("tolera cinco minutos de diferença e registra rejeições maiores no diagnóstico", () => {
+  it("aceita diferença de relógio para peer presente e mantém o diagnóstico", () => {
     vi.useFakeTimers();
     const now = new Date("2026-09-01T12:00:00.000Z");
     vi.setSystemTime(now);
@@ -42,7 +42,7 @@ describe("SupabaseSignalingProvider reconnect sends", () => {
     state.peerId = localPeerId;
     state.presencePeers.set(remotePeerId, {
       peerId: remotePeerId,
-      joinedAt: now.getTime() - 10 * 60_000,
+      joinedAt: now.getTime() - 70 * 60_000,
       clientVersion: "0.2.1",
     });
 
@@ -57,13 +57,37 @@ describe("SupabaseSignalingProvider reconnect sends", () => {
       payload: { sdp: { type: "offer", sdp: "offer" } },
     });
 
-    expect(state.acceptMessage(envelope(now.getTime() - 4 * 60_000, "clock-within-limit"))).toBe(true);
-    expect(provider.getDiagnostics().clockSkewMs).toBe(-4 * 60_000);
-    expect(state.acceptMessage(envelope(now.getTime() - 6 * 60_000, "clock-outside-limit"))).toBe(false);
+    expect(state.acceptMessage(envelope(now.getTime() - 60 * 60_000, "clock-outside-limit"))).toBe(true);
     expect(provider.getDiagnostics()).toMatchObject({
-      clockSkewMs: -6 * 60_000,
-      clockSkewRejectedMessages: 1,
+      clockSkewMs: -60 * 60_000,
+      clockSkewRejectedMessages: 0,
     });
+    vi.useRealTimers();
+  });
+
+  it("rejeita relógio muito divergente enquanto o peer ainda não está presente", () => {
+    vi.useFakeTimers();
+    const now = new Date("2026-09-01T12:00:00.000Z");
+    vi.setSystemTime(now);
+    const provider = new SupabaseSignalingProvider();
+    const state = internals(provider);
+    const localPeerId = "00000000-0000-4000-8000-000000000001";
+    const remotePeerId = "00000000-0000-4000-8000-000000000002";
+    state.roomId = "room-clock-test";
+    state.peerId = localPeerId;
+    state.channel = { presenceState: () => ({}) };
+
+    expect(state.acceptMessage({
+      version: 1,
+      type: "webrtc.offer",
+      roomId: "room-clock-test",
+      fromPeerId: remotePeerId,
+      targetPeerId: localPeerId,
+      messageId: "clock-peer-absent",
+      timestamp: now.getTime() - 60 * 60_000,
+      payload: { sdp: { type: "offer", sdp: "offer" } },
+    })).toBe(false);
+    expect(provider.getDiagnostics().clockSkewRejectedMessages).toBe(1);
     vi.useRealTimers();
   });
 
@@ -90,5 +114,28 @@ describe("SupabaseSignalingProvider reconnect sends", () => {
     expect(state.channel).toBe(replacement);
     expect(replacement.subscribe).toHaveBeenCalledOnce();
     vi.useRealTimers();
+  });
+
+  it("reconhece uma reentrada rápida e seleciona a sessão mais nova do presenceState", () => {
+    const provider = new SupabaseSignalingProvider();
+    const state = internals(provider);
+    const peerId = "00000000-0000-4000-8000-000000000002";
+    const previous = { peerId, joinedAt: 10_000, clientVersion: "0.2.1" };
+    const current = { peerId, joinedAt: 10_500, clientVersion: "0.2.1" };
+    const onLeft = vi.fn();
+    const onJoined = vi.fn();
+    provider.onPeerLeft(onLeft);
+    provider.onPeerJoined(onJoined);
+    state.peerId = "00000000-0000-4000-8000-000000000001";
+    state.presencePeers.set(peerId, previous);
+    // A sessão antiga aparece por último para reproduzir a ordem instável que
+    // o Supabase pode entregar durante a troca de canal.
+    state.channel = { presenceState: () => ({ first: [current], second: [previous] }) };
+
+    state.reconcilePresence();
+
+    expect(onLeft).toHaveBeenCalledWith(peerId);
+    expect(onJoined).toHaveBeenCalledWith(current);
+    expect(state.presencePeers.get(peerId)).toEqual(current);
   });
 });

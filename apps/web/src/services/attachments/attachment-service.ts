@@ -354,9 +354,13 @@ export class AttachmentService extends EventTarget {
       }
     }
     this.sourceByAttachment.set(attachmentId, source);
-    const transferId = await this.sender.offer(peerId, source, record.manifest);
+    // Registros criados pela versão que usava payloads de 256 KiB precisam ser
+    // repartidos: com o envelope binário eles excedem o maxMessageSize SCTP de
+    // vários Chromium/Electron e falham já no primeiro DataChannel.send().
+    const transferManifest = await normalizeManifestForTransfer(source, record.manifest, this.localPeerId);
+    const transferId = await this.sender.offer(peerId, source, transferManifest);
     this.outgoing.set(transferId, { peerId, attachmentId });
-    await this.storage.registerOutgoing(transferId, this.channelId, peerId, record.manifest);
+    await this.storage.registerOutgoing(transferId, this.channelId, peerId, transferManifest);
   }
 
   private async markRequestedAttachmentError(peerId: string, attachmentId: string, message: string): Promise<void> {
@@ -685,6 +689,32 @@ async function buildManifest(file: File, channelId: string, senderPeerId: string
     chunkCount,
     chunkHashes,
     createdAt: new Date().toISOString(),
+  };
+}
+
+async function normalizeManifestForTransfer(
+  source: TransferSource,
+  manifest: AttachmentManifest,
+  senderPeerId: string,
+): Promise<AttachmentManifest> {
+  const chunkSize = DEFAULT_ATTACHMENT_CHUNK_SIZE;
+  if (manifest.chunkSize === chunkSize && manifest.senderPeerId === senderPeerId) return manifest;
+
+  const chunkCount = Math.ceil(source.size / chunkSize);
+  const chunkHashes = chunkCount <= MAX_MANIFEST_CHUNK_HASHES ? [] as string[] : undefined;
+  if (chunkHashes) {
+    for (let index = 0; index < chunkCount; index += 1) {
+      const offset = index * chunkSize;
+      chunkHashes.push(await sha256Hex(source.slice(offset, Math.min(source.size, offset + chunkSize))));
+    }
+  }
+  return {
+    ...manifest,
+    senderPeerId,
+    size: source.size,
+    chunkSize,
+    chunkCount,
+    chunkHashes,
   };
 }
 

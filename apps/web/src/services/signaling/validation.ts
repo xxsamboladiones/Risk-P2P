@@ -7,8 +7,6 @@ import type {
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ROOM = /^[0-9a-f]{64}$/;
-const MAX_AGE_MS = 120_000;
-const MAX_FUTURE_MS = 30_000;
 const MAX_ENVELOPE_BYTES = 65_536;
 
 type RecordValue = Record<string, unknown>;
@@ -21,7 +19,6 @@ function validBase(value: unknown, expectedType: string): value is RecordValue {
   if (!record(value)) return false;
   let size = MAX_ENVELOPE_BYTES + 1;
   try { size = new TextEncoder().encode(JSON.stringify(value)).byteLength; } catch { return false; }
-  const now = Date.now();
   return size <= MAX_ENVELOPE_BYTES
     && value.version === 1
     && value.type === expectedType
@@ -31,8 +28,6 @@ function validBase(value: unknown, expectedType: string): value is RecordValue {
     && typeof value.messageId === "string" && UUID.test(value.messageId)
     && typeof value.timestamp === "number"
     && Number.isFinite(value.timestamp)
-    && value.timestamp >= now - MAX_AGE_MS
-    && value.timestamp <= now + MAX_FUTURE_MS
     && record(value.payload);
 }
 

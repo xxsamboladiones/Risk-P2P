@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_ATTACHMENT_CHUNK_SIZE,
   MAX_ATTACHMENT_CONTROL_WIRE_BYTES,
   type AttachmentManifest,
   type AttachmentTransferProgress,
@@ -90,6 +91,56 @@ describe("AttachmentService request errors", () => {
     const service = new AttachmentService(transport, "channel_12345678", "self_12345678", () => ["peer_12345678"], storage);
 
     await expect(service.handleControlString("peer_12345678", " ".repeat(MAX_ATTACHMENT_CONTROL_WIRE_BYTES + 1))).resolves.toBe(false);
+  });
+
+  it("reparticiona anexos antigos de 256 KiB antes de oferecê-los novamente", async () => {
+    const legacyManifest: AttachmentManifest = {
+      ...manifest,
+      size: 256 * 1024,
+      chunkSize: 256 * 1024,
+      chunkCount: 1,
+      chunkHashes: undefined,
+    };
+    const legacyRecord = { ...record(), manifest: legacyManifest, totalBytes: legacyManifest.size };
+    const controls: Record<string, unknown>[] = [];
+    const storage: AttachmentStorage = {
+      prepare: async () => undefined,
+      hasChunk: async () => false,
+      writeChunk: async () => undefined,
+      finalize: async () => ({ contentHash: attachmentId }),
+      discard: async () => undefined,
+      persistOutgoingSource: async () => legacyRecord,
+      registerOutgoing: async () => legacyRecord,
+      registerSyncedMetadata: async () => legacyRecord,
+      updateProgress: async () => legacyRecord,
+      listChannel: async () => [legacyRecord],
+      findByTransferId: async () => undefined,
+      findAnyByAttachmentId: async () => legacyRecord,
+      findCompletedByAttachmentId: async () => legacyRecord,
+      getBlob: async () => new Blob([new Uint8Array(legacyManifest.size)]),
+      saveRecord: async () => undefined,
+    };
+    const transport = {
+      sendData: (payload: string) => { controls.push(JSON.parse(payload) as Record<string, unknown>); return 1; },
+      sendTransferData: () => 1,
+      waitForTransferBufferedAmountLow: async () => undefined,
+      getTransferBufferedAmount: () => 0,
+      isTransferChannelOpen: () => true,
+      ensureTransferChannel: () => undefined,
+    } as unknown as MeshWebRTCTransport;
+    const service = new AttachmentService(transport, "channel_12345678", "self_12345678", () => ["peer_12345678"], storage);
+
+    await service.handleControlString("peer_12345678", JSON.stringify({
+      type: "peer.capabilities",
+      protocolVersion: 1,
+      capabilities: ["file-transfer-v1"],
+    }));
+    await service.handleControlString("peer_12345678", JSON.stringify({ type: "file.request", attachmentId }));
+
+    const offer = controls.find((message) => message.type === "file.offer") as { manifest: AttachmentManifest };
+    expect(offer.manifest.chunkSize).toBe(DEFAULT_ATTACHMENT_CHUNK_SIZE);
+    expect(offer.manifest.chunkCount).toBe(Math.ceil(legacyManifest.size / DEFAULT_ATTACHMENT_CHUNK_SIZE));
+    expect(offer.manifest.senderPeerId).toBe("self_12345678");
   });
 });
 

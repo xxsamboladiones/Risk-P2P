@@ -6,6 +6,7 @@ import {
   compareGroupManifestRevisions,
   createGroupAdministratorGrant,
   createGroupRevocationCertificate,
+  groupMembershipRendezvousId,
   groupRendezvousId,
   reconcileIdentityMembership,
   resolveLocalGroupManifest,
@@ -263,6 +264,8 @@ describe("permissões de grupo local", () => {
     expect(merged.rendezvousSecret).toBe("secret_new_12345678");
     expect(groupRendezvousId(merged, "chat", "channel_12345678"))
       .not.toBe(groupRendezvousId(current, "chat", "channel_12345678"));
+    expect(groupMembershipRendezvousId(merged.groupId))
+      .toBe(groupMembershipRendezvousId(current.groupId));
   });
 
   it("cria uma revogação assinada que pode ser retransmitida sem a chave privada do emissor", async () => {

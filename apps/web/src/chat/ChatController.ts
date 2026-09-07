@@ -26,6 +26,7 @@ import { loadRtcNetworkContext } from "../services/network/runtime";
 import {
   applyGroupRevocationCertificate,
   getOrCreateLocalIdentity,
+  groupMembershipRendezvousId,
   loadLocalGroups,
   groupRendezvousId,
   type GroupRevocationCertificate,
@@ -714,7 +715,11 @@ export class ChatController {
         const group = (await loadLocalGroups()).find((item) => item.groupId === groupId);
         if (!group || this.sessionToken !== sessionToken || this.groupId !== groupId || this.identity !== identity) return;
         const channelId = this.channelId;
-        const nextRendezvousId = channelId ? groupRendezvousId(group, "chat", channelId) : undefined;
+        const nextRendezvousId = channelId
+          ? this.membershipOnly
+            ? groupMembershipRendezvousId(group.groupId)
+            : groupRendezvousId(group, "chat", channelId)
+          : undefined;
         const rendezvousChanged = Boolean(nextRendezvousId && this.rendezvousId && nextRendezvousId !== this.rendezvousId);
         this.installGroupPeers(group.members ?? [], group.removedMembers ?? [], group.revocations ?? []);
         await this.connectPresentTrustedPeers();

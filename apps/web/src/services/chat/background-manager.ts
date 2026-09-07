@@ -1,5 +1,5 @@
 import { ChatController, type ChatConnectionOptions, type ChatConnectionStatus } from "../../chat";
-import { getOrCreateLocalIdentity, groupRendezvousId, type LocalGroup } from "../offline/social-storage";
+import { getOrCreateLocalIdentity, groupMembershipRendezvousId, groupRendezvousId, type LocalGroup } from "../offline/social-storage";
 
 const MAX_BACKGROUND_CHANNELS = 8;
 export const MAX_BACKGROUND_PRIVATE_CHATS = 8;
@@ -246,7 +246,9 @@ export class BackgroundChatManager {
           revokedPeers: group.removedMembers ?? [],
           revocations: group.revocations ?? [],
           groupId: group.groupId,
-          rendezvousId: groupRendezvousId(group, "chat", group.groupId),
+          // O canal membership-only precisa sobreviver à rotação do segredo do
+          // grupo para entregar o manifesto novo a membros que estavam offline.
+          rendezvousId: groupMembershipRendezvousId(group.groupId),
           namespace: "group",
           requireIdentityAuthentication: true,
           membershipOnly: true,

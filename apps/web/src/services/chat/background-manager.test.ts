@@ -4,6 +4,7 @@ import type { LocalGroup } from "../offline/social-storage";
 const runtime = vi.hoisted(() => ({
   connected: [] as string[],
   membershipConnected: [] as string[],
+  membershipRendezvousIds: [] as string[],
   disconnected: [] as string[],
   failedOnce: new Set<string>(),
   connectAttempts: new Map<string, number>(),
@@ -35,13 +36,15 @@ vi.mock("../../chat", () => ({
       return () => this.statusListeners.delete(listener);
     }
 
-    async connect(channelId: string, _displayName?: string, _iceServers?: RTCIceServer[], options?: { membershipOnly?: boolean }): Promise<void> {
+    async connect(channelId: string, _displayName?: string, _iceServers?: RTCIceServer[], options?: { membershipOnly?: boolean; rendezvousId?: string }): Promise<void> {
       this.channelId = channelId;
       this.membershipOnly = options?.membershipOnly === true;
       runtime.connectAttempts.set(channelId, (runtime.connectAttempts.get(channelId) ?? 0) + 1);
       if (runtime.failedOnce.delete(channelId)) throw new Error("falha temporária");
-      if (this.membershipOnly) runtime.membershipConnected.push(channelId);
-      else runtime.connected.push(channelId);
+      if (this.membershipOnly) {
+        runtime.membershipConnected.push(channelId);
+        runtime.membershipRendezvousIds.push(options?.rendezvousId ?? "");
+      } else runtime.connected.push(channelId);
       this.statusListeners.forEach((listener) => listener("connected"));
       this.statusListeners.forEach((listener) => listener("ready"));
     }
@@ -89,6 +92,7 @@ describe("BackgroundChatManager", () => {
   beforeEach(() => {
     runtime.connected.length = 0;
     runtime.membershipConnected.length = 0;
+    runtime.membershipRendezvousIds.length = 0;
     runtime.disconnected.length = 0;
     runtime.failedOnce.clear();
     runtime.connectAttempts.clear();
@@ -111,6 +115,22 @@ describe("BackgroundChatManager", () => {
     expect(runtime.connected).toEqual([]);
     expect(runtime.membershipConnected).toEqual([group.groupId]);
     await manager.disconnect();
+  });
+
+  it("mantém o rendezvous de membros estável quando o segredo privado gira", async () => {
+    const manager = new BackgroundChatManager();
+    const before = groupWithTextChannels();
+    await manager.sync([before], "Ana", []);
+    const firstRendezvous = runtime.membershipRendezvousIds[0];
+    await manager.disconnect();
+
+    const after = { ...before, rendezvousVersion: 2, rendezvousSecret: "B".repeat(43) };
+    const nextManager = new BackgroundChatManager();
+    await nextManager.sync([after], "Ana", []);
+
+    expect(runtime.membershipRendezvousIds.at(-1)).toBe(firstRendezvous);
+    expect(firstRendezvous).toContain(before.groupId);
+    await nextManager.disconnect();
   });
 
   it("libera uma sessão de grupo já aberta quando a chamada assume o canal", async () => {

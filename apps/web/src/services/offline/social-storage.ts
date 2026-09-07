@@ -107,6 +107,15 @@ export function groupRendezvousId(group: PublicGroupMetadata, purpose: "chat" | 
   return `risk-rendezvous-v1:${secret}:${purpose}:${resourceId}`;
 }
 
+/**
+ * Canal de controle estável usado somente para reconciliar manifestos assinados.
+ * Ele não usa rendezvousSecret porque justamente precisa continuar acessível a
+ * membros legítimos que ficaram offline durante uma rotação desse segredo.
+ */
+export function groupMembershipRendezvousId(groupId: string): string {
+  return `risk-membership-v1:${groupId}`;
+}
+
 type DesktopBackendConfig = { baseUrl: string; token?: string };
 let desktopConfigPromise: Promise<DesktopBackendConfig | null> | undefined;
 let migrationPromise: Promise<void> | undefined;

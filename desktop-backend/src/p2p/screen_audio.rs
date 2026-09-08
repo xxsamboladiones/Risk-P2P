@@ -34,6 +34,10 @@ const RISK_APPLICATION_ID: &str = "com.risk.calls";
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(750);
 #[cfg(target_os = "linux")]
 const MIX_NODE_WAIT_ATTEMPTS: usize = 80;
+#[cfg(target_os = "linux")]
+const MICROPHONE_GUARD_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(target_os = "linux")]
+const MICROPHONE_GUARD_ATTEMPTS: usize = 60;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,6 +60,13 @@ struct PrepareResponse {
     reason: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MicrophoneGuardResponse {
+    active: bool,
+    reason: Option<String>,
+}
+
 #[cfg(target_os = "linux")]
 struct PipeWireSession {
     loopback: Child,
@@ -63,17 +74,72 @@ struct PipeWireSession {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct MicrophoneControlSnapshot {
+    node_id: u32,
+    node_name: String,
+    volume: f64,
+    muted: bool,
+}
+
+#[cfg(target_os = "linux")]
+struct MicrophoneGuard {
+    snapshots: Arc<Vec<MicrophoneControlSnapshot>>,
+    restore_task: JoinHandle<()>,
+}
+
+#[cfg(target_os = "linux")]
 static SESSION: OnceLock<Mutex<Option<PipeWireSession>>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+static MICROPHONE_GUARD: OnceLock<Mutex<Option<MicrophoneGuard>>> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 fn session() -> &'static Mutex<Option<PipeWireSession>> {
     SESSION.get_or_init(|| Mutex::new(None))
 }
 
+#[cfg(target_os = "linux")]
+fn microphone_guard() -> &'static Mutex<Option<MicrophoneGuard>> {
+    MICROPHONE_GUARD.get_or_init(|| Mutex::new(None))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/screen-audio/prepare", post(prepare))
+        .route(
+            "/screen-audio/microphone-guard/start",
+            post(start_microphone_guard_route),
+        )
         .route("/screen-audio/stop", post(stop))
+}
+
+async fn start_microphone_guard_route() -> Json<MicrophoneGuardResponse> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        Json(MicrophoneGuardResponse {
+            active: false,
+            reason: Some("A proteção nativa do microfone só é necessária no Linux".into()),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        match start_microphone_guard().await {
+            Ok(count) => Json(MicrophoneGuardResponse {
+                active: count > 0,
+                reason: (count == 0)
+                    .then(|| "Nenhuma fonte física de microfone foi encontrada no PipeWire".into()),
+            }),
+            Err(error) => {
+                tracing::warn!(error = %error, "PipeWire microphone guard unavailable");
+                Json(MicrophoneGuardResponse {
+                    active: false,
+                    reason: Some(error.to_string()),
+                })
+            }
+        }
+    }
 }
 
 async fn prepare(Json(input): Json<PrepareInput>) -> Json<PrepareResponse> {
@@ -115,8 +181,85 @@ async fn prepare(Json(input): Json<PrepareInput>) -> Json<PrepareResponse> {
 
 async fn stop() -> Json<Value> {
     stop_pipewire().await;
+    stop_microphone_guard().await;
     Json(serde_json::json!({ "ok": true }))
 }
+
+#[cfg(target_os = "linux")]
+async fn start_microphone_guard() -> anyhow::Result<usize> {
+    stop_microphone_guard().await;
+    ensure_command("wpctl").await?;
+
+    let graph = read_graph().await?;
+    let mut snapshots = Vec::new();
+    for object in graph
+        .iter()
+        .filter(|object| is_physical_audio_source(object))
+    {
+        let (Some(node_id), Some(node_name)) = (object.id, node_name(object)) else {
+            continue;
+        };
+        match read_wpctl_control(node_id).await {
+            Ok((volume, muted)) => snapshots.push(MicrophoneControlSnapshot {
+                node_id,
+                node_name: node_name.to_string(),
+                volume,
+                muted,
+            }),
+            Err(error) => tracing::debug!(
+                node_id,
+                node_name,
+                error = %error,
+                "Could not snapshot PipeWire microphone control"
+            ),
+        }
+    }
+
+    let snapshot_count = snapshots.len();
+    let snapshots = Arc::new(snapshots);
+    let task_snapshots = Arc::clone(&snapshots);
+    let restore_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(MICROPHONE_GUARD_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        for _ in 0..MICROPHONE_GUARD_ATTEMPTS {
+            ticker.tick().await;
+            if let Err(error) = restore_microphone_controls(&task_snapshots).await {
+                tracing::debug!(error = %error, "PipeWire microphone control restore failed");
+            }
+        }
+    });
+
+    *microphone_guard().lock().await = Some(MicrophoneGuard {
+        snapshots,
+        restore_task,
+    });
+    tracing::info!(snapshot_count, "PipeWire microphone guard active");
+    Ok(snapshot_count)
+}
+
+#[cfg(target_os = "linux")]
+async fn stop_microphone_guard() {
+    let current = microphone_guard().lock().await.take();
+    let Some(current) = current else {
+        return;
+    };
+    current.restore_task.abort();
+
+    // Encerrar a captura também pode alterar o controle nativo um pouco depois
+    // de o track parar. Repetimos a restauração apenas nessa curta transição.
+    for attempt in 0..3 {
+        if let Err(error) = restore_microphone_controls(&current.snapshots).await {
+            tracing::debug!(error = %error, "Final PipeWire microphone control restore failed");
+        }
+        if attempt < 2 {
+            tokio::time::sleep(MICROPHONE_GUARD_INTERVAL).await;
+        }
+    }
+    tracing::info!("PipeWire microphone guard stopped");
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn stop_microphone_guard() {}
 
 #[cfg(target_os = "linux")]
 async fn start_pipewire(exclude_risk: bool) -> anyhow::Result<()> {
@@ -343,6 +486,110 @@ async fn read_graph() -> anyhow::Result<Vec<PwObject>> {
 }
 
 #[cfg(target_os = "linux")]
+async fn read_wpctl_control(node_id: u32) -> anyhow::Result<(f64, bool)> {
+    let output = Command::new("wpctl")
+        .arg("get-volume")
+        .arg(node_id.to_string())
+        .stdin(Stdio::null())
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "wpctl get-volume falhou para o nó {node_id}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    parse_wpctl_control(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_wpctl_control(output: &str) -> anyhow::Result<(f64, bool)> {
+    let value = output
+        .trim()
+        .strip_prefix("Volume:")
+        .ok_or_else(|| anyhow::anyhow!("saída inesperada do wpctl: {}", output.trim()))?;
+    let volume = value
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("wpctl não informou o volume"))?
+        .parse::<f64>()?;
+    Ok((volume, value.contains("[MUTED]")))
+}
+
+#[cfg(target_os = "linux")]
+async fn restore_microphone_controls(
+    snapshots: &[MicrophoneControlSnapshot],
+) -> anyhow::Result<()> {
+    if snapshots.is_empty() {
+        return Ok(());
+    }
+
+    let graph = read_graph().await?;
+    let current_nodes: HashMap<u32, &PwObject> = graph
+        .iter()
+        .filter(|object| object.type_name().ends_with(":Node"))
+        .filter_map(|object| Some((object.id?, object)))
+        .collect();
+
+    for snapshot in snapshots {
+        let Some(node) = current_nodes.get(&snapshot.node_id) else {
+            continue;
+        };
+        if node_name(node) != Some(snapshot.node_name.as_str()) || !is_physical_audio_source(node) {
+            continue;
+        }
+        let Ok((current_volume, current_muted)) = read_wpctl_control(snapshot.node_id).await else {
+            continue;
+        };
+
+        if (current_volume - snapshot.volume).abs() > 0.002 {
+            let status = Command::new("wpctl")
+                .arg("set-volume")
+                .arg(snapshot.node_id.to_string())
+                .arg(format!("{:.6}", snapshot.volume))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await?;
+            if !status.success() {
+                tracing::debug!(node_id = snapshot.node_id, "wpctl set-volume failed");
+            } else {
+                tracing::info!(
+                    node_id = snapshot.node_id,
+                    from = current_volume,
+                    to = snapshot.volume,
+                    "Restored PipeWire microphone volume changed by screen capture"
+                );
+            }
+        }
+
+        if current_muted != snapshot.muted {
+            let status = Command::new("wpctl")
+                .arg("set-mute")
+                .arg(snapshot.node_id.to_string())
+                .arg(if snapshot.muted { "1" } else { "0" })
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await?;
+            if !status.success() {
+                tracing::debug!(node_id = snapshot.node_id, "wpctl set-mute failed");
+            } else {
+                tracing::info!(
+                    node_id = snapshot.node_id,
+                    from = current_muted,
+                    to = snapshot.muted,
+                    "Restored PipeWire microphone mute changed by screen capture"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 async fn reconcile_links(exclude_risk: bool, risk_root_pid: u32) -> anyhow::Result<()> {
     let graph = read_graph().await?;
     let nodes: HashMap<u32, &PwObject> = graph
@@ -515,6 +762,18 @@ fn is_mix_source(object: &PwObject) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn is_physical_audio_source(object: &PwObject) -> bool {
+    if object.prop_str("media.class") != Some("Audio/Source")
+        || object.prop_u32("device.id").is_none()
+        || is_mix_source(object)
+    {
+        return false;
+    }
+    let name = node_name(object).unwrap_or("").to_ascii_lowercase();
+    !name.contains("monitor") && !name.starts_with("risk.")
+}
+
+#[cfg(target_os = "linux")]
 fn is_playback_stream(object: &PwObject) -> bool {
     matches!(object.prop_str("media.class"), Some("Stream/Output/Audio"))
         || matches!(object.prop_str("media.category"), Some("Playback"))
@@ -645,6 +904,38 @@ mod tests {
             "node.description": MIX_SOURCE_LABEL,
             "media.class": "Audio/Source"
         }))));
+    }
+
+    #[test]
+    fn detects_only_physical_microphone_sources() {
+        assert!(is_physical_audio_source(&node(serde_json::json!({
+            "node.name": "alsa_input.usb-headset.mono-fallback",
+            "media.class": "Audio/Source",
+            "device.id": 42,
+        }))));
+        assert!(!is_physical_audio_source(&node(serde_json::json!({
+            "node.name": "alsa_output.pci-hdmi.monitor",
+            "media.class": "Audio/Source",
+            "device.id": 43,
+        }))));
+        assert!(!is_physical_audio_source(&node(serde_json::json!({
+            "node.name": MIX_SOURCE_NAME,
+            "node.description": MIX_SOURCE_LABEL,
+            "media.class": "Audio/Source",
+        }))));
+    }
+
+    #[test]
+    fn parses_wpctl_volume_and_mute() {
+        assert_eq!(
+            parse_wpctl_control("Volume: 0.320000\n").unwrap(),
+            (0.32, false)
+        );
+        assert_eq!(
+            parse_wpctl_control("Volume: 1.00 [MUTED]\n").unwrap(),
+            (1.0, true)
+        );
+        assert!(parse_wpctl_control("unexpected").is_err());
     }
 
     #[test]

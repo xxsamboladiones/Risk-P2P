@@ -1,7 +1,6 @@
 import { WebScreenShareProvider, type CallTransport, type ScreenShareProvider } from "@risk/rtc";
 import type { PeerState } from "@risk/protocol";
 import { useCallStore } from "../store";
-import { stabilizeMicrophoneGain } from "../services/audio/microphone";
 import { loadVoiceVideoSettings, type VoiceVideoSettings } from "../services/audio/settings";
 import {
   applyScreenCaptureQuality,
@@ -38,6 +37,10 @@ export class MediaManager {
   private microphone?: MediaStreamTrack;
   private rnnoiseMicrophone?: MicrophoneSession["rnnoise"];
   private microphoneSettings?: VoiceVideoSettings;
+  private microphoneMonitorCleanup?: () => void;
+  private microphoneMonitorRevision = 0;
+  private microphoneRecovery?: { revision: number; promise: Promise<void> };
+  private lastAutomaticMicrophoneRecoveryAt = Number.NEGATIVE_INFINITY;
   private camera?: MediaStreamTrack;
   private screenStream?: MediaStream;
   private screenQualityProfile: ScreenQualityProfile = SCREEN_QUALITY_PROFILES["1080p30"];
@@ -54,6 +57,8 @@ export class MediaManager {
   get state(): PeerState { return this.peerState; }
 
   reset(): void {
+    this.stopMicrophoneMonitor();
+    this.lastAutomaticMicrophoneRecoveryAt = Number.NEGATIVE_INFINITY;
     this.local = new MediaStream();
     this.microphoneInputStream = undefined;
     this.microphone = undefined;
@@ -82,6 +87,7 @@ export class MediaManager {
     this.local.addTrack(microphoneSession.track);
     await transport.publishTrack(microphoneSession.track, this.local);
     if (!this.dependencies.isActive(lifecycle)) throw new DOMException("Entrada na chamada cancelada.", "AbortError");
+    this.startMicrophoneMonitor(lifecycle);
     this.peerState.cameraStreamId = this.local.id;
     this.updateLocalPreview();
     return this.local;
@@ -95,6 +101,12 @@ export class MediaManager {
       this.microphoneInputStream?.getAudioTracks().forEach((input) => { input.enabled = track.enabled; });
       this.peerState.microphone = track.enabled;
       this.notifyState("Não foi possível atualizar o microfone.");
+      if (track.enabled) {
+        const transport = this.dependencies.getTransport();
+        if (transport) {
+          await this.requestMicrophoneRecovery(transport, this.dependencies.currentLifecycle(), true, false);
+        }
+      }
     } catch (error) {
       this.dependencies.reportError(error, "Não foi possível alterar o microfone.");
     }
@@ -141,6 +153,7 @@ export class MediaManager {
     this.microphone = replacement.track;
     this.rnnoiseMicrophone = replacement.rnnoise;
     this.microphoneSettings = { ...settings };
+    this.startMicrophoneMonitor(lifecycle);
     this.updateLocalPreview();
 
     previousInputStream.getTracks().forEach((track) => track.stop());
@@ -274,7 +287,7 @@ export class MediaManager {
         return;
       }
 
-      await this.ensureMicrophoneAfterScreenCapture(transport, lifecycle);
+      await this.requestMicrophoneRecovery(transport, lifecycle, true, false);
       if (linuxAudioPreparation) {
         void this.attachLinuxScreenAudio(stream, lifecycle, linuxAudioPreparation, settings.excludeRiskAudioFromScreenShare);
       }
@@ -283,7 +296,7 @@ export class MediaManager {
         void linuxAudioPreparation.then(() => stopDesktopScreenAudio()).catch(() => undefined);
       }
       if (stream && this.screenStream === stream) await this.stopScreen().catch(() => undefined);
-      else if (desktopAudio?.mode === "pipewire") await stopDesktopScreenAudio();
+      else await stopDesktopScreenAudio();
       if (!(error instanceof DOMException && error.name === "NotAllowedError")) {
         this.dependencies.reportError(error, "Não foi possível compartilhar a tela.");
       }
@@ -378,7 +391,7 @@ export class MediaManager {
 
       try {
         await transport.publishTrack(audioTrack, stream);
-        if (this.microphone?.readyState === "live") await transport.publishTrack(this.microphone, this.local);
+        await this.requestMicrophoneRecovery(transport, lifecycle, true, false);
       } catch (error) {
         stream.removeTrack(audioTrack);
         audioTrack.stop();
@@ -406,10 +419,88 @@ export class MediaManager {
     stream.getTracks().forEach((track) => track.stop());
     await this.screen.stopScreenShare().catch(() => undefined);
     await stopDesktopScreenAudio();
-    if (this.microphoneInputStream) await stabilizeMicrophoneGain(this.microphoneInputStream);
   }
 
-  private async ensureMicrophoneAfterScreenCapture(transport: CallTransport, lifecycle: number): Promise<void> {
+  private startMicrophoneMonitor(lifecycle: number): void {
+    this.stopMicrophoneMonitor();
+    const revision = this.microphoneMonitorRevision;
+    const inputTrack = this.microphoneInputStream?.getAudioTracks()[0];
+    const publishedTrack = this.microphone;
+    if (!inputTrack || !publishedTrack) return;
+
+    const tracks = [...new Set([inputTrack, publishedTrack])];
+    const recover = () => {
+      if (!this.peerState.microphone || !this.dependencies.isActive(lifecycle)) return;
+      const transport = this.dependencies.getTransport();
+      if (!transport) return;
+      void this.requestMicrophoneRecovery(transport, lifecycle, false, true).catch((error) => {
+        if (!(error instanceof DOMException && error.name === "AbortError")) {
+          this.dependencies.reportError(error, "O microfone parou de responder e não pôde ser recuperado.");
+        }
+      });
+    };
+    const recovered = () => {
+      this.lastAutomaticMicrophoneRecoveryAt = Number.NEGATIVE_INFINITY;
+    };
+    tracks.forEach((track) => {
+      track.addEventListener("mute", recover);
+      track.addEventListener("ended", recover);
+      track.addEventListener("unmute", recovered);
+    });
+    this.microphoneMonitorCleanup = () => {
+      if (this.microphoneMonitorRevision !== revision) return;
+      tracks.forEach((track) => {
+        track.removeEventListener("mute", recover);
+        track.removeEventListener("ended", recover);
+        track.removeEventListener("unmute", recovered);
+      });
+      this.microphoneMonitorCleanup = undefined;
+    };
+  }
+
+  private stopMicrophoneMonitor(): void {
+    this.microphoneMonitorCleanup?.();
+    this.microphoneMonitorCleanup = undefined;
+    this.microphoneMonitorRevision += 1;
+  }
+
+  private async requestMicrophoneRecovery(
+    transport: CallTransport,
+    lifecycle: number,
+    republishHealthyTrack: boolean,
+    automatic: boolean,
+  ): Promise<void> {
+    const revision = this.microphoneMonitorRevision;
+    const activeRecovery = this.microphoneRecovery;
+    if (activeRecovery?.revision === revision) {
+      await activeRecovery.promise;
+      return;
+    }
+    if (automatic) {
+      const now = Date.now();
+      if (now - this.lastAutomaticMicrophoneRecoveryAt < 5_000) return;
+      this.lastAutomaticMicrophoneRecoveryAt = now;
+    }
+
+    const promise = this.recoverMicrophone(transport, lifecycle, revision, republishHealthyTrack);
+    const recovery = { revision, promise };
+    this.microphoneRecovery = recovery;
+    try {
+      await promise;
+    } finally {
+      if (this.microphoneRecovery === recovery) this.microphoneRecovery = undefined;
+    }
+  }
+
+  private async recoverMicrophone(
+    transport: CallTransport,
+    lifecycle: number,
+    revision: number,
+    republishHealthyTrack: boolean,
+  ): Promise<void> {
+    await this.rnnoiseMicrophone?.ensureRunning().catch((error) => {
+      console.warn("Não foi possível reativar o RNNoise antes de verificar o microfone.", error);
+    });
     const intendedEnabled = this.peerState.microphone;
     const currentMicrophone = this.microphone;
     const inputTrack = this.microphoneInputStream?.getAudioTracks()[0];
@@ -417,23 +508,29 @@ export class MediaManager {
 
     currentMicrophone.enabled = intendedEnabled;
     inputTrack.enabled = intendedEnabled;
-    await stabilizeMicrophoneGain(this.microphoneInputStream!);
 
     // Alguns capturadores suspendem brevemente a fonte de entrada enquanto o
     // portal de tela é aberto. Damos tempo para o unmute nativo antes de criar
     // outra captura e renegociar o sender.
     if (microphoneTrackUnavailable(currentMicrophone) || microphoneTrackUnavailable(inputTrack)) {
-      await new Promise((resolve) => window.setTimeout(resolve, 300));
+      await waitForMicrophoneRecovery(currentMicrophone, inputTrack);
     }
-    if (!this.dependencies.isActive(lifecycle) || this.microphone !== currentMicrophone) return;
+    if (
+      !this.dependencies.isActive(lifecycle)
+      || this.microphone !== currentMicrophone
+      || this.microphoneMonitorRevision !== revision
+    ) return;
 
     if (!microphoneTrackUnavailable(currentMicrophone) && !microphoneTrackUnavailable(inputTrack)) {
-      await transport.publishTrack(currentMicrophone, this.local);
+      if (republishHealthyTrack) await transport.publishTrack(currentMicrophone, this.local);
       return;
     }
 
     const settings = this.microphoneSettings ?? loadVoiceVideoSettings();
-    await this.updateVoiceInput(settings);
+    const currentDeviceId = inputTrack.getSettings().deviceId?.trim();
+    await this.updateVoiceInput(currentDeviceId
+      ? { ...settings, microphoneDeviceId: currentDeviceId }
+      : settings);
   }
 
   private setScreenQualityProfile(profile: ScreenQualityProfile): void {
@@ -466,4 +563,26 @@ export class MediaManager {
 
 function microphoneTrackUnavailable(track: MediaStreamTrack): boolean {
   return track.readyState !== "live" || track.muted;
+}
+
+async function waitForMicrophoneRecovery(...tracks: MediaStreamTrack[]): Promise<void> {
+  if (tracks.every((track) => !microphoneTrackUnavailable(track))) return;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled || tracks.some((track) => microphoneTrackUnavailable(track))) return;
+      settled = true;
+      clearTimeout(timeout);
+      tracks.forEach((track) => track.removeEventListener("unmute", finish));
+      resolve();
+    };
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      tracks.forEach((track) => track.removeEventListener("unmute", finish));
+      resolve();
+    }, 1_500);
+    tracks.forEach((track) => track.addEventListener("unmute", finish));
+    finish();
+  });
 }

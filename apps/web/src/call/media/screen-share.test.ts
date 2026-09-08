@@ -24,6 +24,30 @@ describe("startScreenCapture", () => {
     expect(provider.startScreenShare).not.toHaveBeenCalled();
   });
 
+  it("protege o volume nativo do microfone antes de abrir o seletor no Linux", async () => {
+    const stream = {} as MediaStream;
+    const getBackendConfig = vi.fn(async () => ({ baseUrl: "http://127.0.0.1:3030/", token: "token" }));
+    const chooseScreenSource = vi.fn(async () => "screen:1");
+    const selectScreenSource = vi.fn(async () => undefined);
+    const getDisplayMedia = vi.fn(async () => stream);
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ active: true }),
+    }));
+    const provider = { startScreenShare: vi.fn() } as unknown as ScreenShareProvider;
+    vi.stubGlobal("window", { desktop: { getBackendConfig, chooseScreenSource, selectScreenSource } });
+    vi.stubGlobal("navigator", { userAgent: "Linux", mediaDevices: { getDisplayMedia } });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await startScreenCapture(provider, undefined, false, true);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:3030/screen-audio/microphone-guard/start",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchMock.mock.invocationCallOrder[0]!).toBeLessThan(getDisplayMedia.mock.invocationCallOrder[0]!);
+  });
+
   it("no navegador delega a escolha sem áudio ao provider", async () => {
     const stream = {} as MediaStream;
     const startScreenShare = vi.fn(async () => stream);

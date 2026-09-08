@@ -16,6 +16,11 @@ export type ScreenCaptureStart = {
   linuxAudioPreparation?: Promise<DesktopScreenAudioPreparation | null>;
 };
 
+type DesktopMicrophoneGuardResponse = {
+  active: boolean;
+  reason?: string;
+};
+
 export async function startScreenCapture(
   provider: ScreenShareProvider,
   sourceId: string | undefined,
@@ -23,20 +28,36 @@ export async function startScreenCapture(
   excludeRisk: boolean,
 ): Promise<ScreenCaptureStart> {
   const linuxDesktop = Boolean(window.desktop && /Linux/i.test(navigator.userAgent));
-  if (linuxDesktop && includeAudio) {
-    // O vídeo não espera o PipeWire; o áudio pode ser publicado depois.
-    const linuxAudioPreparation = prepareDesktopScreenAudio(excludeRisk).catch((error) => {
-      console.warn("Não foi possível preparar o áudio PipeWire da tela.", error);
-      return null;
-    });
-    return {
-      stream: await startDesktopVideoShare(sourceId),
-      desktopAudio: null,
-      linuxAudioPreparation,
-    };
-  }
   if (linuxDesktop) {
-    return { stream: await startDesktopVideoShare(sourceId), desktopAudio: null };
+    // O portal/Chromium pode alterar volume ou mute da fonte física assim que
+    // getDisplayMedia é aberto, inclusive quando o áudio da tela está desligado.
+    await startDesktopMicrophoneGuard().catch((error) => {
+      console.warn("Não foi possível proteger o controle PipeWire do microfone.", error);
+    });
+    if (includeAudio) {
+      // O vídeo não espera o PipeWire; o áudio pode ser publicado depois.
+      const linuxAudioPreparation = prepareDesktopScreenAudio(excludeRisk).catch((error) => {
+        console.warn("Não foi possível preparar o áudio PipeWire da tela.", error);
+        return null;
+      });
+      try {
+        return {
+          stream: await startDesktopVideoShare(sourceId),
+          desktopAudio: null,
+          linuxAudioPreparation,
+        };
+      } catch (error) {
+        void linuxAudioPreparation.then(() => stopDesktopScreenAudio());
+        await stopDesktopScreenAudio();
+        throw error;
+      }
+    }
+    try {
+      return { stream: await startDesktopVideoShare(sourceId), desktopAudio: null };
+    } catch (error) {
+      await stopDesktopScreenAudio();
+      throw error;
+    }
   }
   if (!includeAudio) {
     return { stream: await provider.startScreenShare(sourceId, false), desktopAudio: null };
@@ -98,6 +119,18 @@ export async function prepareDesktopScreenAudio(excludeRisk: boolean): Promise<D
   });
   if (!response.ok) throw new Error(`Falha ao preparar áudio de tela (HTTP ${response.status}).`);
   return response.json() as Promise<DesktopScreenAudioPreparation>;
+}
+
+export async function startDesktopMicrophoneGuard(): Promise<void> {
+  if (!window.desktop?.getBackendConfig) return;
+  const config = await window.desktop.getBackendConfig();
+  const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}/screen-audio/microphone-guard/start`, {
+    method: "POST",
+    headers: { "x-risk-desktop-token": config.token },
+  });
+  if (!response.ok) throw new Error(`Falha ao proteger microfone no PipeWire (HTTP ${response.status}).`);
+  const result = await response.json() as DesktopMicrophoneGuardResponse;
+  if (!result.active && result.reason) console.warn("Proteção PipeWire do microfone indisponível.", result.reason);
 }
 
 export async function stopDesktopScreenAudio(): Promise<void> {

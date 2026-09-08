@@ -36,20 +36,3 @@ export async function openConfiguredMicrophone(settings: VoiceVideoSettings): Pr
     });
   }
 }
-
-/**
- * Reafirma o ganho estável depois que o grafo PipeWire/WebRTC é alterado.
- * Mantém as demais constraints escolhidas para o microfone.
- */
-export async function stabilizeMicrophoneGain(stream: MediaStream): Promise<void> {
-  await Promise.all(stream.getAudioTracks()
-    .filter((track) => track.readyState === "live")
-    .map(async (track) => {
-      const current = typeof track.getConstraints === "function" ? track.getConstraints() : {};
-      try {
-        await track.applyConstraints({ ...current, autoGainControl: false });
-      } catch (error) {
-        console.warn("Não foi possível estabilizar o ganho do microfone após o compartilhamento de tela.", error);
-      }
-    }));
-}

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { openConfiguredMicrophone, stabilizeMicrophoneGain } from "./microphone";
+import { openConfiguredMicrophone } from "./microphone";
 import type { VoiceVideoSettings } from "./settings";
 
 const settings: VoiceVideoSettings = {
@@ -48,25 +48,6 @@ describe("openConfiguredMicrophone", () => {
         channelCount: 1,
       },
       video: false,
-    });
-  });
-
-  it("reaplica ganho estável sem apagar as demais constraints", async () => {
-    const applyConstraints = vi.fn(async () => undefined);
-    const track = {
-      readyState: "live",
-      getConstraints: () => ({ echoCancellation: true, noiseSuppression: true, channelCount: 1 }),
-      applyConstraints,
-    } as unknown as MediaStreamTrack;
-    const stream = { getAudioTracks: () => [track] } as unknown as MediaStream;
-
-    await stabilizeMicrophoneGain(stream);
-
-    expect(applyConstraints).toHaveBeenCalledWith({
-      echoCancellation: true,
-      noiseSuppression: true,
-      channelCount: 1,
-      autoGainControl: false,
     });
   });
 });

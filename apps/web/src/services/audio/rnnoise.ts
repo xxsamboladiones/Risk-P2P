@@ -4,6 +4,7 @@ import rnnoiseWasmSimdPath from "@sapphi-red/web-noise-suppressor/rnnoise_simd.w
 
 export type RnnoiseMicrophone = {
   track: MediaStreamTrack;
+  ensureRunning(): Promise<void>;
   stop(): Promise<void>;
 };
 
@@ -97,11 +98,42 @@ export async function createRnnoiseMicrophone(inputStream: MediaStream): Promise
     });
 
     let stopped = false;
+    const ensureRunning = async () => {
+      if (stopped || context.state === "closed" || context.state === "running") return;
+      await context.resume();
+      const resumedState = context.state as AudioContextState;
+      if (resumedState !== "running") {
+        throw new Error(`RNNoise não conseguiu retomar o AudioContext (${resumedState}).`);
+      }
+    };
+    const handleContextState = () => {
+      if (stopped) return;
+      if (context.state === "closed") {
+        // O MediaManager observa "ended" e substitui toda a sessão de entrada.
+        outputTrack.stop();
+        outputTrack.dispatchEvent(new Event("ended"));
+        return;
+      }
+      void ensureRunning().catch((error) => {
+        console.warn("Não foi possível retomar o processamento RNNoise do microfone.", error);
+      });
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") handleContextState();
+    };
+    context.addEventListener("statechange", handleContextState);
+    document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("focus", handleContextState);
+
     return {
       track: outputTrack,
+      ensureRunning,
       async stop() {
         if (stopped) return;
         stopped = true;
+        context.removeEventListener("statechange", handleContextState);
+        document.removeEventListener("visibilitychange", handleVisibility);
+        window.removeEventListener("focus", handleContextState);
         outputTrack.stop();
         source?.disconnect();
         suppressor?.disconnect();

@@ -13,7 +13,9 @@ import { createMicrophoneSession, stopMicrophoneSession, type MicrophoneSession 
 import {
   reportScreenAudioExclusion,
   startScreenCapture,
+  stopDesktopMicrophoneGuard,
   stopDesktopScreenAudio,
+  stopDesktopScreenAudioCapture,
   waitForPipeWireTrack,
   type DesktopScreenAudioPreparation,
 } from "./media/screen-share";
@@ -427,18 +429,29 @@ export class MediaManager {
     }
     stream.getTracks().forEach((track) => track.stop());
     await this.screen.stopScreenShare().catch(() => undefined);
-    await stopDesktopScreenAudio();
-    // Em algumas versões de PipeWire/Chromium a fonte continua marcada como
-    // live depois que o portal a deixa silenciosa. Reabrir a captura após o
-    // guard restaurar volume/mute é a única forma confiável de recuperar áudio.
-    if (isLinuxDesktop() && transport && this.microphone && this.dependencies.isActive(this.dependencies.currentLifecycle())) {
-      await this.requestMicrophoneRecovery(
-        transport,
-        this.dependencies.currentLifecycle(),
-        true,
-        false,
-        true,
-      ).catch((error) => this.dependencies.reportError(error, "Não foi possível recuperar o microfone após a transmissão."));
+    if (!isLinuxDesktop()) {
+      await stopDesktopScreenAudio();
+      return;
+    }
+
+    // O loopback pode ser removido agora, mas o guard do PipeWire precisa
+    // continuar ativo enquanto o Chromium fecha e recria a entrada. Encerrá-lo
+    // antes dessa troca permitia que o último evento do portal deixasse a fonte
+    // física em mute ou com ganho diferente do valor anterior.
+    await stopDesktopScreenAudioCapture();
+    try {
+      const lifecycle = this.dependencies.currentLifecycle();
+      if (transport && this.microphone && this.dependencies.isActive(lifecycle)) {
+        await this.requestMicrophoneRecovery(
+          transport,
+          lifecycle,
+          true,
+          false,
+          true,
+        ).catch((error) => this.dependencies.reportError(error, "Não foi possível recuperar o microfone após a transmissão."));
+      }
+    } finally {
+      await stopDesktopMicrophoneGuard();
     }
   }
 

@@ -5,6 +5,7 @@ import {
   loadThemeSettings,
   saveThemeSettings,
   selectThemePreset,
+  THEME_PRESETS,
 } from "./settings";
 
 const values = new Map<string, string>();
@@ -49,6 +50,24 @@ describe("theme settings", () => {
     expect(theme.preset).toBe("ocean");
     expect(properties.get("--risk-accent")).toBe("#59c7ff");
     expect(JSON.parse([...values.values()][0]!).preset).toBe("ocean");
+  });
+
+  it("oferece um tema All Black com fundo preto absoluto e contraste escuro", () => {
+    const theme = selectThemePreset("all-black");
+
+    expect(theme.preset).toBe("all-black");
+    expect(theme.colors.background).toBe("#000000");
+    expect(theme.colors.navigation).toBe("#030303");
+    expect(documentElement.style.colorScheme).toBe("dark");
+    expect(properties.get("--risk-accent-contrast")).toBe("#071008");
+  });
+
+  it("mantém identificadores e cores válidos em todas as predefinições", () => {
+    expect(new Set(THEME_PRESETS.map((preset) => preset.id)).size).toBe(THEME_PRESETS.length);
+    for (const preset of THEME_PRESETS) {
+      expect(Object.values(preset.colors)).toHaveLength(10);
+      expect(Object.values(preset.colors).every((color) => /^#[0-9a-f]{6}$/i.test(color))).toBe(true);
+    }
   });
 
   it("aceita cores personalizadas e recupera valores inválidos", () => {

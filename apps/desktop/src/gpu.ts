@@ -2,16 +2,25 @@ import { app } from "electron";
 import { accessSync, constants as fsConstants, existsSync, readFileSync } from "node:fs";
 
 export function configurePlatformRuntime(): void {
+  const disabledFeatures: string[] = [];
   if (process.platform === "linux") {
     // pipewire-pulse pode expor o PID do daemon em vez do PID do cliente.
     process.env["PULSE_PROP_application.name"] = "Risk";
     process.env["PULSE_PROP_application.id"] = "com.risk.calls";
+    // Impede que o APM do Chromium altere o controle físico de entrada do
+    // PipeWire. O AGC escolhido nas configurações continua atuando no sinal
+    // processado, sem mover o ganho do dispositivo do sistema.
+    disabledFeatures.push("WebRtcAllowInputVolumeAdjustment");
   }
 
   if (shouldUseLinuxSoftwareRendering()) {
     app.disableHardwareAcceleration();
-    app.commandLine.appendSwitch("disable-features", "VaapiVideoDecoder,VaapiVideoEncoder");
+    disabledFeatures.push("VaapiVideoDecoder", "VaapiVideoEncoder");
     console.info("[desktop] GPU Linux incompatível ou inacessível; usando renderização por software.");
+  }
+
+  if (disabledFeatures.length > 0) {
+    app.commandLine.appendSwitch("disable-features", disabledFeatures.join(","));
   }
 
   app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");

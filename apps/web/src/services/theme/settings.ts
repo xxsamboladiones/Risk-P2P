@@ -11,7 +11,19 @@ export type ThemeColors = {
   danger: string;
 };
 
-export type ThemePresetId = "risk" | "ocean" | "violet" | "sunset" | "rose" | "light" | "custom";
+export type ThemePresetId =
+  | "risk"
+  | "all-black"
+  | "graphite"
+  | "midnight"
+  | "forest"
+  | "crimson"
+  | "ocean"
+  | "violet"
+  | "sunset"
+  | "rose"
+  | "light"
+  | "custom";
 
 export type ThemeSettings = {
   preset: ThemePresetId;
@@ -33,6 +45,31 @@ export const THEME_PRESETS: readonly ThemePreset[] = [
     id: "risk",
     name: "Risk",
     colors: { accent: "#b7f66a", background: "#090b10", navigation: "#10141b", surface: "#151a22", elevated: "#202731", text: "#edf1f7", muted: "#8994a3", success: "#75df8c", warning: "#e2c55f", danger: "#e95555" },
+  },
+  {
+    id: "all-black",
+    name: "All Black",
+    colors: { accent: "#f2f2f2", background: "#000000", navigation: "#030303", surface: "#080808", elevated: "#111111", text: "#f5f5f5", muted: "#929292", success: "#63d783", warning: "#e1bd58", danger: "#ed5b62" },
+  },
+  {
+    id: "graphite",
+    name: "Grafite",
+    colors: { accent: "#b7c0ca", background: "#08090a", navigation: "#0d0f11", surface: "#14171a", elevated: "#202429", text: "#f0f2f4", muted: "#929ba5", success: "#69d88a", warning: "#dfbd61", danger: "#eb6269" },
+  },
+  {
+    id: "midnight",
+    name: "Meia-noite",
+    colors: { accent: "#6eafff", background: "#030711", navigation: "#060d19", surface: "#0a1424", elevated: "#12223a", text: "#eef5ff", muted: "#8799b2", success: "#5fd6a0", warning: "#e8bd5b", danger: "#f16473" },
+  },
+  {
+    id: "forest",
+    name: "Floresta",
+    colors: { accent: "#78dc9b", background: "#040b08", navigation: "#08140e", surface: "#0d1d14", elevated: "#172c20", text: "#edf8f1", muted: "#8fa79a", success: "#82e79e", warning: "#e1c267", danger: "#ef646d" },
+  },
+  {
+    id: "crimson",
+    name: "Carmesim",
+    colors: { accent: "#ff6578", background: "#0d0406", navigation: "#17080b", surface: "#220d11", elevated: "#32151b", text: "#fff1f3", muted: "#ad9297", success: "#70d995", warning: "#edc25f", danger: "#ff5262" },
   },
   {
     id: "ocean",

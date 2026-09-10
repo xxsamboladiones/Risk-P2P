@@ -37,8 +37,6 @@ const MIX_NODE_WAIT_ATTEMPTS: usize = 80;
 #[cfg(target_os = "linux")]
 const MICROPHONE_GUARD_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(target_os = "linux")]
-const MICROPHONE_GUARD_ATTEMPTS: usize = 60;
-#[cfg(target_os = "linux")]
 const MICROPHONE_FINAL_RESTORE_ATTEMPTS: usize = 8;
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +111,11 @@ pub fn router() -> Router<AppState> {
             "/screen-audio/microphone-guard/start",
             post(start_microphone_guard_route),
         )
+        .route(
+            "/screen-audio/microphone-guard/stop",
+            post(stop_microphone_guard_route),
+        )
+        .route("/screen-audio/stop-capture", post(stop_capture))
         .route("/screen-audio/stop", post(stop))
 }
 
@@ -187,6 +190,19 @@ async fn stop() -> Json<Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 
+async fn stop_capture() -> Json<Value> {
+    // O guard permanece ativo enquanto o renderer recria a captura do
+    // microfone. Assim o Chromium não consegue persistir mute/ganho novos na
+    // fonte física durante a transição de encerramento da tela.
+    stop_pipewire().await;
+    Json(serde_json::json!({ "ok": true }))
+}
+
+async fn stop_microphone_guard_route() -> Json<Value> {
+    stop_microphone_guard().await;
+    Json(serde_json::json!({ "ok": true }))
+}
+
 #[cfg(target_os = "linux")]
 async fn start_microphone_guard() -> anyhow::Result<usize> {
     stop_microphone_guard().await;
@@ -223,7 +239,7 @@ async fn start_microphone_guard() -> anyhow::Result<usize> {
     let restore_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(MICROPHONE_GUARD_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        for _ in 0..MICROPHONE_GUARD_ATTEMPTS {
+        loop {
             ticker.tick().await;
             if let Err(error) = restore_microphone_controls(&task_snapshots).await {
                 tracing::debug!(error = %error, "PipeWire microphone control restore failed");

@@ -134,10 +134,22 @@ export async function startDesktopMicrophoneGuard(): Promise<void> {
 }
 
 export async function stopDesktopScreenAudio(): Promise<void> {
+  await stopDesktopAudioRoute("/screen-audio/stop");
+}
+
+export async function stopDesktopScreenAudioCapture(): Promise<void> {
+  await stopDesktopAudioRoute("/screen-audio/stop-capture");
+}
+
+export async function stopDesktopMicrophoneGuard(): Promise<void> {
+  await stopDesktopAudioRoute("/screen-audio/microphone-guard/stop");
+}
+
+async function stopDesktopAudioRoute(path: string): Promise<void> {
   if (!window.desktop?.getBackendConfig) return;
   try {
     const config = await window.desktop.getBackendConfig();
-    await fetch(`${config.baseUrl.replace(/\/$/, "")}/screen-audio/stop`, {
+    await fetch(`${config.baseUrl.replace(/\/$/, "")}${path}`, {
       method: "POST",
       headers: { "x-risk-desktop-token": config.token },
     });

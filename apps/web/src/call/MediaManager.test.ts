@@ -282,13 +282,28 @@ describe("MediaManager", () => {
 
     await manager.initializeMicrophone(settings, transport, 1);
     await manager.toggleScreen(undefined, false);
-    vi.stubGlobal("window", { desktop: {} });
+    const getBackendConfig = vi.fn(async () => ({ baseUrl: "http://127.0.0.1:3030", token: "token" }));
+    const fetchMock = vi.fn(async () => ({ ok: true }));
+    vi.stubGlobal("window", { desktop: { getBackendConfig } });
+    vi.stubGlobal("fetch", fetchMock);
     await manager.toggleScreen(undefined, false);
 
     expect(replacePublishedTrack).toHaveBeenCalledWith(oldMicrophone, newMicrophone, manager.localStream);
     expect(manager.microphoneTrack).toBe(newMicrophone);
     expect(manager.state.microphone).toBe(true);
     expect(newMicrophone.enabled).toBe(true);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://127.0.0.1:3030/screen-audio/stop-capture",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "http://127.0.0.1:3030/screen-audio/microphone-guard/stop",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchMock.mock.invocationCallOrder[0]!).toBeLessThan(getUserMedia.mock.invocationCallOrder[1]!);
+    expect(getUserMedia.mock.invocationCallOrder[1]!).toBeLessThan(fetchMock.mock.invocationCallOrder[1]!);
   });
 
   it("recupera um microfone que fica mudo durante a chamada normal", async () => {

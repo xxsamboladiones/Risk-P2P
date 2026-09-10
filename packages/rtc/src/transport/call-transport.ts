@@ -42,6 +42,11 @@ export type PeerConnectionDiagnostics = {
   selectedConnectionPath: SelectedConnectionPath;
 };
 
+export type LocalAudioHealthSample = {
+  totalSamplesDuration: number;
+  sampledAt: number;
+};
+
 /**
  * Contrato estável entre a chamada e sua topologia de mídia. Uma implementação
  * SFU pode gerenciar `connectPeer` como admissão/assinatura sem expor SDP à UI.
@@ -58,6 +63,7 @@ export interface CallTransport {
   unpublishTrack(track: MediaStreamTrack): Promise<void>;
   replaceTrack(kind: "audio" | "video", track: MediaStreamTrack | null): Promise<void>;
   replacePublishedTrack(previousTrack: MediaStreamTrack, nextTrack: MediaStreamTrack, stream: MediaStream): Promise<void>;
+  sampleLocalAudio?(track: MediaStreamTrack): Promise<LocalAudioHealthSample | undefined>;
   sendData(data: string, targetPeerId?: string): number;
   requireMediaAuthorization(): void;
   authorizePeerMedia(peerId: string): Promise<void>;

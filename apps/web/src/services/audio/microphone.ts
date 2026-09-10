@@ -5,9 +5,9 @@ function constraintsFor(settings: VoiceVideoSettings, deviceId?: string): MediaT
     ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
     echoCancellation: settings.echoCancellation,
     noiseSuppression: settings.noiseSuppression === "standard",
-    // O AGC do Chromium pode recalibrar o nível quando uma segunda captura de
-    // áudio (a tela) desaparece, elevando bruscamente a sensibilidade do mic.
-    autoGainControl: false,
+    // No Windows o AGC compensa drivers que entregam sinal digital baixo. No
+    // Linux o padrão permanece desligado para não mover o ganho do PipeWire.
+    autoGainControl: settings.automaticGainControl,
     channelCount: 1,
   };
 }

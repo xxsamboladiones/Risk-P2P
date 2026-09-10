@@ -1,0 +1,215 @@
+:root{
+  --risk-accent:#b7f66a;
+  --risk-background:#090b10;
+  --risk-navigation:#10141b;
+  --risk-surface:#151a22;
+  --risk-elevated:#202731;
+  --risk-text:#edf1f7;
+  --risk-muted:#8994a3;
+  --risk-success:#75df8c;
+  --risk-warning:#e2c55f;
+  --risk-danger:#e95555;
+  --risk-accent-contrast:#071008;
+  --risk-surface-contrast:#fff;
+  --risk-border:#edf1f712;
+  --risk-border-strong:#edf1f722;
+  --risk-accent-soft:#b7f66a12;
+  --risk-accent-medium:#b7f66a2a;
+  --risk-success-soft:#75df8c14;
+  --risk-warning-soft:#e2c55f14;
+  --risk-danger-soft:#e9555514;
+  --risk-overlay:#090b10da;
+  --risk-shadow:#ffffff5a;
+}
+
+html[data-risk-theme],html[data-risk-theme] body,html[data-risk-theme] #root,
+html[data-risk-theme] .risk-application,html[data-risk-theme] .social-shell,
+html[data-risk-theme] .room,html[data-risk-theme] .call-layer{
+  background:var(--risk-background);color:var(--risk-text)
+}
+html[data-risk-theme] .auth,html[data-risk-theme] .lobby{
+  color:var(--risk-text);
+  background:radial-gradient(circle at 70% 20%,var(--risk-accent-soft) 0,transparent 30%),radial-gradient(circle at 15% 85%,var(--risk-border-strong) 0,transparent 32%),var(--risk-background)
+}
+html[data-risk-theme] .auth-card,html[data-risk-theme] .lobby section,
+html[data-risk-theme] .modal,html[data-risk-theme] .screen-picker,
+html[data-risk-theme] .chat-gallery,html[data-risk-theme] .fatal-recovery-card,
+html[data-risk-theme] .attachment-card,html[data-risk-theme] .pinned-messages>div,
+html[data-risk-theme] .mention-suggestions{
+  background:var(--risk-surface);color:var(--risk-text);border-color:var(--risk-border-strong)
+}
+html[data-risk-theme] .space-rail,html[data-risk-theme] .navigation,
+html[data-risk-theme] .content-header,html[data-risk-theme] .room footer,
+html[data-risk-theme] .call-chat-header,html[data-risk-theme] .modal-content>.settings-tabs{
+  background:var(--risk-navigation);color:var(--risk-text);border-color:var(--risk-border)
+}
+html[data-risk-theme] .content-panel,html[data-risk-theme] .call-chat-view,
+html[data-risk-theme] .messages,html[data-risk-theme] .friends-layout{
+  background:var(--risk-background);color:var(--risk-text)
+}
+:where(html[data-risk-theme]) button{color:var(--risk-accent-contrast);background:var(--risk-accent)}
+html[data-risk-theme] button.link{background:transparent;color:var(--risk-muted)}
+:where(html[data-risk-theme]) input,:where(html[data-risk-theme]) select,:where(html[data-risk-theme]) textarea{
+  background:var(--risk-background);color:var(--risk-text);border-color:var(--risk-border-strong)
+}
+:where(html[data-risk-theme]) input:focus,:where(html[data-risk-theme]) select:focus,:where(html[data-risk-theme]) textarea:focus{
+  border-color:var(--risk-accent);box-shadow:0 0 0 3px var(--risk-accent-soft)
+}
+:where(html[data-risk-theme]) input[type="checkbox"],:where(html[data-risk-theme]) input[type="radio"],
+:where(html[data-risk-theme]) input[type="range"]{accent-color:var(--risk-accent)}
+
+:where(html[data-risk-theme]) .brand,:where(html[data-risk-theme]) h1,:where(html[data-risk-theme]) h2,
+:where(html[data-risk-theme]) h3,:where(html[data-risk-theme]) strong,
+html[data-risk-theme] .messages article p,html[data-risk-theme] .empty h2,
+html[data-risk-theme] .empty-social h2{color:var(--risk-text)}
+html[data-risk-theme] .brand svg,html[data-risk-theme] .empty-social>svg,
+html[data-risk-theme] .session-loading svg,html[data-risk-theme] .message-box button,
+html[data-risk-theme] .screen-picker>header>div>svg,html[data-risk-theme] .typing-indicator i,
+html[data-risk-theme] .attachment-kind,html[data-risk-theme] .voice-activity-icon,
+html[data-risk-theme] .local-storage-panel h3 svg,html[data-risk-theme] .chat-gallery>header>div>svg{
+  color:var(--risk-accent)
+}
+html[data-risk-theme] .pulse,html[data-risk-theme] .invite-notice,
+html[data-risk-theme] .settings-note,html[data-risk-theme] .audio-apply-status,
+html[data-risk-theme] .attachment-kind{
+  background:var(--risk-accent-soft);color:var(--risk-accent);border-color:var(--risk-accent-medium)
+}
+html[data-risk-theme] .space:hover,html[data-risk-theme] .space.active,
+html[data-risk-theme] .source-switch button.selected,html[data-risk-theme] .room footer button.active,
+html[data-risk-theme] .call-view-tabs button.active,html[data-risk-theme] .voice-session-actions button.active,
+html[data-risk-theme] .screen-audio-option.active,html[data-risk-theme] .profile-file-button,
+html[data-risk-theme] .settings-autosave{
+  background:var(--risk-accent);color:var(--risk-accent-contrast)
+}
+html[data-risk-theme] .space.add{background:var(--risk-accent-soft);color:var(--risk-accent);border-color:var(--risk-accent-medium)}
+
+html[data-risk-theme] .space,html[data-risk-theme] .account-bar,
+html[data-risk-theme] .voice-session-panel,html[data-risk-theme] .voice-session-actions button,
+html[data-risk-theme] .message-box,html[data-risk-theme] .secondary,
+html[data-risk-theme] .tile,html[data-risk-theme] .room footer button,
+html[data-risk-theme] .call-view-tabs,html[data-risk-theme] .minimize-call,
+html[data-risk-theme] .share-control,html[data-risk-theme] .screen-source,
+html[data-risk-theme] .member-picker>button,html[data-risk-theme] .message-actions,
+html[data-risk-theme] .quick-reactions>span,html[data-risk-theme] .message-reactions button,
+html[data-risk-theme] .conversation-tools summary,html[data-risk-theme] .open-gallery,
+html[data-risk-theme] .attachment-actions button,html[data-risk-theme] .settings-secondary-button,
+html[data-risk-theme] .settings-toggle,html[data-risk-theme] .network-settings-section,
+html[data-risk-theme] .network-preference-list label,html[data-risk-theme] .vpn-interface-list article,
+html[data-risk-theme] .in-call-audio-settings,html[data-risk-theme] .in-call-audio-settings>header>button,
+html[data-risk-theme] .in-call-audio-settings .audio-refresh,html[data-risk-theme] .profile-photo-editor,
+html[data-risk-theme] .member-manager,html[data-risk-theme] .invite-tabs,
+html[data-risk-theme] .invite-progress,html[data-risk-theme] .channel-welcome>svg,
+html[data-risk-theme] .network-header-button,html[data-risk-theme] .channel-actions button,
+html[data-risk-theme] .load-older-messages,html[data-risk-theme] .desktop-recovery-notice{
+  background:var(--risk-elevated);color:var(--risk-text);border-color:var(--risk-border)
+}
+html[data-risk-theme] .network-diagnostics,html[data-risk-theme] .network-diagnostics article,
+html[data-risk-theme] .fatal-recovery-card small,html[data-risk-theme] .safe-link-previews a,
+html[data-risk-theme] .chat-message-content code{
+  background:var(--risk-surface);color:var(--risk-text);border-color:var(--risk-border)
+}
+html[data-risk-theme] .tile,html[data-risk-theme] .screen-source-preview,
+html[data-risk-theme] .attachment-image,html[data-risk-theme] .attachment-media{
+  background-color:var(--risk-surface)
+}
+html[data-risk-theme] .tile-label,html[data-risk-theme] .source-switch,
+html[data-risk-theme] .volume-panel,html[data-risk-theme] .composer-reply{
+  background:var(--risk-overlay);color:var(--risk-text);border-color:var(--risk-border-strong)
+}
+
+:where(html[data-risk-theme]) small,:where(html[data-risk-theme]) time,
+html[data-risk-theme] .nav-section,html[data-risk-theme] .channel,
+html[data-risk-theme] .content-header>span,html[data-risk-theme] .empty,
+html[data-risk-theme] .empty-social,html[data-risk-theme] .video-off,
+html[data-risk-theme] .settings-field small,html[data-risk-theme] .settings-toggle small,
+html[data-risk-theme] .call-chat-status,html[data-risk-theme] .screen-picker-loading,
+html[data-risk-theme] .screen-picker-empty,html[data-risk-theme] .attachment-copy span,
+html[data-risk-theme] .attachment-progress,html[data-risk-theme] .typing-indicator,
+html[data-risk-theme] .message-reply-reference,html[data-risk-theme] .deleted-message{
+  color:var(--risk-muted)
+}
+html[data-risk-theme] .channel:hover,html[data-risk-theme] .channel.active,
+html[data-risk-theme] .chat-message:hover,html[data-risk-theme] .message-actions button:hover:not(:disabled),
+html[data-risk-theme] .pinned-messages>div button:hover{
+  background:var(--risk-border);color:var(--risk-text)
+}
+html[data-risk-theme] .channel.voice:hover,html[data-risk-theme] .tile-label em,
+html[data-risk-theme] .volume-control b,html[data-risk-theme] .invite-code,
+html[data-risk-theme] .message-inline-edit button{color:var(--risk-accent)}
+html[data-risk-theme] .tile.local,html[data-risk-theme] .tile:focus-visible,
+html[data-risk-theme] .message-box.is-dragging{border-color:var(--risk-accent-medium)}
+
+html[data-risk-theme] .channel.voice.connected,html[data-risk-theme] .voice-session-summary span,
+html[data-risk-theme] .call-chat-status.ready,html[data-risk-theme] .voice-activity em,
+html[data-risk-theme] .vpn-interface-list em{color:var(--risk-success)}
+html[data-risk-theme] .channel.voice.connected,html[data-risk-theme] .voice-activity.active{
+  background:var(--risk-success-soft);border-color:var(--risk-success)
+}
+html[data-risk-theme] .status i,html[data-risk-theme] .voice-session-summary i,
+html[data-risk-theme] .voice-activity>i,html[data-risk-theme] .call-chat-status.ready i{
+  background:var(--risk-success);box-shadow:0 0 9px var(--risk-success)
+}
+html[data-risk-theme] .content-header .chat-connect.ready{
+  background:var(--risk-success);color:var(--risk-surface-contrast);box-shadow:0 0 18px var(--risk-success-soft)
+}
+html[data-risk-theme] .status.network-limitada,html[data-risk-theme] .call-chat-status.connecting,
+html[data-risk-theme] .call-chat-status.connected,html[data-risk-theme] .attachment-warning,
+html[data-risk-theme] .audio-apply-status.busy{color:var(--risk-warning)}
+html[data-risk-theme] .audio-apply-status.busy{background:var(--risk-warning-soft);border-color:var(--risk-warning)}
+html[data-risk-theme] .status.network-limitada i,html[data-risk-theme] .call-chat-status.connecting i,
+html[data-risk-theme] .call-chat-status.connected i{background:var(--risk-warning)}
+html[data-risk-theme] .error,html[data-risk-theme] .status.network-instável,
+html[data-risk-theme] .settings-device-error,html[data-risk-theme] .audio-apply-error,
+html[data-risk-theme] .attachment-error,html[data-risk-theme] .attachment-preview-error{
+  color:var(--risk-danger)
+}
+html[data-risk-theme] .global-error,html[data-risk-theme] .danger-action,
+html[data-risk-theme] .room footer button.off,html[data-risk-theme] .room footer button.hangup,
+html[data-risk-theme] .voice-session-actions button.disconnect:hover{
+  background:var(--risk-danger);color:#fff
+}
+html[data-risk-theme] .profile-remove-photo,html[data-risk-theme] .attachment-actions button.danger,
+html[data-risk-theme] .content-header .chat-disconnect,html[data-risk-theme] .voice-session-actions button.off,
+html[data-risk-theme] .voice-session-actions button.disconnect,html[data-risk-theme] .danger-confirm-icon{
+  background:var(--risk-danger-soft);color:var(--risk-danger);border-color:var(--risk-danger)
+}
+html[data-risk-theme] .settings-device-error,html[data-risk-theme] .audio-apply-error,
+html[data-risk-theme] .attachment-error,html[data-risk-theme] .lobby-error{
+  background:var(--risk-danger-soft);border-color:var(--risk-danger)
+}
+html[data-risk-theme] .modal-backdrop,html[data-risk-theme] .screen-picker-backdrop,
+html[data-risk-theme] .chat-gallery-backdrop{background:var(--risk-overlay)}
+html[data-risk-theme] .profile-avatar,html[data-risk-theme] .avatar{
+  background:linear-gradient(135deg,var(--risk-accent),var(--risk-success));color:var(--risk-accent-contrast)
+}
+html[data-risk-theme] .chat-message-content a,html[data-risk-theme] .chat-mention{
+  color:var(--risk-accent);text-decoration-color:var(--risk-accent-medium)
+}
+html[data-risk-theme] .chat-mention,html[data-risk-theme] .message-reactions button.active,
+html[data-risk-theme] .message-box .attachment-trigger:hover:not(:disabled){
+  background:var(--risk-accent-soft);color:var(--risk-accent);border-color:var(--risk-accent-medium)
+}
+html[data-risk-theme] .attachment-progress>div{background:var(--risk-border)}
+html[data-risk-theme] .attachment-progress>div i{background:var(--risk-accent)}
+html[data-risk-theme] .attachment-card.state-completed{border-color:var(--risk-accent-medium)}
+html[data-risk-theme] .attachment-card.kind-executable{border-color:var(--risk-warning)}
+html[data-risk-theme] .attachment-card.kind-executable .attachment-kind{
+  background:var(--risk-warning-soft);color:var(--risk-warning)
+}
+html[data-risk-theme] .attachment-drop-hint{background:var(--risk-overlay);color:var(--risk-accent)}
+html[data-risk-theme] .conversation-tools{background:linear-gradient(var(--risk-background) 75%,transparent)}
+html[data-risk-theme] .call-workspace .tile.speaking{
+  border-color:var(--risk-accent);box-shadow:inset 0 0 0 1px var(--risk-accent),0 0 0 2px var(--risk-accent-medium),0 0 26px var(--risk-accent-soft)
+}
+html[data-risk-theme] .call-workspace .tile.speaking .profile-avatar.call-profile-avatar{
+  border-color:var(--risk-accent);box-shadow:0 0 0 4px var(--risk-accent-medium),0 0 30px var(--risk-accent-soft)
+}
+html[data-risk-theme] .tile.profile-only .video-off{
+  background:radial-gradient(circle at 50% 42%,var(--risk-accent-soft) 0,transparent 38%),var(--risk-surface)
+}
+html[data-risk-theme] .settings-tabs{background:var(--risk-background);border-color:var(--risk-border)}
+html[data-risk-theme] .settings-tabs button{background:transparent;color:var(--risk-muted)}
+html[data-risk-theme] .settings-tabs button.active{background:var(--risk-elevated);color:var(--risk-accent);box-shadow:inset 0 0 0 1px var(--risk-accent-medium)}
+html[data-risk-theme] .modal-content{scrollbar-color:var(--risk-muted) var(--risk-background)}
+html[data-risk-theme] .modal-content::-webkit-scrollbar-track{background:var(--risk-background)}
+html[data-risk-theme] .modal-content::-webkit-scrollbar-thumb{background:var(--risk-muted);border-color:var(--risk-background)}

@@ -7,6 +7,10 @@ import { AppErrorBoundary } from "./components/AppErrorBoundary";
 import { DesktopRecoveryNotice } from "./components/DesktopRecoveryNotice";
 import "./styles.css";
 import "./components/modal-layout.css";
+import "./components/theme-overrides.css";
+import { initializeTheme } from "./services/theme/settings";
+
+initializeTheme();
 
 createRoot(document.getElementById("root")!).render(<React.StrictMode>
   <RiskApplicationProvider application={riskApplication}>

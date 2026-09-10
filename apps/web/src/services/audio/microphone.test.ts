@@ -6,6 +6,7 @@ const settings: VoiceVideoSettings = {
   microphoneDeviceId: "usb-mic-123",
   noiseSuppression: "standard",
   echoCancellation: true,
+  automaticGainControl: false,
   excludeRiskAudioFromScreenShare: true,
 };
 
@@ -47,6 +48,18 @@ describe("openConfiguredMicrophone", () => {
         autoGainControl: false,
         channelCount: 1,
       },
+      video: false,
+    });
+  });
+
+  it("ativa a compensação de sensibilidade quando configurada", async () => {
+    const getUserMedia = vi.fn(async () => fakeStream);
+    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia } });
+
+    await openConfiguredMicrophone({ ...settings, automaticGainControl: true });
+
+    expect(getUserMedia).toHaveBeenCalledWith({
+      audio: expect.objectContaining({ autoGainControl: true }),
       video: false,
     });
   });

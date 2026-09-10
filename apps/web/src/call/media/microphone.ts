@@ -22,6 +22,7 @@ export async function createMicrophoneSession(settings: VoiceVideoSettings): Pro
     label: inputTrack.label || "unknown",
     noiseSuppression: settings.noiseSuppression,
     echoCancellation: settings.echoCancellation,
+    automaticGainControl: settings.automaticGainControl,
   });
 
   if (settings.noiseSuppression !== "rnnoise") return { inputStream, track: inputTrack };

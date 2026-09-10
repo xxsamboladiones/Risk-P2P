@@ -19,6 +19,7 @@ import {
 import { connectionPathSignature, summarizePeerStats, type OutboundBytesSample } from "../diagnostics/stats";
 import type {
   CallTransportJoinOptions,
+  LocalAudioHealthSample,
   MeshCallTransport,
   PeerConnectionDiagnostics,
   TransportEvents,
@@ -233,6 +234,33 @@ export class MeshWebRTCTransport implements MeshCallTransport {
     this.localTracks.delete(previousTrack.id);
     this.localTracks.set(nextTrack.id, { track: nextTrack, stream, video: previousPublication?.video });
     if (nextTrack.kind === "video") await this.applyAdaptiveVideoParameters();
+  }
+
+  async sampleLocalAudio(track: MediaStreamTrack): Promise<LocalAudioHealthSample | undefined> {
+    let totalSamplesDuration: number | undefined;
+    for (const { pc } of this.peers.values()) {
+      const sender = pc.getSenders().find((item) => item.track === track || item.track?.id === track.id);
+      if (!sender || typeof sender.getStats !== "function") continue;
+      let reports: RTCStatsReport;
+      try {
+        reports = await sender.getStats();
+      } catch {
+        continue;
+      }
+      reports.forEach((report) => {
+        const sample = report as RTCStats & { kind?: string; totalSamplesDuration?: number };
+        if (
+          sample.type === "media-source"
+          && sample.kind === "audio"
+          && typeof sample.totalSamplesDuration === "number"
+          && Number.isFinite(sample.totalSamplesDuration)
+        ) {
+          totalSamplesDuration = Math.max(totalSamplesDuration ?? 0, sample.totalSamplesDuration);
+        }
+      });
+      if (totalSamplesDuration !== undefined) break;
+    }
+    return totalSamplesDuration === undefined ? undefined : { totalSamplesDuration, sampledAt: Date.now() };
   }
 
   sendData(data: string, targetPeerId?: string): number {

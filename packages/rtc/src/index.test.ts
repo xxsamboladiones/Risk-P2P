@@ -14,6 +14,9 @@ class FakeRtpSender {
   getParameters(): RTCRtpSendParameters { return this.parameters; }
   async setParameters(parameters: RTCRtpSendParameters): Promise<void> { this.parameters = parameters; }
   async replaceTrack(track: MediaStreamTrack | null): Promise<void> { this.track = track; }
+  async getStats(): Promise<RTCStatsReport> {
+    return new Map(FakePeerConnection.stats.map((stat) => [String(stat.id), stat])) as unknown as RTCStatsReport;
+  }
 }
 
 class FakePeerConnection {
@@ -176,6 +179,26 @@ describe("MeshWebRTCTransport", () => {
     await transport.leave();
     expect(transport.getDiagnostics()).toHaveLength(0);
     await expect(transport.join({ roomId: "room-2", localPeerId: "outro-peer" })).rejects.toThrow("outro peer local");
+  });
+
+  it("expõe o avanço das amostras do microfone sem confundir silêncio com falha", async () => {
+    const transport = new MeshWebRTCTransport("local", [], events());
+    const track = { id: "microphone", kind: "audio" } as MediaStreamTrack;
+    const stream = { id: "local", getTracks: () => [track] } as unknown as MediaStream;
+    await transport.connect("remote", false);
+    await transport.publishTrack(track, stream);
+    FakePeerConnection.stats = [{
+      id: "audio-source",
+      type: "media-source",
+      kind: "audio",
+      audioLevel: 0,
+      totalSamplesDuration: 123.5,
+    }];
+
+    await expect(transport.sampleLocalAudio(track)).resolves.toEqual({
+      totalSamplesDuration: 123.5,
+      sampledAt: expect.any(Number),
+    });
   });
 
   it("preserva ICE normal com host, STUN e TURN habilitados", async () => {

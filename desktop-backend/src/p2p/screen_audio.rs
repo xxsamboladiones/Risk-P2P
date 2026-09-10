@@ -38,6 +38,8 @@ const MIX_NODE_WAIT_ATTEMPTS: usize = 80;
 const MICROPHONE_GUARD_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(target_os = "linux")]
 const MICROPHONE_GUARD_ATTEMPTS: usize = 60;
+#[cfg(target_os = "linux")]
+const MICROPHONE_FINAL_RESTORE_ATTEMPTS: usize = 8;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -247,11 +249,11 @@ async fn stop_microphone_guard() {
 
     // Encerrar a captura também pode alterar o controle nativo um pouco depois
     // de o track parar. Repetimos a restauração apenas nessa curta transição.
-    for attempt in 0..3 {
+    for attempt in 0..MICROPHONE_FINAL_RESTORE_ATTEMPTS {
         if let Err(error) = restore_microphone_controls(&current.snapshots).await {
             tracing::debug!(error = %error, "Final PipeWire microphone control restore failed");
         }
-        if attempt < 2 {
+        if attempt + 1 < MICROPHONE_FINAL_RESTORE_ATTEMPTS {
             tokio::time::sleep(MICROPHONE_GUARD_INTERVAL).await;
         }
     }

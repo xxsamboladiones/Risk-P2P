@@ -149,6 +149,16 @@ export function InCallAudioSettings({ call, onClose }: { call: CallController; o
       <span><strong>Cancelamento de eco</strong><small>Também é reaplicado sem desconectar a chamada.</small></span>
     </label>
 
+    <label className="audio-toggle">
+      <input
+        type="checkbox"
+        checked={settings.automaticGainControl}
+        disabled={busy}
+        onChange={(event) => { void apply({ automaticGainControl: event.target.checked }); }}
+      />
+      <span><strong>Sensibilidade automática</strong><small>Recomendado no Windows; no Linux preserva melhor o PipeWire quando desligado.</small></span>
+    </label>
+
     <div className={`audio-apply-status ${busy ? "busy" : ""}`}>
       {busy ? "Trocando a track de áudio…" : "Configuração atual aplicada e salva"}
     </div>

@@ -39,10 +39,16 @@ export class MediaManager {
   private microphoneSettings?: VoiceVideoSettings;
   private microphoneMonitorCleanup?: () => void;
   private microphoneMonitorRevision = 0;
-  private microphoneRecovery?: { revision: number; promise: Promise<void> };
+  private microphoneHealthCheckRunning = false;
+  private microphoneHealthSample?: { totalSamplesDuration: number; sampledAt: number };
+  private microphoneStalledSamples = 0;
+  private lastMicrophoneHealthTickAt = Date.now();
+  private microphoneRecovery?: { revision: number; forceReplacement: boolean; promise: Promise<void> };
   private lastAutomaticMicrophoneRecoveryAt = Number.NEGATIVE_INFINITY;
   private camera?: MediaStreamTrack;
   private screenStream?: MediaStream;
+  private screenMonitorCleanup?: () => void;
+  private lastWindowsScreenRecoveryAt = Number.NEGATIVE_INFINITY;
   private screenQualityProfile: ScreenQualityProfile = SCREEN_QUALITY_PROFILES["1080p30"];
   private screenQualityRevision = 0;
   private peerState: PeerState = { microphone: true, camera: false, screenShare: false };
@@ -58,6 +64,8 @@ export class MediaManager {
 
   reset(): void {
     this.stopMicrophoneMonitor();
+    this.stopScreenMonitor();
+    this.lastWindowsScreenRecoveryAt = Number.NEGATIVE_INFINITY;
     this.lastAutomaticMicrophoneRecoveryAt = Number.NEGATIVE_INFINITY;
     this.local = new MediaStream();
     this.microphoneInputStream = undefined;
@@ -261,11 +269,10 @@ export class MediaManager {
       }
 
       this.screenStream = stream;
-      // Um evento tardio da captura anterior não pode encerrar uma nova
-      // transmissão iniciada no mesmo MediaManager.
-      videoTrack.addEventListener("ended", () => { void this.stopScreen(stream); }, { once: true });
+      this.startScreenMonitor(videoTrack, stream, sourceId, includeAudio, lifecycle);
       const transport = this.dependencies.getTransport();
       if (!transport) {
+        this.stopScreenMonitor();
         stream.getTracks().forEach((track) => track.stop());
         await stopDesktopScreenAudio();
         this.screenStream = undefined;
@@ -287,7 +294,7 @@ export class MediaManager {
         return;
       }
 
-      await this.requestMicrophoneRecovery(transport, lifecycle, true, false);
+      await this.requestMicrophoneRecovery(transport, lifecycle, true, false, isLinuxDesktop());
       if (linuxAudioPreparation) {
         void this.attachLinuxScreenAudio(stream, lifecycle, linuxAudioPreparation, settings.excludeRiskAudioFromScreenShare);
       }
@@ -324,16 +331,17 @@ export class MediaManager {
     const screenStream = this.screenStream;
     this.reset();
 
-    local.getTracks().forEach((track) => track.stop());
-    inputStream?.getTracks().forEach((track) => track.stop());
+    // O guard do PipeWire precisa ser o último a encerrar. Fechar o
+    // AudioContext/captura depois da restauração pode fazer o Chromium gravar
+    // novamente ganho 100% na fonte física.
     screenStream?.getTracks().forEach((track) => track.stop());
     useCallStore.getState().setLocalMedia({ microphone: null, camera: null, screen: null }, this.peerState);
 
-    const screenCleanup = this.screen.stopScreenShare().catch(() => undefined);
-    const desktopAudioCleanup = stopDesktopScreenAudio();
+    await this.screen.stopScreenShare().catch(() => undefined);
     await rnnoise?.stop().catch(() => undefined);
-    await screenCleanup;
-    await desktopAudioCleanup;
+    local.getTracks().forEach((track) => track.stop());
+    inputStream?.getTracks().forEach((track) => track.stop());
+    await stopDesktopScreenAudio();
   }
 
   private async attachLinuxScreenAudio(
@@ -407,6 +415,7 @@ export class MediaManager {
   private async stopScreen(expectedStream?: MediaStream): Promise<void> {
     const stream = this.screenStream;
     if (!stream || (expectedStream && stream !== expectedStream)) return;
+    this.stopScreenMonitor();
     this.screenStream = undefined;
     this.peerState.screenShare = false;
     this.peerState.screenStreamId = undefined;
@@ -419,6 +428,87 @@ export class MediaManager {
     stream.getTracks().forEach((track) => track.stop());
     await this.screen.stopScreenShare().catch(() => undefined);
     await stopDesktopScreenAudio();
+    // Em algumas versões de PipeWire/Chromium a fonte continua marcada como
+    // live depois que o portal a deixa silenciosa. Reabrir a captura após o
+    // guard restaurar volume/mute é a única forma confiável de recuperar áudio.
+    if (isLinuxDesktop() && transport && this.microphone && this.dependencies.isActive(this.dependencies.currentLifecycle())) {
+      await this.requestMicrophoneRecovery(
+        transport,
+        this.dependencies.currentLifecycle(),
+        true,
+        false,
+        true,
+      ).catch((error) => this.dependencies.reportError(error, "Não foi possível recuperar o microfone após a transmissão."));
+    }
+  }
+
+  private startScreenMonitor(
+    track: MediaStreamTrack,
+    stream: MediaStream,
+    sourceId: string | undefined,
+    includeAudio: boolean,
+    lifecycle: number,
+  ): void {
+    this.stopScreenMonitor();
+    let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
+    const clearRecovery = () => {
+      if (recoveryTimer) clearTimeout(recoveryTimer);
+      recoveryTimer = undefined;
+    };
+    const unmuted = () => {
+      clearRecovery();
+      this.lastWindowsScreenRecoveryAt = Number.NEGATIVE_INFINITY;
+    };
+    const ended = () => {
+      clearRecovery();
+      void this.stopScreen(stream);
+    };
+    const muted = () => {
+      clearRecovery();
+      const windowsDesktop = Boolean(window.desktop && /Windows/i.test(navigator.userAgent));
+      if (!windowsDesktop || !sourceId) return;
+      recoveryTimer = setTimeout(() => {
+        recoveryTimer = undefined;
+        if (
+          this.screenStream !== stream
+          || track.readyState !== "live"
+          || !track.muted
+          || !this.dependencies.isActive(lifecycle)
+        ) return;
+        const now = Date.now();
+        if (now - this.lastWindowsScreenRecoveryAt < 15_000) return;
+        this.lastWindowsScreenRecoveryAt = now;
+        void this.restartMutedWindowsScreen(stream, sourceId, includeAudio, lifecycle);
+      }, 3_000);
+    };
+    track.addEventListener("ended", ended, { once: true });
+    track.addEventListener("mute", muted);
+    track.addEventListener("unmute", unmuted);
+    this.screenMonitorCleanup = () => {
+      clearRecovery();
+      track.removeEventListener("ended", ended);
+      track.removeEventListener("mute", muted);
+      track.removeEventListener("unmute", unmuted);
+      this.screenMonitorCleanup = undefined;
+    };
+  }
+
+  private stopScreenMonitor(): void {
+    this.screenMonitorCleanup?.();
+    this.screenMonitorCleanup = undefined;
+  }
+
+  private async restartMutedWindowsScreen(
+    stream: MediaStream,
+    sourceId: string,
+    includeAudio: boolean,
+    lifecycle: number,
+  ): Promise<void> {
+    if (this.screenStream !== stream || !this.dependencies.isActive(lifecycle)) return;
+    console.warn("Captura de tela do Windows permaneceu muda; reiniciando a mesma fonte.", { sourceId });
+    await this.stopScreen(stream);
+    if (!this.dependencies.isActive(lifecycle)) return;
+    await this.toggleScreen(sourceId, includeAudio, this.screenQualityProfile);
   }
 
   private startMicrophoneMonitor(lifecycle: number): void {
@@ -447,6 +537,24 @@ export class MediaManager {
       track.addEventListener("ended", recover);
       track.addEventListener("unmute", recovered);
     });
+    let healthTimer: ReturnType<typeof setInterval> | undefined;
+    const healthCheck = () => {
+      if (!isLinuxDesktop() || !this.peerState.microphone || !this.dependencies.isActive(lifecycle)) return;
+      const now = Date.now();
+      const wokeFromSleep = document.visibilityState === "visible"
+        && now - this.lastMicrophoneHealthTickAt > 60_000;
+      this.lastMicrophoneHealthTickAt = now;
+      void this.checkLinuxMicrophoneHealth(lifecycle, revision, wokeFromSleep);
+    };
+    const checkWhenVisible = () => {
+      if (document.visibilityState === "visible") healthCheck();
+    };
+    if (isLinuxDesktop()) {
+      this.lastMicrophoneHealthTickAt = Date.now();
+      healthTimer = setInterval(healthCheck, 20_000);
+      window.addEventListener("focus", healthCheck);
+      document.addEventListener("visibilitychange", checkWhenVisible);
+    }
     this.microphoneMonitorCleanup = () => {
       if (this.microphoneMonitorRevision !== revision) return;
       tracks.forEach((track) => {
@@ -454,6 +562,11 @@ export class MediaManager {
         track.removeEventListener("ended", recover);
         track.removeEventListener("unmute", recovered);
       });
+      if (healthTimer) {
+        clearInterval(healthTimer);
+        window.removeEventListener("focus", healthCheck);
+        document.removeEventListener("visibilitychange", checkWhenVisible);
+      }
       this.microphoneMonitorCleanup = undefined;
     };
   }
@@ -461,7 +574,52 @@ export class MediaManager {
   private stopMicrophoneMonitor(): void {
     this.microphoneMonitorCleanup?.();
     this.microphoneMonitorCleanup = undefined;
+    this.microphoneHealthSample = undefined;
+    this.microphoneStalledSamples = 0;
+    this.microphoneHealthCheckRunning = false;
     this.microphoneMonitorRevision += 1;
+  }
+
+  private async checkLinuxMicrophoneHealth(
+    lifecycle: number,
+    revision: number,
+    wokeFromSleep: boolean,
+  ): Promise<void> {
+    if (this.microphoneHealthCheckRunning || this.microphoneMonitorRevision !== revision) return;
+    const transport = this.dependencies.getTransport();
+    const track = this.microphone;
+    if (!transport || !track || !this.peerState.microphone || !this.dependencies.isActive(lifecycle)) return;
+    this.microphoneHealthCheckRunning = true;
+    try {
+      if (wokeFromSleep) {
+        console.info("Retomando o microfone do Linux após suspensão do sistema.");
+        await this.requestMicrophoneRecovery(transport, lifecycle, true, true, true);
+        return;
+      }
+      const sample = await transport.sampleLocalAudio?.(track);
+      if (!sample || this.microphoneMonitorRevision !== revision || this.microphone !== track) {
+        this.microphoneHealthSample = sample;
+        this.microphoneStalledSamples = 0;
+        return;
+      }
+      const previous = this.microphoneHealthSample;
+      this.microphoneHealthSample = sample;
+      if (!previous || sample.totalSamplesDuration > previous.totalSamplesDuration + 0.01) {
+        this.microphoneStalledSamples = 0;
+        return;
+      }
+      this.microphoneStalledSamples += 1;
+      if (this.microphoneStalledSamples < 2) return;
+      this.microphoneStalledSamples = 0;
+      console.warn("A captura do microfone no Linux parou de produzir amostras; reabrindo a fonte.", {
+        stalledForMs: sample.sampledAt - previous.sampledAt,
+      });
+      await this.requestMicrophoneRecovery(transport, lifecycle, true, true, true);
+    } catch (error) {
+      console.warn("Não foi possível verificar a saúde do microfone no Linux.", error);
+    } finally {
+      this.microphoneHealthCheckRunning = false;
+    }
   }
 
   private async requestMicrophoneRecovery(
@@ -469,11 +627,14 @@ export class MediaManager {
     lifecycle: number,
     republishHealthyTrack: boolean,
     automatic: boolean,
+    forceReplacement = false,
   ): Promise<void> {
     const revision = this.microphoneMonitorRevision;
     const activeRecovery = this.microphoneRecovery;
     if (activeRecovery?.revision === revision) {
       await activeRecovery.promise;
+      if (!forceReplacement || activeRecovery.forceReplacement) return;
+      await this.requestMicrophoneRecovery(transport, lifecycle, republishHealthyTrack, automatic, true);
       return;
     }
     if (automatic) {
@@ -482,8 +643,8 @@ export class MediaManager {
       this.lastAutomaticMicrophoneRecoveryAt = now;
     }
 
-    const promise = this.recoverMicrophone(transport, lifecycle, revision, republishHealthyTrack);
-    const recovery = { revision, promise };
+    const promise = this.recoverMicrophone(transport, lifecycle, revision, republishHealthyTrack, forceReplacement);
+    const recovery = { revision, forceReplacement, promise };
     this.microphoneRecovery = recovery;
     try {
       await promise;
@@ -497,6 +658,7 @@ export class MediaManager {
     lifecycle: number,
     revision: number,
     republishHealthyTrack: boolean,
+    forceReplacement: boolean,
   ): Promise<void> {
     await this.rnnoiseMicrophone?.ensureRunning().catch((error) => {
       console.warn("Não foi possível reativar o RNNoise antes de verificar o microfone.", error);
@@ -521,7 +683,7 @@ export class MediaManager {
       || this.microphoneMonitorRevision !== revision
     ) return;
 
-    if (!microphoneTrackUnavailable(currentMicrophone) && !microphoneTrackUnavailable(inputTrack)) {
+    if (!forceReplacement && !microphoneTrackUnavailable(currentMicrophone) && !microphoneTrackUnavailable(inputTrack)) {
       if (republishHealthyTrack) await transport.publishTrack(currentMicrophone, this.local);
       return;
     }
@@ -559,6 +721,13 @@ export class MediaManager {
       screen: this.screenStream ? new MediaStream(this.screenStream.getVideoTracks()) : null,
     }, this.peerState);
   }
+}
+
+function isLinuxDesktop(): boolean {
+  return typeof window !== "undefined"
+    && Boolean(window.desktop)
+    && typeof navigator !== "undefined"
+    && /Linux/i.test(navigator.userAgent);
 }
 
 function microphoneTrackUnavailable(track: MediaStreamTrack): boolean {

@@ -138,6 +138,15 @@ export function VoiceVideoSettingsPanel() {
     <label className="settings-toggle">
       <input
         type="checkbox"
+        checked={settings.automaticGainControl}
+        onChange={(event) => update({ automaticGainControl: event.target.checked })}
+      />
+      <span><strong>Sensibilidade automática do microfone</strong><small>Compensa microfones com volume baixo no Windows. No Linux, deixe desligada para preservar o ganho definido no PipeWire.</small></span>
+    </label>
+
+    <label className="settings-toggle">
+      <input
+        type="checkbox"
         checked={settings.excludeRiskAudioFromScreenShare}
         onChange={(event) => update({ excludeRiskAudioFromScreenShare: event.target.checked })}
       />

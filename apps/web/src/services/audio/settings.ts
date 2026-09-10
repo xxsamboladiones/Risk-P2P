@@ -4,6 +4,7 @@ export type VoiceVideoSettings = {
   microphoneDeviceId: string;
   noiseSuppression: NoiseSuppressionMode;
   echoCancellation: boolean;
+  automaticGainControl: boolean;
   excludeRiskAudioFromScreenShare: boolean;
 };
 
@@ -19,8 +20,22 @@ export const DEFAULT_VOICE_VIDEO_SETTINGS: VoiceVideoSettings = {
   microphoneDeviceId: "",
   noiseSuppression: "standard",
   echoCancellation: true,
+  automaticGainControl: false,
   excludeRiskAudioFromScreenShare: true,
 };
+
+function runtimeAutomaticGainControlDefault(): boolean {
+  return typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
+}
+
+function defaultSettings(): VoiceVideoSettings {
+  return {
+    ...DEFAULT_VOICE_VIDEO_SETTINGS,
+    // O AGC ajuda drivers Windows que entregam sinal digital muito baixo. No
+    // Linux ele continua desligado para não alterar o ganho físico do PipeWire.
+    automaticGainControl: runtimeAutomaticGainControlDefault(),
+  };
+}
 
 function syncMediaCaptureOptions(settings: VoiceVideoSettings): void {
   (globalThis as typeof globalThis & { __riskMediaCaptureOptions?: RiskMediaCaptureOptions }).__riskMediaCaptureOptions = {
@@ -36,7 +51,7 @@ export function loadVoiceVideoSettings(): VoiceVideoSettings {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) {
-      const settings = { ...DEFAULT_VOICE_VIDEO_SETTINGS };
+      const settings = defaultSettings();
       syncMediaCaptureOptions(settings);
       return settings;
     }
@@ -48,12 +63,15 @@ export function loadVoiceVideoSettings(): VoiceVideoSettings {
       microphoneDeviceId: normalizeMicrophoneDeviceId(value.microphoneDeviceId),
       noiseSuppression,
       echoCancellation: value.echoCancellation !== false,
+      automaticGainControl: typeof value.automaticGainControl === "boolean"
+        ? value.automaticGainControl
+        : runtimeAutomaticGainControlDefault(),
       excludeRiskAudioFromScreenShare: value.excludeRiskAudioFromScreenShare !== false,
     };
     syncMediaCaptureOptions(settings);
     return settings;
   } catch {
-    const settings = { ...DEFAULT_VOICE_VIDEO_SETTINGS };
+    const settings = defaultSettings();
     syncMediaCaptureOptions(settings);
     return settings;
   }

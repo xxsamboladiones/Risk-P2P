@@ -1,3 +1,5 @@
+export * from "./game";
+
 export type PeerState = {
   microphone: boolean;
   camera: boolean;

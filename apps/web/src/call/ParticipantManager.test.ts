@@ -23,6 +23,33 @@ function screenStream(id: string, track: FakeTrack): MediaStream {
 beforeEach(() => useCallStore.getState().reset());
 
 describe("ParticipantManager", () => {
+  it.each(["state-first", "stream-first"])("mostra uma tela já ativa para quem entra depois (%s)", (order) => {
+    const manager = new ParticipantManager();
+    const stream = screenStream("received-screen", new FakeTrack());
+    const state = { microphone: true, camera: false, screenShare: true, screenStreamId: "announced-screen" };
+    manager.ensure("peer");
+    if (order === "state-first") manager.state("peer", state);
+    manager.remoteStream("peer", stream);
+    manager.state("peer", state);
+    const participant = useCallStore.getState().participants.peer!;
+    expect(participant.streams?.[participant.state.screenStreamId!]).toBe(stream);
+  });
+
+  it("associa câmera e tela já recebidas ao primeiro estado da chamada", () => {
+    const manager = new ParticipantManager();
+    const camera = screenStream("received-camera", new FakeTrack());
+    const screen = screenStream("received-screen", new FakeTrack());
+    manager.remoteStream("peer", camera);
+    manager.remoteStream("peer", screen);
+    manager.state("peer", {
+      microphone: true, camera: true, screenShare: true,
+      cameraStreamId: "announced-camera", screenStreamId: "announced-screen",
+    });
+    const participant = useCallStore.getState().participants.peer!;
+    expect(participant.streams?.[participant.state.screenStreamId!]).toBe(screen);
+    expect(participant.streams?.[participant.state.cameraStreamId!]).toBe(camera);
+  });
+
   it("preserva o novo ID anunciado, remove a tela encerrada e aceita a substituta", () => {
     const manager = new ParticipantManager();
     const oldTrack = new FakeTrack();

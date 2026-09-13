@@ -47,6 +47,7 @@ interface Window {
     selectScreenSource(sourceId: string): Promise<void>;
     setWindowFullscreen(enabled: boolean): Promise<{ fullscreen: boolean }>;
     getBackendConfig(): Promise<RiskDesktopBackendConfig>;
+    onGameModeStopped?(callback: () => void): () => void;
     getNetworkInterfaces(): Promise<RiskDesktopNetworkInterface[]>;
     openExternal(url: string): Promise<void>;
     onBackendStatus(callback: (status: RiskDesktopBackendStatus) => void): () => void;

@@ -128,7 +128,7 @@ export class HistoryService {
     if (this.requests.get(remotePeerId)?.requestId !== chunk.requestId) return;
     for (const message of chunk.messages) {
       if (this.messages.hasProcessed(message.id) || !(await this.verify(message))) continue;
-      await this.messages.persistSigned(message);
+      await this.messages.persistSigned(message, "history");
     }
     for (const event of chunk.events ?? []) {
       if (this.messages.hasProcessedEvent(event.id) || !(await this.verifyEvent(event))) continue;

@@ -60,7 +60,7 @@ import {
   type PublicPeerIdentity,
 } from "../services/offline/social-storage";
 import { useCallStore } from "../store";
-import { callOwnsTextConversation } from "../application/chat-routing";
+import { mergeMessageHistory } from "../services/chat/message-history";
 import { playCallSound } from "../services/audio/call-sounds";
 
 type SocialModal = "friend" | "group" | "groupProfile" | "channel" | "inviteMember" | "manageMember" | "joinGroup" | "settings" | "profile" | null;
@@ -274,18 +274,18 @@ export function HomeView() {
 
   const isPrivateConversation = Boolean(activeFriend);
   const privateSession = isPrivateConversation && privateChannelId ? backgroundChats.privateSession(privateChannelId) : undefined;
-  const isCallConversation = callOwnsTextConversation({
-    roomId,
-    conversationId,
-    callTextChannelId: callContext?.textChannelId,
-    privateConversation: isPrivateConversation,
-  });
   const activeConversationChat = isPrivateConversation
     ? (privateSession?.controller ?? chat)
-    : isCallConversation
-      ? callChat
+    : conversationId
+      ? backgroundChats.groupController(conversationId)
       : chat;
   const activeConversationControllerAvailable = !isPrivateConversation || Boolean(privateSession?.controller);
+
+  useEffect(() => {
+    if (conversationId && (!roomId || !callWorkspaceOpen) && document.visibilityState === "visible") {
+      backgroundChats.clear(conversationId);
+    }
+  }, [backgroundChats, conversationId, roomId, callWorkspaceOpen, unreadChannels]);
 
   useEffect(() => {
     if (!conversationId) {
@@ -306,6 +306,7 @@ export function HomeView() {
       setChatStatus(session?.status ?? "disconnected");
     }
     let alive = true;
+    setMessages([]);
     const offMessage = controller?.onMessage((message) => {
       if (!alive || message.channelId !== conversationId) return;
       setMessages((current) => {
@@ -336,7 +337,7 @@ export function HomeView() {
     void Promise.all([historyController.history(conversationId), historyController.attachmentHistory(conversationId)])
       .then(([chatItems, attachmentItems]) => {
         if (!alive) return;
-        setMessages([...chatItems].sort((a, b) => a.createdAt.localeCompare(b.createdAt)));
+        setMessages((current) => mergeMessageHistory(chatItems, current));
         setHasOlderMessages(chatItems.length === 100);
         setAttachments(dedupeAttachments(attachmentItems));
       })
@@ -348,13 +349,12 @@ export function HomeView() {
       offStatus?.();
       offAttachment?.();
       offProgress?.();
-      if (!isPrivateConversation && !isCallConversation) void chat.disconnect();
       setChatStatus("disconnected");
       setAttachmentProgress({});
       setReplyingTo(null);
       setTypingUsers([]);
     };
-  }, [activeConversationChat, activeConversationControllerAvailable, conversationId, isCallConversation, isPrivateConversation]);
+  }, [activeConversationChat, activeConversationControllerAvailable, conversationId, isPrivateConversation]);
 
   useEffect(() => setMessageSearch(""), [activeChannel?.id, activeFriend?.id]);
 
@@ -389,13 +389,6 @@ export function HomeView() {
           }
         : {});
       const textChannel = availableChannels.find((item) => item.kind === "text") ?? null;
-      if (textChannel) {
-        await backgroundChats.release(textChannel.id);
-        if (!activeFriend && activeChannel?.id === textChannel.id) {
-          await chat.disconnect().catch(() => undefined);
-          setChatStatus("disconnected");
-        }
-      }
       setCallContext({
         groupId: community?.id ?? "",
         groupName: community?.name ?? "Grupo",
@@ -434,9 +427,6 @@ export function HomeView() {
         return;
       }
       if (!activeChannel || activeChannel.kind !== "text") return;
-      if (roomId && callContext?.textChannelId === activeChannel.id) {
-        throw new Error("Este canal já pertence ao chat automático da chamada enquanto você estiver na sala de voz.");
-      }
       const [identity, groups] = await Promise.all([
         getOrCreateLocalIdentity(currentUser.displayName),
         loadLocalGroups(),
@@ -445,7 +435,7 @@ export function HomeView() {
       if (selectedCommunity?.local && !group) {
         throw new Error("Os dados locais deste grupo não estão disponíveis. O chat foi bloqueado para evitar uma conexão sem autenticação.");
       }
-      await chat.connect(activeChannel.id, currentUser.displayName, iceServers, group ? {
+      await backgroundChats.connectGroup(activeChannel.id, currentUser.displayName, iceServers, group ? {
         identity,
         trustedPeers: group.members,
         revokedPeers: group.removedMembers ?? [],
@@ -546,7 +536,7 @@ export function HomeView() {
       await deleteLocalGroupChannel(selectedCommunity.id, removing.id);
       const remaining = channels.filter((item) => item.id !== removing.id);
       if (activeChannel?.id === removing.id) {
-        await chat.disconnect().catch(() => undefined);
+        await backgroundChats.release(removing.id).catch(() => undefined);
         setChatStatus("disconnected");
         setActiveChannel(remaining.find((item) => item.kind === "text") ?? remaining[0] ?? null);
       }
@@ -756,7 +746,6 @@ export function HomeView() {
             <button className="disconnect" onClick={() => {
               setRoom(null);
               setCallContext(null);
-              void callChat.disconnect();
               void call.leave(roomId);
             }} title="Desconectar"><PhoneOff/></button>
           </div>

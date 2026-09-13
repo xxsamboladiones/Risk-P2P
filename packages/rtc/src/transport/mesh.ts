@@ -1,4 +1,5 @@
 import type { IceCandidatePayload, PeerState } from "@risk/protocol";
+import { GAME_INPUT_CHANNEL, MAX_GAME_PACKET_BYTES } from "@risk/protocol";
 import { logger } from "@risk/shared";
 import {
   classifySelectedConnectionPath,
@@ -26,6 +27,7 @@ import type {
 } from "./call-transport";
 import { resolveVideoSenderPolicy, type VideoPublicationOptions } from "../video-encoding";
 import { isMLineOrderMismatch } from "./negotiation";
+import { GamePlayout } from "./game-playout";
 import { createMeshPeerEntry, type MeshPeerEntry as PeerEntry } from "./peer";
 import { addOrQueueIceCandidate, flushPendingIceCandidates } from "./ice";
 import {
@@ -49,6 +51,12 @@ export class MeshWebRTCTransport implements MeshCallTransport {
   private readonly mediaAuthorizedPeers = new Set<string>();
   private readonly pendingRemoteStreams = new Map<string, Map<string, MediaStream>>();
   private readonly activeRemoteStreams = new Map<string, Map<string, MediaStream>>();
+  // A associação track/stream é mutável durante rollback e renegociação.
+  // A autorização pertence à faixa recebida, mesmo enquanto ela está sem stream.
+  private readonly remoteTracks = new Map<string, Set<MediaStreamTrack>>();
+  private readonly gamePlayout = new Map<string, GamePlayout>();
+  private readonly gamePlaybackPeers = new Set<string>();
+  private readonly screenPlaybackPeers = new Set<string>();
   private readonly recoveryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly recoveryAttempts = new Map<string, number>();
   private mediaAuthorizationRequired = false;
@@ -98,7 +106,7 @@ export class MeshWebRTCTransport implements MeshCallTransport {
     const entry = this.peers.get(peerId) ?? this.createPeer(peerId);
     if (initiator) { entry.canNegotiate = true; entry.initiator = true; }
     if (initiator && this.events.onDataMessage && !entry.dataChannel) {
-      this.bindControlDataChannel(peerId, entry, entry.pc.createDataChannel(CONTROL_CHANNEL_LABEL, { ordered: true }));
+      this.bindControlDataChannel(peerId, entry, entry.pc.createDataChannel(CONTROL_CHANNEL_LABEL, { ordered: true }), true);
     }
     // `new` não evolui para `failed` quando uma offer some no signaling. Arme
     // a recuperação desde a criação do peer para que a negociação não possa
@@ -119,8 +127,9 @@ export class MeshWebRTCTransport implements MeshCallTransport {
   }
 
   async authorizePeerMedia(peerId: string): Promise<void> {
-    this.mediaAuthorizedPeers.add(peerId);
     const entry = this.requirePeer(peerId);
+    this.mediaAuthorizedPeers.add(peerId);
+    this.remoteTracks.get(peerId)?.forEach((track) => { track.enabled = true; });
     const pendingStreams = this.pendingRemoteStreams.get(peerId);
     if (pendingStreams) {
       this.pendingRemoteStreams.delete(peerId);
@@ -139,7 +148,10 @@ export class MeshWebRTCTransport implements MeshCallTransport {
   }
 
   revokePeerMedia(peerId: string): void {
+    this.setScreenPlayback(peerId, false);
+    this.setGameModePlayback(peerId, false);
     this.mediaAuthorizedPeers.delete(peerId);
+    this.remoteTracks.get(peerId)?.forEach((track) => { track.enabled = false; });
     this.pendingRemoteStreams.get(peerId)?.forEach((stream) => stream.getTracks().forEach((track) => { track.enabled = false; }));
     this.pendingRemoteStreams.delete(peerId);
     this.activeRemoteStreams.get(peerId)?.forEach((stream) => stream.getTracks().forEach((track) => { track.enabled = false; }));
@@ -280,6 +292,59 @@ export class MeshWebRTCTransport implements MeshCallTransport {
     return sent;
   }
 
+  ensureGameInputChannel(peerId: string): void {
+    const entry = this.requirePeer(peerId);
+    if (!this.mediaAuthorizedPeers.has(peerId) || !this.events.onGameInput) return;
+    if (this.localPeerId > peerId || (entry.gameInputChannel && !["closed", "closing"].includes(entry.gameInputChannel.readyState))) return;
+    this.bindGameInputChannel(peerId, entry, entry.pc.createDataChannel(GAME_INPUT_CHANNEL, { ordered: false, maxRetransmits: 0 }));
+  }
+
+  sendGameInput(peerId: string, data: string): boolean {
+    const channel = this.peers.get(peerId)?.gameInputChannel;
+    if (!this.mediaAuthorizedPeers.has(peerId) || channel?.readyState !== "open"
+      || channel.bufferedAmount > 0 || encodedMessageSize(data) > MAX_GAME_PACKET_BYTES) return false;
+    channel.send(data);
+    return true;
+  }
+
+  setGameModePlayback(peerId: string, enabled: boolean): void {
+    if (enabled && this.mediaAuthorizedPeers.has(peerId)) this.gamePlaybackPeers.add(peerId);
+    else this.gamePlaybackPeers.delete(peerId);
+    this.applyPlayoutPolicy(peerId);
+  }
+
+  setScreenPlayback(peerId: string, enabled: boolean): void {
+    if (enabled && this.mediaAuthorizedPeers.has(peerId)) this.screenPlaybackPeers.add(peerId);
+    else this.screenPlaybackPeers.delete(peerId);
+    this.applyPlayoutPolicy(peerId);
+  }
+
+  private applyPlayoutPolicy(peerId: string): void {
+    if (!this.gamePlaybackPeers.has(peerId) && !this.screenPlaybackPeers.has(peerId)) {
+      this.gamePlayout.get(peerId)?.restore();
+      this.gamePlayout.delete(peerId);
+      return;
+    }
+    const entry = this.peers.get(peerId);
+    if (!entry || !this.mediaAuthorizedPeers.has(peerId)) return;
+    const policy = this.gamePlayout.get(peerId) ?? new GamePlayout();
+    this.gamePlayout.set(peerId, policy);
+    policy.apply(entry.pc.getTransceivers().map(({ receiver }) => receiver), this.gamePlaybackPeers.has(peerId) ? 0 : 30);
+  }
+
+  private bindGameInputChannel(peerId: string, entry: PeerEntry, channel: RTCDataChannel): void {
+    if (this.peers.get(peerId) !== entry || channel.ordered || channel.maxRetransmits !== 0
+      || (entry.gameInputChannel && !["closed", "closing"].includes(entry.gameInputChannel.readyState))) { channel.close(); return; }
+    entry.gameInputChannel = channel;
+    const current = () => this.peers.get(peerId) === entry && entry.gameInputChannel === channel;
+    channel.onmessage = ({ data }) => {
+      if (current() && this.mediaAuthorizedPeers.has(peerId) && typeof data === "string" && encodedMessageSize(data) <= MAX_GAME_PACKET_BYTES) this.events.onGameInput?.(peerId, data);
+    };
+    const notify = () => { if (current()) this.events.onGameInputState?.(peerId, channel.readyState); };
+    channel.onopen = channel.onclose = channel.onerror = notify;
+    if (channel.readyState === "open") notify();
+  }
+
   sendTransferData(data: ArrayBuffer | ArrayBufferView, targetPeerId?: string): number {
     const payload = exactArrayBuffer(data);
     if (payload.byteLength > MAX_TRANSFER_FRAME_BYTES) throw new Error("Frame do risk.transfer excede o limite permitido.");
@@ -357,6 +422,8 @@ export class MeshWebRTCTransport implements MeshCallTransport {
   async disconnect(peerId?: string): Promise<void> {
     const ids = peerId ? [peerId] : [...this.peers.keys()];
     ids.forEach((id) => {
+      this.setScreenPlayback(id, false);
+      this.setGameModePlayback(id, false);
       const entry = this.peers.get(id);
       if (!entry) return;
       entry.pc.onicecandidate = null;
@@ -366,6 +433,7 @@ export class MeshWebRTCTransport implements MeshCallTransport {
       entry.pendingIceCandidates.length = 0;
       entry.dataChannel?.close();
       entry.transferDataChannel?.close();
+      entry.gameInputChannel?.close();
       entry.pc.close();
       this.peers.delete(id);
       this.mediaAuthorizedPeers.delete(id);
@@ -373,6 +441,8 @@ export class MeshWebRTCTransport implements MeshCallTransport {
       pendingStreams?.forEach((stream) => stream.getTracks().forEach((track) => { track.enabled = false; }));
       this.pendingRemoteStreams.delete(id);
       this.activeRemoteStreams.delete(id);
+      this.remoteTracks.get(id)?.forEach((track) => { track.enabled = false; });
+      this.remoteTracks.delete(id);
       this.previousOutboundBytes.delete(id);
       this.previousConnectionPaths.delete(id);
       const timer = this.recoveryTimers.get(id);
@@ -440,10 +510,21 @@ export class MeshWebRTCTransport implements MeshCallTransport {
       }
       void Promise.resolve(this.events.sendIce(peerId, prepared)).catch((error) => logger.warn("ICE signaling failed", { peerId, error: String(error) }));
     };
-    pc.ontrack = ({ streams }) => {
+    pc.ontrack = ({ track, streams }) => {
+      if (this.peers.get(peerId) !== entry) return;
+      if (this.gamePlayout.has(peerId)) this.applyPlayoutPolicy(peerId);
+      const authorized = !this.mediaAuthorizationRequired || this.mediaAuthorizedPeers.has(peerId);
+      const tracks = this.remoteTracks.get(peerId) ?? new Set<MediaStreamTrack>();
+      const receivedTracks = new Set(streams.flatMap((stream) => stream.getTracks()));
+      if (track) receivedTracks.add(track);
+      receivedTracks.forEach((received) => {
+        tracks.add(received);
+        received.enabled = authorized;
+      });
+      this.remoteTracks.set(peerId, tracks);
       const stream = streams[0];
       if (!stream) return;
-      if (!this.mediaAuthorizationRequired || this.mediaAuthorizedPeers.has(peerId)) {
+      if (authorized) {
         this.rememberActiveRemoteStream(peerId, stream);
         this.events.onRemoteStream(peerId, stream);
         return;
@@ -457,7 +538,8 @@ export class MeshWebRTCTransport implements MeshCallTransport {
       this.pendingRemoteStreams.set(peerId, pending);
     };
     pc.ondatachannel = ({ channel }) => {
-      if (channel.label === TRANSFER_CHANNEL_LABEL) this.bindTransferDataChannel(peerId, entry, channel);
+      if (channel.label === GAME_INPUT_CHANNEL && this.events.onGameInput) this.bindGameInputChannel(peerId, entry, channel);
+      else if (channel.label === TRANSFER_CHANNEL_LABEL) this.bindTransferDataChannel(peerId, entry, channel);
       else if (channel.label === CONTROL_CHANNEL_LABEL || channel.label === "risk.control") this.bindControlDataChannel(peerId, entry, channel);
       else channel.close();
     };
@@ -546,7 +628,7 @@ export class MeshWebRTCTransport implements MeshCallTransport {
     replacement.initiator = true;
     replacement.canNegotiate = true;
     if (this.events.onDataMessage && !replacement.dataChannel) {
-      this.bindControlDataChannel(peerId, replacement, replacement.pc.createDataChannel(CONTROL_CHANNEL_LABEL, { ordered: true }));
+      this.bindControlDataChannel(peerId, replacement, replacement.pc.createDataChannel(CONTROL_CHANNEL_LABEL, { ordered: true }), true);
     }
     if (hadTransferChannel && this.events.onTransferMessage && !replacement.transferDataChannel) {
       this.bindTransferDataChannel(peerId, replacement, replacement.pc.createDataChannel(TRANSFER_CHANNEL_LABEL, { ordered: true }));
@@ -607,14 +689,27 @@ export class MeshWebRTCTransport implements MeshCallTransport {
     })));
   }
 
-  private bindControlDataChannel(peerId: string, entry: PeerEntry, channel: RTCDataChannel): void {
+  private bindControlDataChannel(peerId: string, entry: PeerEntry, channel: RTCDataChannel, locallyCreated = false): void {
+    if (this.peers.get(peerId) !== entry) { channel.close(); return; }
     const previous = entry.dataChannel;
+    if (previous && previous !== channel
+      && previous.readyState !== "closed" && previous.readyState !== "closing"
+      && entry.controlChannelLocallyCreated !== locallyCreated) {
+      // Em offers simultâneas, ambos podem criar um canal. Os dois lados devem
+      // preservar o canal criado pelo menor peerId; trocar sempre pelo recebido
+      // fecha as duas pontas e impede a autenticação e a liberação da mídia.
+      const preferLocal = this.localPeerId < peerId;
+      if (locallyCreated !== preferLocal) { channel.close(); return; }
+    }
     entry.dataChannel = channel;
+    entry.controlChannelLocallyCreated = locallyCreated;
     if (previous && previous !== channel) previous.close();
+    let lastState: RTCDataChannelState | undefined;
     const notifyState = () => {
       // O fechamento de um canal substituído não pode derrubar a autenticação do
       // canal novo. Só a geração atualmente associada ao peer publica seu estado.
-      if (this.peers.get(peerId) === entry && entry.dataChannel === channel) {
+      if (this.peers.get(peerId) === entry && entry.dataChannel === channel && lastState !== channel.readyState) {
+        lastState = channel.readyState;
         this.events.onDataState?.(peerId, channel.readyState);
       }
     };
@@ -622,8 +717,10 @@ export class MeshWebRTCTransport implements MeshCallTransport {
     channel.onclose = notifyState;
     channel.onerror = notifyState;
     channel.onmessage = ({ data }) => {
+      if (this.peers.get(peerId) !== entry || entry.dataChannel !== channel) return;
       if (typeof data === "string" && encodedMessageSize(data) <= MAX_CONTROL_MESSAGE_BYTES) this.events.onDataMessage?.(peerId, data);
     };
+    if (channel.readyState === "open") notifyState();
   }
 
   private bindTransferDataChannel(peerId: string, entry: PeerEntry, channel: RTCDataChannel): void {
@@ -705,7 +802,7 @@ export class MeshWebRTCTransport implements MeshCallTransport {
     replacement.initiator = initiator;
     replacement.canNegotiate = true;
     if (this.events.onDataMessage && !replacement.dataChannel) {
-      this.bindControlDataChannel(peerId, replacement, replacement.pc.createDataChannel(CONTROL_CHANNEL_LABEL, { ordered: true }));
+      this.bindControlDataChannel(peerId, replacement, replacement.pc.createDataChannel(CONTROL_CHANNEL_LABEL, { ordered: true }), true);
     }
     if (hadTransferChannel && this.events.onTransferMessage && !replacement.transferDataChannel) {
       this.bindTransferDataChannel(peerId, replacement, replacement.pc.createDataChannel(TRANSFER_CHANNEL_LABEL, { ordered: true }));
@@ -720,14 +817,18 @@ export class MeshWebRTCTransport implements MeshCallTransport {
   }
 
   private disposePeerEntry(peerId: string, entry: PeerEntry, preserveRecovery = false): void {
+    this.setScreenPlayback(peerId, false);
+    this.setGameModePlayback(peerId, false);
     if (this.peers.get(peerId) === entry) this.peers.delete(peerId);
     entry.pc.onicecandidate = null;
     entry.pc.ontrack = null;
+    entry.pc.ondatachannel = null;
     entry.pc.onnegotiationneeded = null;
     entry.pc.onconnectionstatechange = null;
     entry.pendingIceCandidates.length = 0;
     entry.dataChannel?.close();
     entry.transferDataChannel?.close();
+    entry.gameInputChannel?.close();
     entry.pc.close();
     this.mediaAuthorizedPeers.delete(peerId);
     const pendingStreams = this.pendingRemoteStreams.get(peerId);
@@ -736,6 +837,8 @@ export class MeshWebRTCTransport implements MeshCallTransport {
     const activeStreams = this.activeRemoteStreams.get(peerId);
     activeStreams?.forEach((stream) => stream.getTracks().forEach((track) => { track.enabled = false; }));
     this.activeRemoteStreams.delete(peerId);
+    this.remoteTracks.get(peerId)?.forEach((track) => { track.enabled = false; });
+    this.remoteTracks.delete(peerId);
     this.previousOutboundBytes.delete(peerId);
     this.previousConnectionPaths.delete(peerId);
     const timer = this.recoveryTimers.get(peerId);

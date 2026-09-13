@@ -49,7 +49,6 @@ const backend = new DesktopBackendManager(
   () => isQuitting,
 );
 const screenCapture = new ScreenCaptureController(isTrustedRendererUrl);
-registerDesktopIpc(backend, isTrustedRendererUrl);
 
 function openMainWindow(): BrowserWindow {
   if (mainWindow && !mainWindow.isDestroyed()) return mainWindow;
@@ -96,6 +95,8 @@ if (hasSingleInstanceLock) {
   });
 
   app.whenReady().then(async () => {
+    // O IPC também registra um atalho global, que exige o Electron pronto.
+    registerDesktopIpc(backend, isTrustedRendererUrl);
     if (app.isPackaged) {
       await registerPackagedProtocol(path.resolve(process.resourcesPath, "web"));
       pageUrl = PACKAGED_ENTRY_URL;

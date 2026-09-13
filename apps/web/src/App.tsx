@@ -6,6 +6,8 @@ import { useCallStore } from "./store";
 import { AuthView } from "./views/AuthView";
 import { CallView } from "./views/CallView";
 import { HomeView } from "./views/HomeView";
+import { ChatProfiles } from "./components/ChatProfiles";
+import { MessageNotifications } from "./components/MessageNotifications";
 
 export function App() {
   const { session } = useRiskApplication();
@@ -31,8 +33,9 @@ export function App() {
     return <main className="auth"><div className="session-loading"><Sparkles/><span>Restaurando sua sessão…</span></div></main>;
   }
   if (!token) return <AuthView/>;
-  return <div className="risk-application">
+  return <ChatProfiles><div className="risk-application">
     <HomeView/>
     {room && <div className={`call-layer ${callWorkspaceOpen ? "open" : "background"}`} aria-hidden={!callWorkspaceOpen}><CallView/></div>}
-  </div>;
+    <MessageNotifications/>
+  </div></ChatProfiles>;
 }

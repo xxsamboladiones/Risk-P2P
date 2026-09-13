@@ -1,0 +1,16 @@
+.game-tile-controls{position:absolute;right:14px;bottom:110px;z-index:8;display:flex;flex-wrap:wrap;gap:7px;justify-content:flex-end;max-width:calc(100% - 28px)}
+.game-tile-controls button,.game-tile-controls select{display:flex;align-items:center;gap:7px;border:1px solid #b7f66a66;background:#192515;color:#d3ffad;padding:9px 12px;border-radius:10px;font:600 13px inherit;cursor:pointer}
+.game-tile-controls button.playing{background:#b7f66a;color:#14200a}.game-tile-controls small{width:100%;color:#ffada5;background:#111d;padding:7px;border-radius:8px}
+.game-host-control{position:relative;flex-shrink:0}.game-host-control>button{display:flex;align-items:center;gap:8px}.game-host-control>button:disabled{opacity:.45;cursor:not-allowed}
+.game-host-panel{position:fixed;bottom:100px;right:20px;z-index:300;width:330px;max-width:calc(100vw - 32px);background:#141c22;color:#edf2f7;border:1px solid #b7f66a55;border-radius:14px;padding:16px;box-shadow:0 12px 35px #0008;display:grid;gap:10px;text-align:left}
+.game-host-panel strong{color:#c9ff9e}.game-host-panel small{font-size:12px;line-height:1.45;color:#b4c0cc}.game-host-panel>div{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:13px}.game-host-panel>div>span{overflow-wrap:anywhere}.game-host-panel button{font-size:12px;padding:7px;background:#482d2c;color:#ffd4cb}
+.tile.thumbnail .game-tile-controls{bottom:40px;right:8px}.tile.thumbnail .game-tile-controls select{display:none}.tile.thumbnail .game-tile-controls button{font-size:11px;padding:6px}
+
+.game-tile-controls .game-escape-hint{color:#d3dfcc;font-size:12px}
+/* Higher specificity restores the overlays hidden by legacy fullscreen rules. */
+.call-workspace .stage .tile[data-risk-overlays-visible="true"] :is(.tile-label,.source-switch,.game-tile-controls){display:flex!important;opacity:1!important;visibility:visible!important}
+.call-workspace .stage .tile[data-risk-overlays-visible="true"] .volume-panel{display:grid!important;opacity:1!important;visibility:visible!important}
+.call-workspace .stage .tile[data-risk-overlays-visible="true"] .tile-fullscreen{display:grid!important;opacity:.9!important;visibility:visible!important}
+.call-workspace .stage .tile[data-risk-overlays-visible="false"] :is(.tile-label,.source-switch,.volume-panel,.tile-fullscreen,.game-tile-controls){opacity:0!important;visibility:hidden!important;pointer-events:none!important}
+.call-workspace .stage .tile[data-risk-overlays-visible="false"]{cursor:none!important}
+

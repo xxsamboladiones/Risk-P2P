@@ -9,6 +9,7 @@ export type ScreenQualityProfile = {
   fps: number;
   maxBitrate: number;
   contentHint: "detail" | "motion";
+  degradationPreference?: RTCDegradationPreference;
 };
 
 type ScreenCaptureConstraints = MediaTrackConstraints & { resizeMode?: "crop-and-scale" };
@@ -31,7 +32,7 @@ export function screenVideoPublication(profile: ScreenQualityProfile): VideoPubl
     maxFramerate: profile.fps,
     targetWidth: profile.width,
     targetHeight: profile.height,
-    degradationPreference: profile.contentHint === "motion" ? "balanced" : "maintain-resolution",
+    degradationPreference: profile.degradationPreference ?? (profile.contentHint === "motion" ? "maintain-framerate" : "maintain-resolution"),
   };
 }
 

@@ -1,6 +1,6 @@
 import { session } from "electron";
 
-const ALLOWED_PERMISSIONS = new Set(["media", "display-capture", "fullscreen"]);
+const ALLOWED_PERMISSIONS = new Set(["media", "display-capture", "fullscreen", "pointerLock"]);
 
 export function registerPermissionPolicy(isTrustedRendererUrl: (value: string) => boolean): void {
   session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {

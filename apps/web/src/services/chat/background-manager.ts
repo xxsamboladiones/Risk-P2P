@@ -31,6 +31,7 @@ export type PrivateChatSessionSnapshot = {
 
 export class BackgroundChatManager {
   private readonly sessions = new Map<string, ChatController>();
+  private readonly groupStatuses = new Map<string, ChatConnectionStatus>();
   private readonly membershipSessions = new Map<string, ChatController>();
   private readonly privateSessions = new Map<string, PrivateChatSession>();
   private readonly unread = new Map<string, number>();
@@ -54,6 +55,36 @@ export class BackgroundChatManager {
   clear(channelId: string): void {
     if (!this.unread.delete(channelId)) return;
     this.listener?.(new Map(this.unread));
+  }
+
+  /** Uma sessão por canal, compartilhada pelo chat, chamada e segundo plano. */
+  groupController(channelId: string): ChatController {
+    const existing = this.sessions.get(channelId);
+    if (existing) return existing;
+    const controller = this.createController();
+    this.sessions.set(channelId, controller);
+    controller.onStatus((status) => {
+      if (this.sessions.get(channelId) !== controller) return;
+      this.groupStatuses.set(channelId, status);
+      if (status === "error" && this.desiredChannels.has(channelId)) this.scheduleRetry();
+    });
+    controller.onMessage((message, change, origin) => {
+      if (message.channelId !== channelId || change !== "created" || origin !== "remote") return;
+      this.unread.set(channelId, (this.unread.get(channelId) ?? 0) + 1);
+      this.listener?.(new Map(this.unread));
+    });
+    return controller;
+  }
+
+  connectGroup(channelId: string, displayName: string, iceServers: RTCIceServer[], options: ChatConnectionOptions = {}): Promise<void> {
+    return this.enqueue(() => this.connectGroupNow(channelId, displayName, iceServers, options));
+  }
+
+  private async connectGroupNow(channelId: string, displayName: string, iceServers: RTCIceServer[], options: ChatConnectionOptions = {}): Promise<void> {
+    const controller = this.groupController(channelId);
+    const status = this.groupStatuses.get(channelId);
+    if (status === "ready" || status === "connected" || status === "connecting") return;
+    await controller.connect(channelId, displayName, iceServers, options);
   }
 
   privateSession(channelId: string): PrivateChatSessionSnapshot | undefined {
@@ -87,13 +118,10 @@ export class BackgroundChatManager {
       offMessage: () => undefined,
     };
     session.offStatus = controller.onStatus((status) => { session.status = status; });
-    session.offMessage = controller.onMessage((message, change) => {
-      if (message.channelId !== channelId || change !== "created") return;
+    session.offMessage = controller.onMessage((message, change, origin) => {
+      if (message.channelId !== channelId || change !== "created" || origin !== "remote") return;
       this.unread.set(channelId, (this.unread.get(channelId) ?? 0) + 1);
       this.listener?.(new Map(this.unread));
-      if (document.visibilityState !== "visible" && "Notification" in window && Notification.permission === "granted") {
-        new Notification("Nova mensagem privada no Risk", { body: `${message.author}: ${message.content.slice(0, 120)}` });
-      }
     });
     this.privateSessions.set(channelId, session);
 
@@ -131,6 +159,7 @@ export class BackgroundChatManager {
       const controller = this.sessions.get(channelId);
       if (!controller) return;
       this.sessions.delete(channelId);
+      this.groupStatuses.delete(channelId);
       await controller.disconnect();
     });
   }
@@ -161,44 +190,33 @@ export class BackgroundChatManager {
     reservedChannelIds: readonly string[] = [],
   ): Promise<void> {
     await this.syncGroupMembership(groups, displayName, iceServers);
-    const excluded = new Set<string>(reservedChannelIds);
-    if (activeChannelId) excluded.add(activeChannelId);
-    const desired = groups.flatMap((group) => group.channels.filter((channel) => channel.kind === "text").map((channel) => channel.id))
-      .filter((channelId) => !excluded.has(channelId))
-      .slice(0, MAX_BACKGROUND_CHANNELS);
+    const allChannels = groups.flatMap((group) => group.channels.filter((channel) => channel.kind === "text").map((channel) => channel.id));
+    const priority = [...reservedChannelIds, ...(activeChannelId ? [activeChannelId] : [])].filter((id) => allChannels.includes(id));
+    const desired = [...new Set([...priority, ...allChannels])].slice(0, MAX_BACKGROUND_CHANNELS);
     this.desiredChannels = new Set(desired);
 
     await Promise.all([...this.sessions].filter(([channelId]) => !this.desiredChannels.has(channelId)).map(async ([channelId, controller]) => {
       if (this.sessions.get(channelId) !== controller) return;
       this.sessions.delete(channelId);
+      this.groupStatuses.delete(channelId);
       await controller.disconnect();
     }));
 
     await Promise.all(desired.map(async (channelId) => {
-      if (!this.desiredChannels.has(channelId) || this.sessions.has(channelId)) return;
-      const controller = this.createController();
-      this.sessions.set(channelId, controller);
-      controller.onMessage((message, change) => {
-        if (message.channelId !== channelId || change !== "created") return;
-        this.unread.set(channelId, (this.unread.get(channelId) ?? 0) + 1);
-        this.listener?.(new Map(this.unread));
-        if (document.visibilityState !== "visible" && "Notification" in window && Notification.permission === "granted") {
-          new Notification("Nova mensagem no Risk", { body: `${message.author}: ${message.content.slice(0, 120)}` });
-        }
-      });
+      if (!this.desiredChannels.has(channelId)) return;
+      const controller = this.groupController(channelId);
       try {
-        await controller.connect(channelId, displayName, iceServers);
+        await this.connectGroupNow(channelId, displayName, iceServers);
         if (!this.desiredChannels.has(channelId) || this.sessions.get(channelId) !== controller) {
           if (this.sessions.get(channelId) === controller) this.sessions.delete(channelId);
           await controller.disconnect();
         }
       } catch {
-        if (this.sessions.get(channelId) === controller) this.sessions.delete(channelId);
         await controller.disconnect();
       }
     }));
-    this.reportCapacity(groups, excluded);
-    if (this.sessions.size < desired.length
+    this.reportCapacity(groups, new Set());
+    if (desired.some((id) => !["ready", "connected", "connecting"].includes(this.groupStatuses.get(id) ?? "disconnected"))
       || this.membershipSessions.size < Math.min(groups.length, MAX_BACKGROUND_MEMBERSHIP_GROUPS)) {
       this.scheduleRetry();
     } else {
@@ -215,6 +233,7 @@ export class BackgroundChatManager {
       const membershipSessions = [...this.membershipSessions.values()];
       const privateSessions = [...this.privateSessions.values()];
       this.sessions.clear();
+      this.groupStatuses.clear();
       this.membershipSessions.clear();
       this.privateSessions.clear();
       privateSessions.forEach((session) => { session.offStatus(); session.offMessage(); });

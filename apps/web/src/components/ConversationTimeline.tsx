@@ -5,6 +5,8 @@ import type { ChatMessage } from "../application/contracts";
 import type { ChatAttachmentProgress, ChatAttachmentRecord } from "../chat";
 import { AttachmentCard } from "./AttachmentCard";
 import { SafeMessageContent } from "./SafeMessageContent";
+import { ProfileAvatar } from "./ProfileAvatar";
+import { useMessageAuthor } from "./ChatProfiles";
 import "./chat-features.css";
 
 const QUICK_REACTIONS = ["👍", "❤️", "😂", "🎉", "👀"];
@@ -47,6 +49,7 @@ export function ConversationTimeline({
   onPin?(message: ChatMessage, pinned: boolean): Promise<void>;
 }) {
   const [editingId, setEditingId] = useState<string>();
+  const authorFor = useMessageAuthor();
   const [editValue, setEditValue] = useState("");
   const [galleryOpen, setGalleryOpen] = useState(false);
   const messageById = useMemo(() => new Map(messages.map((message) => [message.id, message])), [messages]);
@@ -86,7 +89,7 @@ export function ConversationTimeline({
 
     {items.map((item) => item.type === "message"
       ? <article id={`chat-message-${item.message.id}`} className={`chat-message ${item.message.deletedAt ? "is-deleted" : ""}`} key={`message:${item.message.id}`}>
-          <div className="avatar">{item.message.author[0]}</div>
+          <ProfileAvatar className="avatar" displayName={item.message.author} avatar={authorFor(item.message).avatar}/>
           <div className="chat-message-body">
             <div className="chat-message-heading"><strong>{item.message.author}</strong><time>{new Date(item.message.createdAt).toLocaleString()}</time>{item.message.editedAt && !item.message.deletedAt && <small>(editada)</small>}{item.message.pinnedAt && <Pin size={12}/>}</div>
             {item.message.replyToId && <div className="message-reply-reference"><Reply size={13}/>{replyLabel(messageById.get(item.message.replyToId))}</div>}

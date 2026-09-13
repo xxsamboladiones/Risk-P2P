@@ -16,6 +16,7 @@ import {
   type MessagePageOptions,
 } from "../services/offline/chat-storage";
 import type { LocalIdentity } from "../services/offline/social-storage";
+import { announceIncomingMessage } from "../services/chat/incoming-messages";
 import {
   compareEvents,
   loadLocalChatEvents,
@@ -24,6 +25,7 @@ import {
 import type { ChatEventPageOptions } from "../services/offline/chat-event-storage";
 
 export type ChatMessageChange = "created" | "updated";
+export type ChatMessageOrigin = "local" | "remote" | "history";
 export type ChatEventInput =
   | { action: "reply"; referenceMessageId: string }
   | { action: "edit"; content: string }
@@ -34,7 +36,7 @@ export type ChatEventInput =
 export class MessageService {
   private readonly processed = new Set<string>();
   private readonly processedEvents = new Set<string>();
-  private readonly callbacks = new Set<(message: LocalChatMessage, change: ChatMessageChange) => void>();
+  private readonly callbacks = new Set<(message: LocalChatMessage, change: ChatMessageChange, origin: ChatMessageOrigin) => void>();
   private readonly messageCache = new Map<string, LocalChatMessage>();
   private readonly projectionEvents = new Map<string, SignedChatEventWireMessage[]>();
   private readonly eventWrites = new Map<string, Promise<LocalChatMessage | undefined>>();
@@ -52,7 +54,7 @@ export class MessageService {
     });
   }
 
-  onMessage(callback: (message: LocalChatMessage, change: ChatMessageChange) => void): () => void {
+  onMessage(callback: (message: LocalChatMessage, change: ChatMessageChange, origin: ChatMessageOrigin) => void): () => void {
     this.callbacks.add(callback);
     return () => this.callbacks.delete(callback);
   }
@@ -156,12 +158,12 @@ export class MessageService {
     return { ...unsigned, signature: bytesToBase64Url(new Uint8Array(signature)) };
   }
 
-  async persistSigned(message: SignedChatWireMessage): Promise<LocalChatMessage> {
-    return this.persist(signedToLocal(message));
+  async persistSigned(message: SignedChatWireMessage, origin: ChatMessageOrigin = "local"): Promise<LocalChatMessage> {
+    return this.persist(signedToLocal(message), origin);
   }
 
-  async persistLegacy(message: LegacyChatWireMessage, author: string): Promise<LocalChatMessage> {
-    return this.persist(legacyToLocal(message, author));
+  async persistLegacy(message: LegacyChatWireMessage, author: string, origin: ChatMessageOrigin = "local"): Promise<LocalChatMessage> {
+    return this.persist(legacyToLocal(message, author), origin);
   }
 
   async persistEvent(event: SignedChatEventWireMessage): Promise<LocalChatMessage | undefined> {
@@ -192,11 +194,11 @@ export class MessageService {
     await saveLocalMessage(projected);
     this.rememberEvent(event.id);
     this.messageCache.set(key, projected);
-    this.callbacks.forEach((callback) => callback(projected, "updated"));
+    this.callbacks.forEach((callback) => callback(projected, "updated", "history"));
     return projected;
   }
 
-  private async persist(message: LocalChatMessage): Promise<LocalChatMessage> {
+  private async persist(message: LocalChatMessage, origin: ChatMessageOrigin): Promise<LocalChatMessage> {
     const key = this.cacheKey(message.channelId, message.id);
     const existing = this.messageCache.get(key) ?? await loadLocalMessage(message.channelId, message.id);
     const projectionBase: LocalChatMessage = existing ? {
@@ -213,7 +215,8 @@ export class MessageService {
     await saveLocalMessage(projected);
     this.remember(message.id);
     this.messageCache.set(key, projected);
-    this.callbacks.forEach((callback) => callback(projected, "created"));
+    this.callbacks.forEach((callback) => callback(projected, existing ? "updated" : "created", origin));
+    if (!existing && origin === "remote") announceIncomingMessage(projected);
     return projected;
   }
 

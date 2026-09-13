@@ -13,7 +13,7 @@ import {
 } from "./MessageProtocol";
 import { HistoryService } from "./HistoryService";
 import { GroupChatService, inferLocalGroupSecurity } from "./GroupChatService";
-import { MessageService, type ChatEventInput, type ChatMessageChange } from "./MessageService";
+import { MessageService, type ChatEventInput, type ChatMessageChange, type ChatMessageOrigin } from "./MessageService";
 import { OutboxService } from "./OutboxService";
 import { SyncService } from "./SyncService";
 import type { SignalingNamespace, SignalingProvider } from "../services/signaling/types";
@@ -381,7 +381,7 @@ export class ChatController {
   async cancelAttachment(record: StoredAttachmentRecord): Promise<void> { await this.attachments.cancel(record); }
 
   localPeerId(): string | undefined { return this.peerId; }
-  onMessage(callback: (message: LocalChatMessage, change: ChatMessageChange) => void): () => void { return this.messages.onMessage(callback); }
+  onMessage(callback: (message: LocalChatMessage, change: ChatMessageChange, origin: ChatMessageOrigin) => void): () => void { return this.messages.onMessage(callback); }
   onTyping(callback: (participants: ChatTypingParticipant[]) => void): () => void {
     this.typingCallbacks.add(callback);
     callback(this.typingParticipants());
@@ -633,14 +633,14 @@ export class ChatController {
           return;
         }
         if (!this.identity || envelope.authorPeerId !== remotePeerId || !(await this.groups.verifySignedMessage(envelope))) return;
-        await this.messages.persistSigned(envelope);
+        await this.messages.persistSigned(envelope, "remote");
         this.sendMessageAck(remotePeerId, envelope.id);
         return;
       }
       if (this.messages.hasProcessed(envelope.id)) return;
       if (this.identity) return;
       const trustedDisplayName = this.groups.displayName(remotePeerId) ?? `Peer ${remotePeerId.slice(0, 6)}`;
-      await this.messages.persistLegacy(envelope, trustedDisplayName);
+      await this.messages.persistLegacy(envelope, trustedDisplayName, "remote");
       return;
     }
 

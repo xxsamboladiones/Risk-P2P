@@ -63,6 +63,7 @@ export class MediaManager {
   get localStream(): MediaStream { return this.local; }
   get microphoneTrack(): MediaStreamTrack | undefined { return this.microphone; }
   get state(): PeerState { return this.peerState; }
+  get qualityProfile(): ScreenQualityProfile { return this.screenQualityProfile; }
 
   reset(): void {
     this.stopMicrophoneMonitor();

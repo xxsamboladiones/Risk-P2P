@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type RefObject } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type FormEvent, type RefObject } from "react";
 import {
   Activity,
   Copy,
@@ -30,6 +30,7 @@ import type {
 import { loadLocalGroups } from "../services/offline/social-storage";
 import { incompatiblePeerMessage } from "../services/protocol-compatibility";
 import { observeVoiceActivity } from "../services/audio/voice-activity";
+import { createRemoteAudioPlayback, type RemoteAudioPlayback } from "../services/audio/remote-playback";
 import { networkPreferenceLabel } from "../services/network/settings";
 import {
   isScreenQuality,
@@ -42,7 +43,11 @@ import { responsiveCallGrid } from "./call-layout";
 import { InCallAudioSettings } from "./InCallAudioSettings";
 import { MessageComposer } from "./MessageComposer";
 import { ProfileAvatar } from "./ProfileAvatar";
+import { mergeMessageHistory } from "../services/chat/message-history";
 import "./call-workspace.css";
+import { GameHostControls, GameTileControls } from "./GameModeControls";
+import type { GameModeController } from "../call/game/GameModeController";
+import { observeFullscreenOverlays } from "./fullscreen-overlays";
 
 type ViewMode = "call" | "chat";
 
@@ -59,31 +64,20 @@ function initialScreenAudio(): boolean {
 }
 
 function RemoteAudio({ stream, volume }: { stream: MediaStream; volume: number }) {
-  const contextRef = useRef<AudioContext | null>(null);
-  const gainRef = useRef<GainNode | null>(null);
+  const playbackRef = useRef<RemoteAudioPlayback | null>(null);
+  const audioTrackKey = stream.getAudioTracks().map((track) => track.id).join(":");
 
   useEffect(() => {
-    const context = new AudioContext();
-    const source = context.createMediaStreamSource(stream);
-    const gain = context.createGain();
-    gain.gain.value = volume / 100;
-    source.connect(gain).connect(context.destination);
-    contextRef.current = context;
-    gainRef.current = gain;
-    void context.resume().catch(() => undefined);
+    const playback = createRemoteAudioPlayback(stream, volume);
+    playbackRef.current = playback;
     return () => {
-      source.disconnect();
-      gain.disconnect();
-      void context.close();
-      contextRef.current = null;
-      gainRef.current = null;
+      playback.stop();
+      playbackRef.current = null;
     };
-  }, [stream]);
+  }, [stream, audioTrackKey]);
 
   useEffect(() => {
-    const gain = gainRef.current;
-    if (gain) gain.gain.setTargetAtTime(volume / 100, gain.context.currentTime, 0.015);
-    if (contextRef.current?.state === "suspended") void contextRef.current.resume().catch(() => undefined);
+    playbackRef.current?.setVolume(volume);
   }, [volume]);
 
   return null;
@@ -125,6 +119,7 @@ function FullscreenButton({ target }: { target: RefObject<HTMLElement | null> })
 }
 
 function VideoTile({
+  game,
   participant,
   tileId,
   focused,
@@ -132,6 +127,7 @@ function VideoTile({
   deafened,
   onFocus,
 }: {
+  game?: GameModeController;
   participant: Participant;
   tileId: string;
   focused: boolean;
@@ -154,12 +150,18 @@ function VideoTile({
   const videoRef = useRef<HTMLVideoElement>(null);
   const articleRef = useRef<HTMLElement>(null);
 
+  useEffect(() => articleRef.current ? observeFullscreenOverlays(articleRef.current) : undefined, []);
+
   useEffect(() => {
     if (participant.state.screenShare && screenStream) setSource("screen");
     else if (!participant.state.screenShare) setSource("camera");
   }, [participant.state.screenShare, screenStream]);
 
   const selected = source === "screen" ? screenStream : cameraStream;
+  useEffect(() => {
+    game?.setScreenPlayback(participant.peerId, source === "screen" && participant.state.screenShare);
+    return () => game?.setScreenPlayback(participant.peerId, false);
+  }, [game, participant.peerId, participant.state.screenShare, source]);
   const trackKey = selected?.getVideoTracks().map((track) => track.id).join(":") ?? "";
   useEffect(() => {
     if (videoRef.current) {
@@ -197,6 +199,7 @@ function VideoTile({
       {screenHasAudio && <VolumeControl label="Transmissão" value={screenVolume} onChange={setScreenVolume}/>} 
     </div>}
     <div className="tile-label"><span>{participant.displayName}</span>{!participant.state.microphone && <MicOff size={15}/>} {participant.state.screenAudio && !compact && <em>ÁUDIO DA TELA</em>}</div>
+    {game && <GameTileControls game={game} peerId={participant.peerId} target={articleRef} visible={source === "screen" && participant.state.screenShare}/>}
   </article>;
 }
 
@@ -243,6 +246,7 @@ function LocalVideoTile({
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const articleRef = useRef<HTMLElement>(null);
+  useEffect(() => articleRef.current ? observeFullscreenOverlays(articleRef.current) : undefined, []);
   const source = mirrored ? "camera" : "screen";
   const speaking = useVoiceActivity(microphoneStream, microphone && Boolean(microphoneStream));
   useEffect(() => {
@@ -316,8 +320,8 @@ function ScreenSourcePicker({
   </div>;
 }
 
-export function CallWorkspace({ call, chat, onMinimize }: { call: CallController; chat: ChatController; onMinimize(): void }) {
-  const { gateway: api } = useRiskApplication();
+export function CallWorkspace({ call, chat: fallbackChat, onMinimize }: { call: CallController; chat: ChatController; onMinimize(): void }) {
+  const { gateway: api, backgroundChats } = useRiskApplication();
   const token = useCallStore((state) => state.token)!;
   const roomId = useCallStore((state) => state.roomId)!;
   const callContext = useCallStore((state) => state.callContext);
@@ -336,6 +340,8 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
   const [attachments, setAttachments] = useState<ChatAttachmentRecord[]>([]);
   const [attachmentProgress, setAttachmentProgress] = useState<Record<string, ChatAttachmentProgress | undefined>>({});
   const [quality, setQuality] = useState<ScreenQuality>(initialScreenQuality);
+  const gameState = useSyncExternalStore(call.game.subscribe, call.game.getSnapshot);
+  const displayedQuality = gameState.quality ?? quality;
   const [screenAudioEnabled, setScreenAudioEnabled] = useState(initialScreenAudio);
   const [audioSettingsOpen, setAudioSettingsOpen] = useState(false);
   const [sourcePickerOpen, setSourcePickerOpen] = useState(false);
@@ -347,8 +353,17 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
   const [diagnostics, setDiagnostics] = useState<CallDiagnostics | null>(null);
   const [replyingTo, setReplyingTo] = useState<ChatMessage | null>(null);
   const [typingUsers, setTypingUsers] = useState<string[]>([]);
+  const workspaceOpen = useCallStore((state) => state.callWorkspaceOpen);
+  useEffect(() => { if (view !== "call" || !workspaceOpen) call.game.leave(); }, [call, view, workspaceOpen]);
 
   const context = callContext;
+  const chat = context?.textChannelId ? backgroundChats.groupController(context.textChannelId) : fallbackChat;
+
+  useEffect(() => {
+    if (view === "chat" && context?.textChannelId && useCallStore.getState().callWorkspaceOpen && document.visibilityState === "visible") {
+      backgroundChats.clear(context.textChannelId);
+    }
+  }, [backgroundChats, context?.textChannelId, view, messages]);
 
   useEffect(() => {
     if (context) return;
@@ -402,6 +417,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
 
   useEffect(() => {
     const channelId = context?.textChannelId;
+    setMessages([]);
     if (!channelId) {
       setChatStatus("disconnected");
       return;
@@ -436,16 +452,15 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
 
     void (async () => {
       try {
-        await chat.disconnect().catch(() => undefined);
         const [{ iceServers }, history, storedAttachments] = await Promise.all([
           api.turnCredentials(token),
           chat.history(channelId),
           chat.attachmentHistory(channelId),
         ]);
         if (!alive) return;
-        setMessages([...history].sort((left, right) => left.createdAt.localeCompare(right.createdAt)));
+        setMessages((current) => mergeMessageHistory(history, current));
         setAttachments(storedAttachments.reduce<ChatAttachmentRecord[]>((items, record) => upsertAttachment(items, record), []));
-        await chat.connect(channelId, context.displayName, iceServers);
+        await backgroundChats.connectGroup(channelId, context.displayName, iceServers);
       } catch (cause) {
         if (alive) setError(cause instanceof Error ? cause.message : "Não foi possível conectar o chat do grupo.");
       }
@@ -460,7 +475,6 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
       offProgress();
       setReplyingTo(null);
       setTypingUsers([]);
-      void chat.disconnect();
     };
   }, [chat, context?.displayName, context?.textChannelId, setError, token]);
 
@@ -646,7 +660,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
         {localPreviews.screen && <LocalVideoTile
           stream={localPreviews.screen}
           tileId="local-screen"
-          label={localState.screenAudio ? `Tela · ${QUALITY_PROFILES[quality].label}` : `Tela · sem áudio · ${QUALITY_PROFILES[quality].label}`}
+          label={localState.screenAudio ? `Tela · ${QUALITY_PROFILES[displayedQuality].label}` : `Tela · sem áudio · ${QUALITY_PROFILES[displayedQuality].label}`}
           mirrored={false}
           microphone={localState.microphone}
           focused={focused === "local-screen"}
@@ -656,6 +670,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
         {peers.map((participant) => {
           const id = `peer-${participant.peerId}`;
           return <VideoTile
+            game={call.game}
             key={participant.peerId}
             participant={participant}
             tileId={id}
@@ -695,6 +710,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
       <button className={deafened ? "off" : ""} onClick={() => setDeafened((value) => !value)} title="Silenciar todo o áudio recebido">{deafened ? <VolumeX/> : <Volume2/>}<span>Ensurdecer</span></button>
       <button className={audioSettingsOpen ? "active" : ""} onClick={() => setAudioSettingsOpen((current) => !current)} title="Configurações de áudio"><Settings2/><span>Áudio</span></button>
       <button className={localState.camera ? "active" : ""} onClick={() => void call.toggleCamera(roomId)}>{localState.camera ? <Video/> : <VideoOff/>}<span>Câmera</span></button>
+      <GameHostControls game={call.game} sharing={localState.screenShare} names={Object.fromEntries(peers.map((peer) => [peer.peerId, peer.displayName]))}/>
       <div className="share-control">
         <button className={localState.screenShare ? "active" : ""} onClick={() => void showScreenPicker()}><MonitorUp/><span>{localState.screenShare ? "Parar transmissão" : "Compartilhar"}</span></button>
         <select
@@ -707,7 +723,7 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
           <option value="audio">Com áudio</option>
           <option value="silent">Sem áudio</option>
         </select>
-        <select value={quality} onChange={(event) => setQuality(event.target.value as ScreenQuality)} aria-label="Qualidade da transmissão" title="Qualidade da transmissão">
+        <select value={displayedQuality} disabled={Boolean(gameState.host)} onChange={(event) => setQuality(event.target.value as ScreenQuality)} aria-label="Qualidade da transmissão" title={gameState.host ? "Qualidade automática do Modo Jogo" : "Qualidade da transmissão"}>
           {Object.entries(QUALITY_PROFILES).map(([value, profile]) => <option key={value} value={value}>{profile.label}</option>)}
         </select>
       </div>
@@ -715,7 +731,6 @@ export function CallWorkspace({ call, chat, onMinimize }: { call: CallController
         setAudioSettingsOpen(false);
         setRoom(null);
         setCallContext(null);
-        void chat.disconnect();
         void call.leave(roomId);
       }}><PhoneOff/><span>Sair</span></button>
     </footer>

@@ -12,6 +12,18 @@ describe("AuthenticationManager", () => {
     });
   });
 
+  it.each([-3_600_000, 3_600_000])("aceita desafio com diferença de relógio de %s ms", (skew) => {
+    const manager = new AuthenticationManager();
+    const challenge = manager.createChallenge("peer_remote_1234");
+    challenge.timestamp += skew;
+    expect(manager.parse(JSON.stringify(challenge)).status).toBe("valid");
+  });
+
+  it.each([null, "ontem", undefined])("recusa timestamp malformado: %s", (timestamp) => {
+    const manager = new AuthenticationManager();
+    expect(manager.parse(JSON.stringify({ ...manager.createChallenge("peer_remote_1234"), timestamp })).status).toBe("expired");
+  });
+
   it("assina e verifica uma prova ECDSA bilateral", async () => {
     const manager = new AuthenticationManager();
     const keys = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);

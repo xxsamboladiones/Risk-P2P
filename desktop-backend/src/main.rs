@@ -1,4 +1,5 @@
 mod p2p;
+mod game;
 
 use anyhow::Context;
 use argon2::{
@@ -63,6 +64,7 @@ struct AppState {
     local_token: String,
     jwt_secret: String,
     attachment_quota_lock: Arc<Mutex<()>>,
+    game: Arc<Mutex<game::Engine>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -232,9 +234,12 @@ async fn main() -> anyhow::Result<()> {
         local_token,
         jwt_secret: URL_SAFE_NO_PAD.encode(secret_bytes),
         attachment_quota_lock: Arc::new(Mutex::new(())),
+        game: Arc::new(Mutex::new(game::Engine::default())),
     };
 
+    game::watchdog(state.game.clone());
     let protected = Router::new()
+        .merge(game::router())
         .route("/auth/register", post(register))
         .route("/auth/login", post(login))
         .route("/auth/refresh", post(refresh))

@@ -44,6 +44,7 @@ export type CandidatePairStatsLike = {
   localCandidateId?: string;
   remoteCandidateId?: string;
   currentRoundTripTime?: number;
+  availableOutgoingBitrate?: number;
   bytesSent?: number;
   bytesReceived?: number;
   lastPacketReceivedTimestamp?: number;

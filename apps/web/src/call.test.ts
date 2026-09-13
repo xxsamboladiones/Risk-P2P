@@ -1,7 +1,9 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { CallTransportRegistry, type MeshCallTransport } from "@risk/rtc";
 import type { PeerState } from "@risk/protocol";
-import type { LocalGroup } from "./services/offline/social-storage";
+import type { LocalGroup, LocalIdentity, PublicPeerIdentity } from "./services/offline/social-storage";
+import { AuthenticationManager, type CallAuthMessage } from "./call/auth/AuthenticationManager";
+import type { ParticipantManager } from "./call/ParticipantManager";
 import { InMemorySignalingHub, InMemorySignalingProvider } from "./services/signaling/in-memory";
 import { useCallStore } from "./store";
 
@@ -42,6 +44,98 @@ beforeAll(async () => {
 
 afterAll(() => vi.unstubAllGlobals());
 afterEach(() => vi.useRealTimers());
+
+describe("autenticação e sincronização inicial da chamada", () => {
+  async function setupProof() {
+    const remotePeerId = "peer_remote_auth_1234";
+    const localPeerId = "peer_local_auth_1234";
+    const keys = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+    const identity: LocalIdentity = {
+      id: "self", peerId: remotePeerId, displayName: "Maria",
+      publicKey: await crypto.subtle.exportKey("jwk", keys.publicKey), privateKey: keys.privateKey,
+    };
+    const transport = {
+      sendData: vi.fn((_raw: string, _peerId: string) => 1),
+      authorizePeerMedia: vi.fn(async () => undefined),
+    };
+    const signaling = { getDiagnostics: () => ({ presencePeers: [remotePeerId] }) };
+    const controller = new CallController();
+    const internals = controller as unknown as {
+      lifecycleId: number; roomId: string; peerId: string;
+      identity: { peerId: string }; transport: typeof transport; signaling: typeof signaling;
+      mediaAuthenticationRequired: boolean;
+      trustedPeers: Map<string, PublicPeerIdentity>;
+      authChallenges: Map<string, { nonce: string; expiresAt: number }>;
+      authTimers: Map<string, ReturnType<typeof setTimeout>>;
+      authenticatedPeers: Set<string>;
+      pendingPeerStates: Map<string, PeerState>;
+      participants: ParticipantManager;
+      sendAuthChallenge(peerId: string): boolean;
+      handleAuthMessage(peerId: string, raw: string): boolean;
+      acceptAuthProof(peerId: string, proof: Extract<CallAuthMessage, { type: "call.auth.proof" }>): Promise<void>;
+    };
+    Object.assign(internals, {
+      lifecycleId: 1, roomId: "room-auth-clock", peerId: localPeerId,
+      identity: { peerId: localPeerId }, transport, signaling, mediaAuthenticationRequired: true,
+    });
+    internals.trustedPeers.set(remotePeerId, identity);
+    internals.sendAuthChallenge(remotePeerId);
+    const challenge = JSON.parse(transport.sendData.mock.calls[0]![0]) as { nonce: string };
+    const manager = new AuthenticationManager();
+    const proof = await manager.createProof(identity, {
+      roomId: internals.roomId, localPeerId: remotePeerId, remotePeerId: localPeerId,
+    }, challenge.nonce);
+    const cleanup = () => {
+      internals.authTimers.forEach(clearTimeout);
+      useCallStore.getState().clearParticipants();
+    };
+    return { internals, transport, remotePeerId, proof, cleanup };
+  }
+
+  it.each([-3_600_000, 3_600_000])("confirma o nome e libera mídia com relógio remoto deslocado em %s ms", async (skew) => {
+    const { internals, transport, remotePeerId, proof, cleanup } = await setupProof();
+    try {
+      proof.timestamp += skew;
+      expect(internals.handleAuthMessage(remotePeerId, JSON.stringify(proof))).toBe(true);
+      await vi.waitFor(() => expect(transport.authorizePeerMedia).toHaveBeenCalledWith(remotePeerId));
+      expect(useCallStore.getState().participants[remotePeerId]?.displayName).toBe("Maria");
+      expect(internals.authenticatedPeers.has(remotePeerId)).toBe(true);
+      await internals.acceptAuthProof(remotePeerId, proof);
+      expect(transport.authorizePeerMedia).toHaveBeenCalledOnce();
+    } finally { cleanup(); }
+  });
+
+  it.each(["expired", "replaced", "bad-signature"])("mantém a mídia bloqueada para prova %s", async (reason) => {
+    const { internals, transport, remotePeerId, proof, cleanup } = await setupProof();
+    try {
+      if (reason === "expired") internals.authChallenges.get(remotePeerId)!.expiresAt = performance.now() - 1;
+      if (reason === "replaced") internals.sendAuthChallenge(remotePeerId);
+      if (reason === "bad-signature") proof.signature = "invalid";
+      await internals.acceptAuthProof(remotePeerId, proof);
+      expect(transport.authorizePeerMedia).not.toHaveBeenCalled();
+      expect(internals.authenticatedPeers.has(remotePeerId)).toBe(false);
+    } finally { cleanup(); }
+  });
+
+  it("aplica o estado inicial antes de liberar streams e preserva atualizações durante a negociação", async () => {
+    const { internals, transport, remotePeerId, proof, cleanup } = await setupProof();
+    const initialState = { microphone: true, camera: false, screenShare: true, screenStreamId: "screen-active" };
+    const latestState = { microphone: true, camera: false, screenShare: false };
+    let stateWhenMediaWasReleased: PeerState | undefined;
+    internals.pendingPeerStates.set(remotePeerId, initialState);
+    transport.authorizePeerMedia.mockImplementation(async () => {
+      stateWhenMediaWasReleased = useCallStore.getState().participants[remotePeerId]?.state;
+      // O compartilhamento pode encerrar enquanto a negociação de mídia aguarda.
+      internals.participants.state(remotePeerId, latestState);
+    });
+    try {
+      await internals.acceptAuthProof(remotePeerId, proof);
+      expect(stateWhenMediaWasReleased).toEqual(initialState);
+      expect(useCallStore.getState().participants[remotePeerId]?.state).toEqual(latestState);
+      expect(internals.pendingPeerStates.has(remotePeerId)).toBe(false);
+    } finally { cleanup(); }
+  });
+});
 
 describe("reconcileRemoteMediaState", () => {
   it("mapeia screen share quando o MediaStream.id remoto difere do id anunciado", () => {

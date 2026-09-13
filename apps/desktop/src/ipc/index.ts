@@ -1,4 +1,4 @@
-import { BrowserWindow, ipcMain, shell } from "electron";
+import { BrowserWindow, globalShortcut, ipcMain, shell } from "electron";
 import { networkInterfaces } from "node:os";
 import type { DesktopBackendManager } from "../backend.js";
 import { collectNetworkInterfaces } from "../network-interfaces.js";
@@ -7,6 +7,13 @@ export function registerDesktopIpc(
   backend: DesktopBackendManager,
   isTrustedRendererUrl: (value: string) => boolean,
 ): void {
+  globalShortcut.register("CommandOrControl+Alt+Shift+F12", () => {
+    const config = backend.getConfig();
+    if (config) void fetch(`${config.baseUrl}/game/emergency-stop`, {
+      method: "POST", headers: { "x-risk-desktop-token": config.token }, signal: AbortSignal.timeout(1500),
+    }).catch(() => undefined);
+    BrowserWindow.getAllWindows().forEach((window) => window.webContents.send("game:stopped"));
+  });
   const assertTrusted = (url: string) => {
     if (!isTrustedRendererUrl(url)) throw new Error("Origem do renderer não autorizada.");
   };

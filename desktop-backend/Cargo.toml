@@ -22,3 +22,9 @@ tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

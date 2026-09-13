@@ -8,7 +8,9 @@ export type MeshPeerEntry = {
   settingRemoteAnswer: boolean;
   pendingIceCandidates: RTCIceCandidateInit[];
   dataChannel?: RTCDataChannel;
+  controlChannelLocallyCreated?: boolean;
   transferDataChannel?: RTCDataChannel;
+  gameInputChannel?: RTCDataChannel;
   initiator: boolean;
   descriptionChain: Promise<void>;
 };

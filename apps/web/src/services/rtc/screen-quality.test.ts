@@ -11,7 +11,7 @@ describe("qualidade da transmissão de tela", () => {
       maxFramerate: 60,
       targetWidth: 1920,
       targetHeight: 1080,
-      degradationPreference: "balanced",
+      degradationPreference: "maintain-framerate",
     });
   });
 

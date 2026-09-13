@@ -57,6 +57,8 @@ import {
 } from "./ParticipantManager";
 import { MediaManager } from "./MediaManager";
 import { bindCallSignaling } from "./signaling/call-signaling";
+import { GameModeController } from "./game/GameModeController";
+import { SCREEN_QUALITY_PROFILES } from "../services/rtc/screen-quality";
 
 const AUTH_CHALLENGE_TIMEOUT_MS = 8_000;
 const AUTH_CONNECTION_WATCHDOG_MS = 20_000;
@@ -71,6 +73,22 @@ const missingProfileGateway: Pick<RiskGateway, "me"> = {
 };
 
 export class CallController {
+  private savedGameQuality?: ScreenQualityProfile;
+  readonly game = new GameModeController({
+    transport: () => this.transport,
+    authenticated: (peer) => this.authenticatedPeers.has(peer) && !this.revocationOnlyPeers.has(peer),
+    canHost: () => this.mediaAuthenticationRequired && this.transportReady,
+    screenId: () => this.media.state.screenShare ? this.media.state.screenStreamId : undefined,
+    quality: async (quality) => {
+      if (quality) {
+        this.savedGameQuality ??= this.media.qualityProfile;
+        await this.media.updateScreenQuality({ ...SCREEN_QUALITY_PROFILES[quality], degradationPreference: "maintain-framerate" });
+      } else if (this.savedGameQuality) {
+        const previous = this.savedGameQuality; this.savedGameQuality = undefined;
+        await this.media.updateScreenQuality(previous);
+      }
+    },
+  });
   private readonly session = new CallSession();
   private signaling?: SignalingProvider;
   private transport?: CallTransport;
@@ -87,6 +105,7 @@ export class CallController {
     currentLifecycle: () => this.lifecycleId,
     isActive: (lifecycle) => this.isActive(lifecycle),
     sendState: (state, failureMessage) => {
+      this.game.screenChanged();
       void this.signaling?.sendPeerState(state).catch((error) => this.reportError(error, failureMessage));
     },
     reportError: (error, fallback) => this.reportError(error, fallback),
@@ -100,7 +119,7 @@ export class CallController {
   private readonly revokedPeers = new Map<string, PublicPeerIdentity>();
   private revocations: GroupRevocationCertificate[] = [];
   private groupId?: string;
-  private readonly authChallenges = new Map<string, string>();
+  private readonly authChallenges = new Map<string, { nonce: string; expiresAt: number }>();
   private readonly authTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly authChallengeAttempts = new Map<string, number>();
   private readonly authenticatedPeers = new Set<string>();
@@ -198,6 +217,7 @@ export class CallController {
         }
       },
       onPeerReset: (remotePeerId) => {
+        this.game.peerLeft(remotePeerId);
         this.authenticatedPeers.delete(remotePeerId);
         this.remoteIdentityPeerIds.delete(remotePeerId);
         this.pendingPeerStates.delete(remotePeerId);
@@ -216,6 +236,7 @@ export class CallController {
         useCallStore.getState().setError(`Falha ao negociar mídia com ${remotePeerId.slice(0, 8)}: ${error instanceof Error ? error.message : String(error)}`);
       },
       onDataMessage: (remotePeerId, data) => {
+        if (this.game.handleControl(remotePeerId, data)) return;
         if (this.mediaAuthenticationRequired) {
           if (this.handleAuthMessage(remotePeerId, data)) return;
           void this.handleGroupRevocationMessage(remotePeerId, data);
@@ -226,6 +247,8 @@ export class CallController {
         this.participants.profile(remotePeerId, message.payload.displayName, message.payload.avatar);
       },
       onDataState: (remotePeerId, state) => this.handleDataChannelState(remotePeerId, state),
+      onGameInput: (peer, data) => this.game.handleInput(peer, data),
+      onGameInputState: (peer, state) => { if (state === "closed" || state === "closing") this.game.peerLeft(peer); },
     } satisfies TransportEvents;
     await signaling.connect(rendezvousId, localPeerId);
     if (this.lifecycleId !== lifecycle) throw new DOMException("Entrada na chamada cancelada.", "AbortError");
@@ -244,6 +267,9 @@ export class CallController {
     this.transportDecision = decision;
     if (this.mediaAuthenticationRequired) transport.requireMediaAuthorization();
     this.transport = transport;
+    if (typeof window !== "undefined" && window.desktop?.onGameModeStopped) {
+      this.signalingUnsubscribers.push(window.desktop.onGameModeStopped(() => { void this.game.reset(); }));
+    }
     this.bindSignaling(signaling, localPeerId);
     if (this.groupId && typeof window !== "undefined") {
       const refreshSecurity = () => { void this.refreshGroupSecurity(); };
@@ -293,6 +319,7 @@ export class CallController {
   }
 
   async updateScreenQuality(profile: ScreenQualityProfile): Promise<void> {
+    if (this.game.getSnapshot().host) { this.savedGameQuality = profile; return; }
     await this.media.updateScreenQuality(profile);
   }
 
@@ -310,10 +337,10 @@ export class CallController {
   private sendAuthChallenge(remotePeerId: string): boolean {
     if (!this.identity || !this.transport || this.authenticatedPeers.has(remotePeerId)) return false;
     const message = this.authentication.createChallenge(this.identity.peerId);
-    this.authChallenges.set(remotePeerId, message.nonce);
+    this.authChallenges.set(remotePeerId, { nonce: message.nonce, expiresAt: performance.now() + AUTH_CHALLENGE_TIMEOUT_MS });
     const sent = this.transport.sendData(JSON.stringify(message), remotePeerId);
     if (sent < 1) {
-      if (this.authChallenges.get(remotePeerId) === message.nonce) this.authChallenges.delete(remotePeerId);
+      if (this.authChallenges.get(remotePeerId)?.nonce === message.nonce) this.authChallenges.delete(remotePeerId);
       return false;
     }
     this.authChallengeAttempts.set(remotePeerId, (this.authChallengeAttempts.get(remotePeerId) ?? 0) + 1);
@@ -322,6 +349,7 @@ export class CallController {
   }
 
   private handleDataChannelState(remotePeerId: string, state: RTCDataChannelState): void {
+    if (state !== "open") this.game.peerLeft(remotePeerId);
     if (state === "open") {
       if (this.mediaAuthenticationRequired) this.sendAuthChallenge(remotePeerId);
       else this.sendProfile(remotePeerId);
@@ -432,11 +460,13 @@ export class CallController {
     const lifecycle = this.lifecycleId;
     const transport = this.transport;
     const identity = this.identity;
-    const expectedNonce = this.authChallenges.get(remotePeerId);
+    const challenge = this.authChallenges.get(remotePeerId);
+    const expectedNonce = challenge?.nonce;
     const remoteIdentity = message.identity;
     const localPeerId = this.peerId;
     const roomId = this.roomId;
-    if (!transport || !identity || !expectedNonce || message.nonce !== expectedNonce || !remoteIdentity
+    if (!transport || !identity || !challenge || performance.now() >= challenge.expiresAt
+      || !expectedNonce || message.nonce !== expectedNonce || !remoteIdentity
       || typeof message.signature !== "string" || !message.capabilities || !localPeerId || !roomId
       || !this.authentication.validRemoteIdentity(remotePeerId, remoteIdentity)) return;
     const trusted = this.trustedPeers.get(remoteIdentity.peerId) ?? this.revokedPeers.get(remoteIdentity.peerId);
@@ -450,7 +480,8 @@ export class CallController {
         message.capabilities,
         message.signature,
       );
-      if (!valid || !this.isActive(lifecycle) || this.transport !== transport || this.identity !== identity || this.authChallenges.get(remotePeerId) !== expectedNonce) return;
+      if (!valid || !this.isActive(lifecycle) || this.transport !== transport || this.identity !== identity
+        || this.authChallenges.get(remotePeerId) !== challenge || performance.now() >= challenge.expiresAt) return;
       this.authChallenges.delete(remotePeerId);
       const timer = this.authTimers.get(remotePeerId); if (timer) clearTimeout(timer);
       this.authTimers.delete(remotePeerId);
@@ -468,13 +499,17 @@ export class CallController {
       }
       this.playPresenceSound(this.presenceSounds.accept(remotePeerId));
       this.participants.profile(remotePeerId, remoteIdentity.displayName, remoteIdentity.avatar);
-      await transport.authorizePeerMedia(remotePeerId);
-      if (!this.isActive(lifecycle) || this.transport !== transport) return;
+      // A autorização pode entregar streams imediatamente e aguardar signaling.
+      // Consome o estado inicial antes disso para identificar a tela já ativa e
+      // não sobrescrever atualizações que chegarem durante essa negociação.
       const pendingState = this.pendingPeerStates.get(remotePeerId);
       if (pendingState) {
         this.pendingPeerStates.delete(remotePeerId);
         this.participants.state(remotePeerId, pendingState);
       }
+      const authorization = transport.authorizePeerMedia(remotePeerId);
+      if (this.isActive(lifecycle) && this.transport === transport && this.authenticatedPeers.has(remotePeerId)) this.game.peerReady(remotePeerId);
+      await authorization;
     } catch { /* prova externa inválida */ }
   }
 
@@ -517,12 +552,14 @@ export class CallController {
     for (const [remotePeerId, identityPeerId] of [...this.remoteIdentityPeerIds]) {
       if (!this.isActive(lifecycle)) return;
       if (this.revokedPeers.has(identityPeerId)) {
+        this.game.peerLeft(remotePeerId);
         this.revocationOnlyPeers.add(remotePeerId);
         this.pendingPeerStates.delete(remotePeerId);
         this.transport?.revokePeerMedia(remotePeerId);
         this.participants.remove(remotePeerId);
         await this.sendCallRevocations(remotePeerId, identityPeerId);
       } else if (!this.trustedPeers.has(identityPeerId)) {
+        this.game.peerLeft(remotePeerId);
         this.authenticatedPeers.delete(remotePeerId);
         this.remoteIdentityPeerIds.delete(remotePeerId);
         this.transport?.revokePeerMedia(remotePeerId);
@@ -608,6 +645,7 @@ export class CallController {
         void signaling.sendPeerState(this.media.state).catch((error) => store.setError(String(error)));
       },
       peerLeft: (remotePeerId) => {
+        this.game.peerLeft(remotePeerId);
         this.playPresenceSound(this.presenceSounds.leave(remotePeerId));
         const store = useCallStore.getState();
         if (this.recovery.finish(remotePeerId, store.error)) store.setError(null);
@@ -674,6 +712,7 @@ export class CallController {
   }
 
   private async cleanup(): Promise<void> {
+    const gameCleanup = this.game.reset();
     this.session.end();
     const signaling = this.signaling;
     const transport = this.transport;
@@ -719,10 +758,12 @@ export class CallController {
     await signaling?.disconnect().catch(() => undefined);
     await transport?.leave().catch(() => undefined);
     await mediaCleanup.catch(() => undefined);
+    await gameCleanup;
   }
 
   async getLiveDiagnostics(): Promise<CallDiagnostics> {
     const peerConnections = await this.transport?.collectDiagnostics() ?? [];
+    this.game.adapt(peerConnections);
     if (peerConnections.length) saveCachedCallNetworkHealth(callNetworkHealth(peerConnections));
     return {
       signaling: this.signaling?.getDiagnostics() ?? null,

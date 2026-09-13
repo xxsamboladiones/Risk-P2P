@@ -1,4 +1,3 @@
-import { withinP2PClockTolerance } from "../../services/p2p-clock";
 import {
   compatibleCallPeer,
   LOCAL_RISK_CAPABILITIES,
@@ -50,7 +49,10 @@ export class AuthenticationManager {
         remoteVersion: validRiskPeerCapabilities(message.capabilities) ? message.capabilities.appVersion : undefined,
       };
     }
-    if (!withinP2PClockTolerance(message.timestamp)) return { status: "expired" };
+    // A prova responde a um nonce aleatório pendente, com prazo medido pelo
+    // relógio local no controller. Comparar horários entre PCs aqui bloqueava
+    // chamadas válidas mesmo depois de o signaling estabelecer a conexão.
+    if (typeof message.timestamp !== "number" || !Number.isFinite(message.timestamp)) return { status: "expired" };
     return { status: "valid", message };
   }
 

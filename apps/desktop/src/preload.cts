@@ -187,13 +187,16 @@ function installNativeStreamFullscreenController(): void {
   }, true);
 
   window.addEventListener("wheel", (event) => {
+    if (document.pointerLockElement) return;
     if (!activeFullscreenTile) return;
     adjustFullscreenZoom(event);
   }, { capture: true, passive: false });
 
   window.addEventListener("keydown", (event) => {
+    if (document.pointerLockElement || document.querySelector("[data-risk-game-playing]")) return;
     if (event.key !== "Escape" || !activeFullscreenTile) return;
     suppressEvent(event);
+    if (event.repeat) return;
     fullscreenTransition = fullscreenTransition
       .catch(() => undefined)
       .then(() => exitNativeStreamFullscreen());
@@ -231,6 +234,11 @@ contextBridge.exposeInMainWorld("desktop", {
   selectScreenSource: (sourceId: string): Promise<void> => ipcRenderer.invoke("screen:select", sourceId),
   setWindowFullscreen: (enabled: boolean): Promise<{ fullscreen: boolean }> => ipcRenderer.invoke("window:fullscreen", enabled),
   getBackendConfig: (): Promise<DesktopBackendConfig> => ipcRenderer.invoke("backend:config"),
+  onGameModeStopped: (callback: () => void): (() => void) => {
+    const listener = () => callback();
+    ipcRenderer.on("game:stopped", listener);
+    return () => ipcRenderer.removeListener("game:stopped", listener);
+  },
   getNetworkInterfaces: (): Promise<DesktopNetworkInterface[]> => ipcRenderer.invoke("network:interfaces"),
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke("shell:open-external", url),
   onBackendStatus: (callback: (status: DesktopBackendStatus) => void): (() => void) => {

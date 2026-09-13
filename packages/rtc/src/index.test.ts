@@ -75,7 +75,7 @@ class FakePeerConnection {
   }
   getSenders(): RTCRtpSender[] { return this.senders as unknown as RTCRtpSender[]; }
   getTransceivers(): RTCRtpTransceiver[] { return []; }
-  createDataChannel(label: string): RTCDataChannel { const channel = new FakeDataChannel(label); FakePeerConnection.dataChannels.push(channel); return channel as unknown as RTCDataChannel; }
+  createDataChannel(label: string, options?: RTCDataChannelInit): RTCDataChannel { const channel = new FakeDataChannel(label, options); FakePeerConnection.dataChannels.push(channel); return channel as unknown as RTCDataChannel; }
   restartIce(): void { FakePeerConnection.restartIceCalls += 1; }
   async getStats(): Promise<RTCStatsReport> {
     return new Map(FakePeerConnection.stats.map((stat) => [String(stat.id), stat])) as unknown as RTCStatsReport;
@@ -84,6 +84,7 @@ class FakePeerConnection {
 }
 
 class FakeDataChannel {
+  counterpart?: FakeDataChannel;
   readyState: RTCDataChannelState = "connecting";
   bufferedAmount = 0;
   sent: string[] = [];
@@ -91,11 +92,18 @@ class FakeDataChannel {
   onclose: (() => void) | null = null;
   onerror: (() => void) | null = null;
   onmessage: ((event: MessageEvent<string>) => void) | null = null;
-  constructor(readonly label: string) {}
+  readonly ordered: boolean;
+  readonly maxRetransmits: number | null;
+  constructor(readonly label: string, options: RTCDataChannelInit = {}) { this.ordered = options.ordered ?? true; this.maxRetransmits = options.maxRetransmits ?? null; }
   open(): void { this.readyState = "open"; this.onopen?.(); }
-  send(data: string): void { this.sent.push(data); }
+  send(data: string): void { this.sent.push(data); this.counterpart?.receive(data); }
   receive(data: string): void { this.onmessage?.(new MessageEvent("message", { data })); }
-  close(): void { this.readyState = "closed"; this.onclose?.(); }
+  close(): void {
+    if (this.readyState === "closed") return;
+    this.readyState = "closed";
+    this.onclose?.();
+    this.counterpart?.close();
+  }
 }
 
 function descriptionWithJson(value: RTCSessionDescriptionInit): RTCSessionDescription {
@@ -167,6 +175,77 @@ describe("MeshWebRTCTransport", () => {
     await transport.connect("00000000-0000-4000-8000-000000000002", false);
     expect(FakePeerConnection.instances).toHaveLength(1);
     await transport.disconnect();
+  });
+
+  it("usa canal de input não ordenado, sem retransmissão, apenas após autenticação", async () => {
+    const onGameInput = vi.fn();
+    const transport = new MeshWebRTCTransport("a", [], { ...events(), onGameInput });
+    transport.requireMediaAuthorization(); await transport.connect("z", false);
+    transport.ensureGameInputChannel("z");
+    expect(FakePeerConnection.dataChannels).toHaveLength(0);
+    await transport.authorizePeerMedia("z"); transport.ensureGameInputChannel("z"); transport.ensureGameInputChannel("z");
+    const channel = FakePeerConnection.dataChannels[0]!;
+    expect(FakePeerConnection.dataChannels).toHaveLength(1);
+    expect(channel.label).toBe("risk.game-input.v1"); expect(channel.ordered).toBe(false); expect(channel.maxRetransmits).toBe(0);
+    channel.open(); expect(transport.sendGameInput("z", "frame")).toBe(true);
+    channel.bufferedAmount = 1; expect(transport.sendGameInput("z", "newer-frame")).toBe(false);
+    channel.bufferedAmount = 0;
+    channel.receive("frame"); expect(onGameInput).toHaveBeenCalledWith("z", "frame");
+    channel.bufferedAmount = 20 * 1024; expect(transport.sendGameInput("z", "frame")).toBe(false);
+    channel.receive("x".repeat(4097)); expect(onGameInput).toHaveBeenCalledOnce();
+    transport.revokePeerMedia("z"); channel.receive("frame"); expect(onGameInput).toHaveBeenCalledOnce();
+    expect(transport.sendGameInput("z", "frame")).toBe(false);
+    await transport.disconnect(); expect(channel.readyState).toBe("closed");
+  });
+
+  it("aplica reprodução de jogo apenas ao peer autorizado e restaura ao revogar", async () => {
+    const transport = new MeshWebRTCTransport("a", [], events());
+    transport.requireMediaAuthorization(); await transport.connect("z", false);
+    const audio = { jitterBufferTarget: 120 }, video = { jitterBufferTarget: null };
+    vi.spyOn(FakePeerConnection.instances[0]!, "getTransceivers").mockReturnValue([
+      { receiver: audio }, { receiver: video },
+    ] as unknown as RTCRtpTransceiver[]);
+    transport.setGameModePlayback("z", true);
+    expect(audio.jitterBufferTarget).toBe(120);
+    await transport.authorizePeerMedia("z"); transport.setScreenPlayback("z", true);
+    expect([audio.jitterBufferTarget, video.jitterBufferTarget]).toEqual([30, 30]);
+    transport.setGameModePlayback("z", true);
+    expect([audio.jitterBufferTarget, video.jitterBufferTarget]).toEqual([0, 0]);
+    transport.setGameModePlayback("z", false);
+    expect([audio.jitterBufferTarget, video.jitterBufferTarget]).toEqual([30, 30]);
+    transport.revokePeerMedia("z");
+    expect([audio.jitterBufferTarget, video.jitterBufferTarget]).toEqual([120, null]);
+    await transport.disconnect();
+  });
+
+  it.each([false, true])("mantém o mesmo canal bilateral quando ambos iniciam a conexão (ordem inversa: %s)", async (reverse) => {
+    const callbacksA = { ...events(), onDataMessage: vi.fn() };
+    const callbacksB = { ...events(), onDataMessage: vi.fn() };
+    const a = new MeshWebRTCTransport("peer-a", [], callbacksA);
+    const b = new MeshWebRTCTransport("peer-b", [], callbacksB);
+    await a.connect("peer-b", true);
+    await b.connect("peer-a", true);
+    const [localA, localB] = FakePeerConnection.dataChannels;
+    const remoteA = new FakeDataChannel(localB!.label);
+    const remoteB = new FakeDataChannel(localA!.label);
+    localA!.counterpart = remoteB;
+    remoteB.counterpart = localA;
+    localB!.counterpart = remoteA;
+    remoteA.counterpart = localB;
+    [localA!, localB!, remoteA, remoteB].forEach((channel) => channel.open());
+    const arrivals = [
+      () => FakePeerConnection.instances[0]!.ondatachannel?.({ channel: remoteA } as unknown as RTCDataChannelEvent),
+      () => FakePeerConnection.instances[1]!.ondatachannel?.({ channel: remoteB } as unknown as RTCDataChannelEvent),
+    ];
+    if (reverse) arrivals.reverse();
+    arrivals.forEach((arrive) => arrive());
+
+    expect(a.sendData("challenge-a", "peer-b")).toBe(1);
+    expect(b.sendData("proof-b", "peer-a")).toBe(1);
+    expect(callbacksB.onDataMessage).toHaveBeenCalledWith("peer-a", "challenge-a");
+    expect(callbacksA.onDataMessage).toHaveBeenCalledWith("peer-b", "proof-b");
+    await a.disconnect();
+    await b.disconnect();
   });
 
   it("implementa o ciclo de sessão comum a Mesh e SFU", async () => {
@@ -381,6 +460,37 @@ describe("MeshWebRTCTransport", () => {
     expect(callbacks.onRemoteStream).toHaveBeenCalledWith(peerId, stream);
     transport.revokePeerMedia(peerId);
     expect(track.enabled).toBe(false);
+  });
+
+  it("libera também o vídeo removido temporariamente do stream durante a autenticação", async () => {
+    const callbacks = events();
+    const transport = new MeshWebRTCTransport("peer-a", [], callbacks);
+    transport.requireMediaAuthorization();
+    await transport.connect("peer-b", false);
+    const video = { id: "screen-video", kind: "video", enabled: true } as MediaStreamTrack;
+    const audio = { id: "screen-audio", kind: "audio", enabled: true } as MediaStreamTrack;
+    let tracks = [audio, video];
+    const stream = { id: "screen", getTracks: () => tracks } as unknown as MediaStream;
+    const connection = FakePeerConnection.instances[0]!;
+    connection.ontrack?.({ track: video, streams: [stream] } as unknown as RTCTrackEvent);
+    expect(video.enabled).toBe(false);
+    expect(callbacks.onRemoteStream).not.toHaveBeenCalled();
+
+    // Rollback/renegociação pode retirar a faixa do MediaStream sem encerrá-la.
+    tracks = [audio];
+    await transport.authorizePeerMedia("peer-b");
+    tracks = [audio, video];
+    connection.ontrack?.({ track: video, streams: [stream] } as unknown as RTCTrackEvent);
+    expect(video.enabled).toBe(true);
+    expect(audio.enabled).toBe(true);
+    expect(callbacks.onRemoteStream).toHaveBeenLastCalledWith("peer-b", stream);
+    transport.revokePeerMedia("peer-b");
+    expect(video.enabled).toBe(false);
+    tracks = [];
+    await transport.authorizePeerMedia("peer-b");
+    expect(video.enabled).toBe(true);
+    await transport.disconnect();
+    expect(video.enabled).toBe(false);
   });
 
   it("preserva renegociação pendente se a câmera/tela ligar enquanto uma offer está em voo", async () => {

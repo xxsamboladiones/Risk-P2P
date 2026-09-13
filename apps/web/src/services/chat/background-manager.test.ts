@@ -30,7 +30,12 @@ vi.mock("../../chat", () => ({
     private membershipOnly = false;
     private readonly statusListeners = new Set<(status: string) => void>();
 
-    onMessage(): () => void { return () => undefined; }
+    private readonly messageListeners = new Set<(message: unknown, change: string, origin: string) => void>();
+    onMessage(listener: (message: unknown, change: string, origin: string) => void): () => void {
+      this.messageListeners.add(listener);
+      return () => { this.messageListeners.delete(listener); };
+    }
+    receive(message: unknown): void { this.messageListeners.forEach((listener) => listener(message, "created", "remote")); }
     onStatus(listener: (status: string) => void): () => void {
       this.statusListeners.add(listener);
       return () => this.statusListeners.delete(listener);
@@ -98,11 +103,11 @@ describe("BackgroundChatManager", () => {
     runtime.connectAttempts.clear();
   });
 
-  it("não ocupa o canal ativo nem o canal reservado pela chamada", async () => {
+  it("sincroniza o canal ativo e o canal da chamada com prioridade", async () => {
     const manager = new BackgroundChatManager();
     const group = groupWithTextChannels("foreground", "call-chat", "background");
     await manager.sync([group], "Ana", [], "foreground", ["call-chat"]);
-    expect(runtime.connected).toEqual(["background"]);
+    expect(runtime.connected).toEqual(["call-chat", "foreground", "background"]);
     expect(runtime.membershipConnected).toEqual([group.groupId]);
     expect(runtime.disconnected).toEqual([]);
     await manager.disconnect();
@@ -133,15 +138,39 @@ describe("BackgroundChatManager", () => {
     await nextManager.disconnect();
   });
 
-  it("libera uma sessão de grupo já aberta quando a chamada assume o canal", async () => {
+  it("mantém a mesma sessão e entrega mensagens às duas telas durante e após a chamada", async () => {
     const manager = new BackgroundChatManager();
     const group = groupWithTextChannels("call-chat");
     await manager.sync([group], "Ana", []);
     expect(runtime.connected).toEqual(["call-chat"]);
-    await manager.release("call-chat");
-    expect(runtime.disconnected).toEqual(["call-chat"]);
+    const foreground = manager.groupController("call-chat");
+    const onForeground = vi.fn();
+    foreground.onMessage(onForeground);
     await manager.sync([group], "Ana", [], undefined, ["call-chat"]);
+    const inCall = manager.groupController("call-chat");
+    expect(inCall).toBe(foreground);
+    const onInCall = vi.fn();
+    const offCall = inCall.onMessage(onInCall);
+    const message = { id: "live-message", channelId: "call-chat", author: "Bruno", content: "Chegou durante a chamada" };
+    (inCall as unknown as { receive(message: unknown): void }).receive(message);
+    expect(onForeground).toHaveBeenCalledWith(message, "created", "remote");
+    expect(onInCall).toHaveBeenCalledWith(message, "created", "remote");
+    offCall();
+    await manager.sync([group], "Ana", [], "call-chat");
+    expect(manager.groupController("call-chat")).toBe(foreground);
+    expect(runtime.disconnected).toEqual([]);
     expect(runtime.connected).toEqual(["call-chat"]);
+    await manager.disconnect();
+  });
+
+  it("deduplica conexão solicitada pela chamada e pela tela de texto ao mesmo tempo", async () => {
+    const manager = new BackgroundChatManager();
+    await Promise.all([
+      manager.connectGroup("shared", "Ana", []),
+      manager.connectGroup("shared", "Ana", []),
+    ]);
+    expect(runtime.connectAttempts.get("shared")).toBe(1);
+    await manager.disconnect();
   });
 
   it("mantém oito chats privados enquanto a UI navega e sincroniza grupos", async () => {

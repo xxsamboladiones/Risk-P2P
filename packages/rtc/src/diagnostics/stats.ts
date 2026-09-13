@@ -14,6 +14,8 @@ export type PeerStatsSummary = {
   packetLossPercent?: number;
   jitterMs?: number;
   outboundBitrateKbps?: number;
+  availableOutgoingKbps?: number;
+  videoEncodeMs?: number;
   outboundSample?: OutboundBytesSample;
   selectedConnectionPath: SelectedConnectionPath;
 };
@@ -29,6 +31,7 @@ export function summarizePeerStats(
   let jitterMs: number | undefined;
   let outboundBitrateKbps: number | undefined;
   let outboundSample: OutboundBytesSample | undefined;
+  let videoEncodeMs: number | undefined;
   reports.forEach((report) => {
     const rtcReport = report as typeof report & {
       isRemote?: boolean;
@@ -38,6 +41,8 @@ export function summarizePeerStats(
       kind?: string;
       bytesSent?: number;
       timestamp?: number;
+      totalEncodeTime?: number;
+      framesEncoded?: number;
     };
     if (rtcReport.type === "inbound-rtp" && !rtcReport.isRemote) {
       if (typeof rtcReport.packetsLost === "number") packetsLost = (packetsLost ?? 0) + rtcReport.packetsLost;
@@ -45,6 +50,9 @@ export function summarizePeerStats(
       if (typeof rtcReport.jitter === "number") jitterMs = Math.max(jitterMs ?? 0, Math.round(rtcReport.jitter * 1000));
     }
     if (rtcReport.type === "outbound-rtp" && rtcReport.kind === "video" && typeof rtcReport.bytesSent === "number") {
+      if (typeof rtcReport.totalEncodeTime === "number" && typeof rtcReport.framesEncoded === "number" && rtcReport.framesEncoded > 0) {
+        videoEncodeMs = Math.max(videoEncodeMs ?? 0, 1000 * rtcReport.totalEncodeTime / rtcReport.framesEncoded);
+      }
       const timestamp = Number(rtcReport.timestamp);
       if (previousOutbound && timestamp > previousOutbound.timestamp) {
         outboundBitrateKbps = Math.max(0, Math.round(((rtcReport.bytesSent - previousOutbound.bytes) * 8) / (timestamp - previousOutbound.timestamp)));
@@ -64,6 +72,9 @@ export function summarizePeerStats(
     jitterMs,
     outboundBitrateKbps,
     outboundSample,
+    videoEncodeMs,
+    availableOutgoingKbps: typeof selectedPair?.pair.availableOutgoingBitrate === "number"
+      ? selectedPair.pair.availableOutgoingBitrate / 1000 : undefined,
     selectedConnectionPath: classifySelectedConnectionPath(selectedPair, networkInterfaces),
   };
 }

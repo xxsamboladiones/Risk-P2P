@@ -22,6 +22,8 @@ export interface TransportEvents {
   onPeerReset?(peerId: string): void;
   onDataMessage?(peerId: string, data: string): void;
   onDataState?(peerId: string, state: RTCDataChannelState): void;
+  onGameInput?(peerId: string, data: string): void;
+  onGameInputState?(peerId: string, state: RTCDataChannelState): void;
   onTransferMessage?(peerId: string, data: ArrayBuffer): void;
   onTransferState?(peerId: string, state: RTCDataChannelState): void;
 }
@@ -39,6 +41,8 @@ export type PeerConnectionDiagnostics = {
   packetLossPercent?: number;
   jitterMs?: number;
   outboundBitrateKbps?: number;
+  availableOutgoingKbps?: number;
+  videoEncodeMs?: number;
   selectedConnectionPath: SelectedConnectionPath;
 };
 
@@ -65,6 +69,10 @@ export interface CallTransport {
   replacePublishedTrack(previousTrack: MediaStreamTrack, nextTrack: MediaStreamTrack, stream: MediaStream): Promise<void>;
   sampleLocalAudio?(track: MediaStreamTrack): Promise<LocalAudioHealthSample | undefined>;
   sendData(data: string, targetPeerId?: string): number;
+  ensureGameInputChannel?(peerId: string): void;
+  sendGameInput?(peerId: string, data: string): boolean;
+  setGameModePlayback?(peerId: string, enabled: boolean): void;
+  setScreenPlayback?(peerId: string, enabled: boolean): void;
   requireMediaAuthorization(): void;
   authorizePeerMedia(peerId: string): Promise<void>;
   revokePeerMedia(peerId: string): void;

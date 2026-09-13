@@ -125,6 +125,7 @@ export class ParticipantManager {
       streams,
       this.announcedScreenStreamIds,
       this.pendingScreenStreamIds,
+      participant.state.screenShare ? participant.state.screenStreamId : undefined,
     );
     this.observeAnnouncedStreamId(
       peerId,
@@ -132,10 +133,12 @@ export class ParticipantManager {
       streams,
       this.announcedCameraStreamIds,
       this.pendingCameraStreamIds,
+      participant.state.camera ? participant.state.cameraStreamId : undefined,
     );
     const state = reconcileRemoteMediaState(streams, remoteState);
-    // O estado costuma chegar antes do evento ontrack. Não substitua um ID
-    // recém-anunciado pelo stream antigo enquanto a renegociação está em voo.
+    // Aguarda somente substituições de uma transmissão conhecida. Na entrada
+    // da chamada, ontrack pode vir antes do primeiro estado e o stream recebido
+    // pode ter outro ID; nesse caso a associação acima já encontrou o vídeo.
     const pendingScreenId = this.pendingScreenStreamIds.get(peerId);
     const pendingCameraId = this.pendingCameraStreamIds.get(peerId);
     if (pendingScreenId && remoteState.screenShare) state.screenStreamId = pendingScreenId;
@@ -149,6 +152,7 @@ export class ParticipantManager {
     streams: Record<string, MediaStream>,
     announcedIds: Map<string, string>,
     pendingIds: Map<string, string>,
+    previousStreamId: string | undefined,
   ): void {
     if (!announcedId) {
       announcedIds.delete(peerId);
@@ -156,9 +160,10 @@ export class ParticipantManager {
       return;
     }
     if (announcedIds.get(peerId) === announcedId) return;
+    const replacingStream = announcedIds.has(peerId) || previousStreamId !== undefined;
     announcedIds.set(peerId, announcedId);
-    if (streams[announcedId]) pendingIds.delete(peerId);
-    else pendingIds.set(peerId, announcedId);
+    if (!streams[announcedId] && replacingStream) pendingIds.set(peerId, announcedId);
+    else pendingIds.delete(peerId);
   }
 
   reconnecting(peerId: string, clearStreams = false): void {

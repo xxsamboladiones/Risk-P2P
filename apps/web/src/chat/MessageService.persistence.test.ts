@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { onIncomingMessage } from "../services/chat/incoming-messages";
 
 const runtime = vi.hoisted(() => ({
   failMessageSave: false,
@@ -70,6 +71,26 @@ describe("MessageService persistence failures", () => {
 
     await expect(service.persistSigned(message)).resolves.toMatchObject({ id: message.id });
     expect(service.hasProcessed(message.id)).toBe(true);
+  });
+
+  it("avisa somente mensagens remotas novas, sem repetir histórico, eco local ou reenvios", async () => {
+    const received = vi.fn();
+    const off = onIncomingMessage(received);
+    const service = new MessageService();
+    const message: SignedChatWireMessage = {
+      version: 2, type: "chat.message", channelId: "notifications", id: crypto.randomUUID(),
+      authorPeerId: "peer-notification", author: "Ana", content: "Olá durante a chamada",
+      timestamp: Date.now(), signature: "A".repeat(86),
+    };
+    try {
+      await service.persistSigned({ ...message, id: crypto.randomUUID() }, "history");
+      await service.persistSigned({ ...message, id: crypto.randomUUID() }, "local");
+      expect(received).not.toHaveBeenCalled();
+      await service.persistSigned(message, "remote");
+      await service.persistSigned(message, "remote");
+      expect(received).toHaveBeenCalledOnce();
+      expect(received).toHaveBeenCalledWith(expect.objectContaining({ content: message.content, authorPeerId: message.authorPeerId }));
+    } finally { off(); }
   });
 
   it("allows a received event to be retried when its storage write fails", async () => {

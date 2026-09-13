@@ -29,7 +29,10 @@ pub(super) fn key(code: &str) -> Option<&'static Key> {
 pub(super) fn capabilities() -> Value {
     #[cfg(windows)]
     {
-        return json!({"keyboardMouse": true, "gamepad": false, "reason": "Controle virtual no Windows ainda não disponível; use teclado e mouse."});
+        return match windows::probe() {
+            Ok(()) => json!({"keyboardMouse": true, "gamepad": true}),
+            Err(reason) => json!({"keyboardMouse": true, "gamepad": false, "reason": reason}),
+        };
     }
     #[cfg(target_os = "linux")]
     {
@@ -46,11 +49,7 @@ pub(super) fn capabilities() -> Value {
 pub(super) fn create(device: Device, slot: usize) -> Result<Box<dyn InputBackend>, String> {
     #[cfg(windows)]
     {
-        let _ = slot;
-        if device == Device::Gamepad {
-            return Err("Controle virtual Windows ainda não disponível".into());
-        }
-        return Ok(Box::new(windows::KeyboardMouse::default()));
+        return windows::create(device, slot);
     }
     #[cfg(target_os = "linux")]
     {

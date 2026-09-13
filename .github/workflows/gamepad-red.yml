@@ -1,0 +1,13 @@
+name: Windows gamepad RED
+on:
+  push:
+    branches: [feat/game-mode-remote-input]
+
+jobs:
+  windows-gamepad-red:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run desktop backend tests
+        run: cargo test --manifest-path desktop-backend/Cargo.toml

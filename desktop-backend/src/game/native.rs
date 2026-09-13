@@ -29,10 +29,10 @@ pub(super) fn key(code: &str) -> Option<&'static Key> {
 pub(super) fn capabilities() -> Value {
     #[cfg(windows)]
     {
-        return match windows::probe() {
+        match windows::probe() {
             Ok(()) => json!({"keyboardMouse": true, "gamepad": true}),
             Err(reason) => json!({"keyboardMouse": true, "gamepad": false, "reason": reason}),
-        };
+        }
     }
     #[cfg(target_os = "linux")]
     {
@@ -49,7 +49,7 @@ pub(super) fn capabilities() -> Value {
 pub(super) fn create(device: Device, slot: usize) -> Result<Box<dyn InputBackend>, String> {
     #[cfg(windows)]
     {
-        return windows::create(device, slot);
+        windows::create(device, slot)
     }
     #[cfg(target_os = "linux")]
     {

@@ -1,5 +1,7 @@
-use super::{delta, key, Frame, InputBackend};
+use super::{delta, key, Device, Frame, InputBackend};
+use crate::game::VirtualGamepadBackend;
 use std::collections::HashSet;
+use vigem_rust::{Client, TargetHandle, Xbox360, X360Button, X360Report};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
 #[derive(Default)]
@@ -7,6 +9,7 @@ pub(super) struct KeyboardMouse {
     keys: HashSet<String>,
     buttons: u8,
 }
+
 fn send(input: INPUT) -> Result<(), String> {
     // SendInput aplica somente input do usuário; não tenta contornar UIPI ou elevar privilégios.
     if unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) } == 1 {
@@ -18,6 +21,7 @@ fn send(input: INPUT) -> Result<(), String> {
         )
     }
 }
+
 fn keyboard(code: &str, pressed: bool) -> Result<(), String> {
     let scan = key(code).ok_or("Tecla não suportada")?.scan;
     send(INPUT {
@@ -39,6 +43,7 @@ fn keyboard(code: &str, pressed: bool) -> Result<(), String> {
         },
     })
 }
+
 fn mouse(flags: u32, dx: i32, dy: i32, data: u32) -> Result<(), String> {
     send(INPUT {
         r#type: INPUT_MOUSE,
@@ -54,6 +59,7 @@ fn mouse(flags: u32, dx: i32, dy: i32, data: u32) -> Result<(), String> {
         },
     })
 }
+
 fn button(index: usize, pressed: bool) -> Result<(), String> {
     let flags = [
         (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
@@ -75,6 +81,7 @@ fn button(index: usize, pressed: bool) -> Result<(), String> {
         },
     )
 }
+
 impl InputBackend for KeyboardMouse {
     fn apply(&mut self, previous: &Frame, next: &Frame) -> Result<(), String> {
         for code in self.keys.clone() {
@@ -109,6 +116,7 @@ impl InputBackend for KeyboardMouse {
         }
         Ok(())
     }
+
     fn release_all(&mut self) -> Result<(), String> {
         let mut failure = None;
         for code in self.keys.clone() {
@@ -131,9 +139,120 @@ impl InputBackend for KeyboardMouse {
         failure.map_or(Ok(()), Err)
     }
 }
+
 impl Drop for KeyboardMouse {
     fn drop(&mut self) {
         let _ = self.release_all();
+    }
+}
+
+fn vigem_error(error: impl std::fmt::Display) -> String {
+    format!("Controle virtual Windows indisponível: {error}")
+}
+
+pub(super) fn probe() -> Result<(), String> {
+    Client::connect().map(|_| ()).map_err(vigem_error)
+}
+
+fn stick(value: f64) -> i16 {
+    let value = value.clamp(-1.0, 1.0);
+    if value >= 0.0 {
+        (value * f64::from(i16::MAX)).round() as i16
+    } else {
+        (value * 32768.0).round() as i16
+    }
+}
+
+fn trigger(value: f64) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn report_from_frame(frame: &Frame) -> X360Report {
+    let Some(gamepad) = frame.gamepad.as_ref() else {
+        return X360Report::default();
+    };
+
+    let mut buttons = X360Button::empty();
+    let pressed = |index: usize| gamepad.buttons.get(index).copied().unwrap_or(0.0) > 0.5;
+    for (index, flag) in [
+        (0, X360Button::A),
+        (1, X360Button::B),
+        (2, X360Button::X),
+        (3, X360Button::Y),
+        (4, X360Button::LEFT_SHOULDER),
+        (5, X360Button::RIGHT_SHOULDER),
+        (8, X360Button::BACK),
+        (9, X360Button::START),
+        (10, X360Button::LEFT_THUMB),
+        (11, X360Button::RIGHT_THUMB),
+        (12, X360Button::DPAD_UP),
+        (13, X360Button::DPAD_DOWN),
+        (14, X360Button::DPAD_LEFT),
+        (15, X360Button::DPAD_RIGHT),
+        (16, X360Button::GUIDE),
+    ] {
+        if pressed(index) {
+            buttons |= flag;
+        }
+    }
+
+    let axis = |index: usize| gamepad.axes.get(index).copied().unwrap_or(0.0);
+    let button_value = |index: usize| gamepad.buttons.get(index).copied().unwrap_or(0.0);
+
+    X360Report {
+        buttons,
+        left_trigger: trigger(button_value(6)),
+        right_trigger: trigger(button_value(7)),
+        thumb_lx: stick(axis(0)),
+        // Browser Gamepad API usa Y positivo para baixo; XInput usa positivo para cima.
+        thumb_ly: stick(-axis(1)),
+        thumb_rx: stick(axis(2)),
+        thumb_ry: stick(-axis(3)),
+    }
+}
+
+struct Gamepad {
+    // O TargetHandle guarda Weak<Client>; manter o Client vivo mantém o alvo conectado ao bus.
+    _client: Client,
+    pad: TargetHandle<Xbox360>,
+}
+
+impl Gamepad {
+    fn new() -> Result<Self, String> {
+        let client = Client::connect().map_err(vigem_error)?;
+        let pad = client
+            .new_x360_target()
+            .plug()
+            .map_err(vigem_error)?
+            .wait_for_ready()
+            .map_err(vigem_error)?;
+        Ok(Self {
+            _client: client,
+            pad,
+        })
+    }
+}
+
+impl VirtualGamepadBackend for Gamepad {}
+
+impl InputBackend for Gamepad {
+    fn apply(&mut self, _: &Frame, next: &Frame) -> Result<(), String> {
+        self.pad
+            .update(&report_from_frame(next))
+            .map_err(vigem_error)
+    }
+
+    fn release_all(&mut self) -> Result<(), String> {
+        self.pad.update(&X360Report::default()).map_err(vigem_error)
+    }
+}
+
+pub(super) fn create(device: Device, _slot: usize) -> Result<Box<dyn InputBackend>, String> {
+    if device == Device::Gamepad {
+        let pad: Box<dyn VirtualGamepadBackend> = Box::new(Gamepad::new()?);
+        Ok(pad)
+    } else {
+        Ok(Box::new(KeyboardMouse::default()))
     }
 }
 
@@ -163,7 +282,9 @@ mod tests {
 
         let report = report_from_frame(&gamepad_frame([1.0, -1.0, -1.0, 1.0], buttons));
         let bits = report.buttons.bits();
-        for expected in [0x1000, 0x0100, 0x0020, 0x0010, 0x0040, 0x0001, 0x0008, 0x0400] {
+        for expected in [
+            0x1000, 0x0100, 0x0020, 0x0010, 0x0040, 0x0001, 0x0008, 0x0400,
+        ] {
             assert_ne!(bits & expected, 0);
         }
         assert_eq!(report.left_trigger, 128);

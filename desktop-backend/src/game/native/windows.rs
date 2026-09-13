@@ -1,7 +1,7 @@
 use super::{delta, key, Device, Frame, InputBackend};
 use crate::game::VirtualGamepadBackend;
 use std::collections::HashSet;
-use vigem_rust::{Client, TargetHandle, Xbox360, X360Button, X360Report};
+use vigem_rust::{Client, TargetHandle, X360Button, X360Report, Xbox360};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 
 #[derive(Default)]

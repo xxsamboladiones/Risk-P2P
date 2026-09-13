@@ -136,3 +136,53 @@ impl Drop for KeyboardMouse {
         let _ = self.release_all();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::Pad;
+
+    fn gamepad_frame(axes: [f64; 4], buttons: [f64; 17]) -> Frame {
+        Frame {
+            gamepad: Some(Pad {
+                axes: axes.to_vec(),
+                buttons: buttons.to_vec(),
+            }),
+            ..Frame::default()
+        }
+    }
+
+    #[test]
+    fn maps_standard_gamepad_to_xbox360_report() {
+        let mut buttons = [0.0; 17];
+        for index in [0, 4, 8, 9, 10, 12, 15, 16] {
+            buttons[index] = 1.0;
+        }
+        buttons[6] = 0.5;
+        buttons[7] = 1.0;
+
+        let report = report_from_frame(&gamepad_frame([1.0, -1.0, -1.0, 1.0], buttons));
+        let bits = report.buttons.bits();
+        for expected in [0x1000, 0x0100, 0x0020, 0x0010, 0x0040, 0x0001, 0x0008, 0x0400] {
+            assert_ne!(bits & expected, 0);
+        }
+        assert_eq!(report.left_trigger, 128);
+        assert_eq!(report.right_trigger, 255);
+        assert_eq!(report.thumb_lx, i16::MAX);
+        assert_eq!(report.thumb_ly, i16::MAX);
+        assert_eq!(report.thumb_rx, i16::MIN);
+        assert_eq!(report.thumb_ry, i16::MIN);
+    }
+
+    #[test]
+    fn missing_gamepad_frame_maps_to_neutral_report() {
+        let report = report_from_frame(&Frame::default());
+        assert_eq!(report.buttons.bits(), 0);
+        assert_eq!(report.left_trigger, 0);
+        assert_eq!(report.right_trigger, 0);
+        assert_eq!(report.thumb_lx, 0);
+        assert_eq!(report.thumb_ly, 0);
+        assert_eq!(report.thumb_rx, 0);
+        assert_eq!(report.thumb_ry, 0);
+    }
+}

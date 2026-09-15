@@ -59,16 +59,25 @@ Lifecycle and media pressure are separate axes because a constrained call can be
 - `foreground`: the app is visible and interactive; normal quality and responsiveness take priority.
 - `foreground-call`: the call workspace is visible; media, diagnostics, and visible presentation remain active.
 - `background-call`: a call continues while its workspace or window is hidden; audio, signaling, publication, and required recovery remain active, while invisible presentation work is suspended.
-- `idle-hidden`: no call or active transfer requires foreground cadence; renderer UI work and non-urgent polling are paused or heavily coalesced while presence, messaging, and notifications remain functional.
+- `idle-hidden`: the application window is hidden and no call workspace requires presentation; renderer UI work and non-urgent polling are paused or heavily coalesced while presence, messaging, and notifications remain functional. Background activities independently retain the scheduling permissions they require.
 
 Media pressure is an independent deterministic state:
 
 ```typescript
 type ExecutionMode = "foreground" | "foreground-call" | "background-call" | "idle-hidden";
 type MediaPressure = "normal" | "warning" | "overloaded";
+
+type RuntimeActivity = {
+  callActive: boolean;
+  transferActive: boolean;
+  screenPublicationActive: boolean;
+  gameSessionActive: boolean;
+};
 ```
 
 `mediaPressure: "overloaded"` means sustained measurements show that the machine cannot maintain the current publication profile. Adaptive media policy may reduce the screen profile but no lower than 480p/30.
+
+`RuntimeActivity` does not create additional execution modes. The policy derives `hasCriticalBackgroundWork` from these flags. A hidden window remains `idle-hidden` when a transfer is active, but the resulting policy denies Chromium background throttling and preserves transfer/backpressure scheduling. This avoids combinatorial modes such as `background-transfer`, `background-game`, or `background-call-transfer`.
 
 Returning to a more active state is event-driven. Deferred work is coalesced so focus restoration does not cause a burst of expired timers or repeated state refreshes.
 
@@ -99,8 +108,8 @@ It may produce decisions such as:
   visualVoiceActivityEnabled: false,
   hiddenVideoPresentationEnabled: false,
   diagnosticsIntervalMs: 10_000,
-  backgroundThrottlingAllowed: false,
-  requestedScreenProfile: "720p30"
+  chromiumBackgroundThrottlingAllowed: false,
+  effectiveScreenProfile: "720p30"
 }
 ```
 
@@ -110,7 +119,28 @@ If a signal or browser API is unavailable, the policy remains at the normal-qual
 
 ## Stability and Hysteresis
 
-Media adaptation requires sustained evidence rather than a single slow frame or network sample. The pure state keeps `overloadSamples`, `recoverySamples`, `lastTransitionAt`, and `cooldownUntil`. Missing samples preserve the current profile and cannot independently trigger a transition.
+Media adaptation requires sustained evidence rather than a single slow frame or network sample. The pure state distinguishes user intent from the profile currently required by runtime conditions:
+
+```typescript
+type ScreenProfile =
+  | "480p30"
+  | "720p30"
+  | "1080p30"
+  | "480p60"
+  | "720p60"
+  | "1080p60";
+
+type AdaptiveMediaState = {
+  requestedProfile: ScreenProfile;
+  effectiveProfile: ScreenProfile;
+  overloadSamples: number;
+  recoverySamples: number;
+  lastTransitionAt: number | null;
+  cooldownUntil: number | null;
+};
+```
+
+`requestedProfile` is the maximum recovery ceiling selected by the user or game-mode policy. `effectiveProfile` is the currently applied profile. Recovery may climb only toward `requestedProfile` and must stop there; it can never silently upgrade to a profile the user did not request. Missing samples preserve both profiles and cannot independently trigger a transition.
 
 The initial deterministic cadence is one aggregate sample every two seconds while screen publication is active:
 
@@ -119,6 +149,8 @@ The initial deterministic cadence is one aggregate sample every two seconds whil
 - fifteen consecutive healthy samples permit recovery by exactly one profile rung;
 - every profile change starts a twenty-second cooldown during which no further profile change occurs;
 - a healthy sample before overload resets `overloadSamples`, while a bad sample during recovery resets `recoverySamples`.
+
+Sampling and pressure classification continue during cooldown. Cooldown blocks publication-profile transitions, not signal collection, counter updates, or pressure-state updates. When cooldown ends, the already accumulated classification determines whether the next permitted transition reduces, holds, or recovers one rung.
 
 Benchmark evidence may tune the counts, cadence, and cooldown before release, but their named state and one-rung transition model remain part of the architecture and test contract.
 
@@ -187,11 +219,13 @@ The remaining media rules are:
 - diagnostics views consume cached summaries instead of triggering their own collections;
 - inactive or closed calls perform no periodic stats collection;
 - visual voice activity runs only for audible, presented participants and stops for hidden tiles;
-- remote video elements that cannot be seen stop presentation work without disabling the underlying audio or connection;
+- remote video elements that cannot be seen stop presentation work while the peer connection, receiving tracks, and remote audio remain active;
 - local camera and screen previews detach or pause when hidden while publication continues;
 - publication parameter updates are deduplicated and applied only when the requested effective profile changes;
 - Mesh adaptation uses already collected summaries rather than repeating `getStats()` calls;
 - file transfer backpressure and call recovery retain existing correctness and timing guarantees.
+
+The policy specifies the hidden-video outcome, not a DOM mechanism. The React/media adapter chooses whether to pause presentation, detach only a video-only stream, or use another browser-supported mechanism. It must not detach a combined stream in a way that interrupts audio, and tests assert continued audio/track/connection behavior rather than requiring a particular `HTMLVideoElement` implementation.
 
 ## Chat and Persistence
 
@@ -237,7 +271,7 @@ The harness records, where supported:
 
 Acceptance is based on these invariants:
 
-- hidden idle performs no periodic UI, visual voice-activity, or call-diagnostic work;
+- hidden idle performs no periodic UI, visual voice-activity, or call-diagnostic work, while active transfers and publications retain their required scheduling;
 - no call means no periodic WebRTC statistics collection;
 - minimized calls retain required transport/audio behavior while invisible video presentation and voice visualization stop;
 - initial feature code excludes call, game, attachment-gallery, and RNNoise implementations until needed;
@@ -252,8 +286,8 @@ Numerical CPU and memory reduction percentages are reported from the target Wind
 
 Implementation uses test-driven development. Each behavior is introduced by a failing test and verified independently before integration.
 
-- Pure policy tests cover lifecycle and pressure as independent axes, missing metrics, warning state, consecutive overload samples, cooldowns, one-rung transitions, recovery, the exact 60 FPS ladder, and the 480p/30 floor.
-- Lifecycle tests cover visibility changes, minimized workspace behavior, active calls, transfers, cleanup, and focus restoration.
+- Pure policy tests cover lifecycle, runtime activity, and pressure as independent inputs; hidden active transfers; missing metrics; warning state; consecutive overload samples; cooldown classification; one-rung transitions; requested/effective profile ceilings; recovery; the exact 60 FPS ladder; and the 480p/30 floor.
+- Lifecycle tests cover visibility changes, minimized workspace behavior, active calls, transfers, screen publication, game sessions, cleanup, and focus restoration.
 - React tests prove that diagnostic updates do not rerender unrelated grids/timelines, hidden media presentation stops, visual VAD stops, and any semantic VAD consumer remains active.
 - Loading tests verify that feature modules are absent from the eager graph and load successfully at their boundaries.
 - RTC tests count stats calls, parameter changes, and track continuity during adaptation.
@@ -271,7 +305,7 @@ Implementation is divided into four independently measurable integration units. 
 
 - add benchmark primitives and capture the reproducible baseline without changing behavior;
 - add the pure coordinator, independent execution/pressure state, and policy ownership boundary;
-- connect document and Electron visibility;
+- connect document and Electron visibility plus orthogonal runtime-activity signals;
 - implement `background-call` and `idle-hidden` lifecycle decisions;
 - verify packaged Windows minimize, tray, restore, notification, call, and transfer behavior.
 

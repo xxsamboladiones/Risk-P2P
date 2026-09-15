@@ -57,6 +57,14 @@ export function createMainWindow(options: MainWindowOptions): BrowserWindow {
     window.hide();
   });
   window.on("closed", () => options.onClosed(window));
+  const reportWindowVisibility = () => {
+    if (window.isDestroyed()) return;
+    window.webContents.send("window:visibility-changed", window.isVisible() && !window.isMinimized());
+  };
+  window.on("hide", reportWindowVisibility);
+  window.on("minimize", reportWindowVisibility);
+  window.on("restore", reportWindowVisibility);
+  window.on("show", reportWindowVisibility);
   window.webContents.setWebRTCIPHandlingPolicy("default");
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   window.webContents.on("will-navigate", (event, targetUrl) => {

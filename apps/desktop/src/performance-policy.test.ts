@@ -2,25 +2,37 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const electronRuntime = vi.hoisted(() => ({
   handlers: new Map<string, (event: { sender: { getURL(): string } }, value: unknown) => Promise<unknown>>(),
-  owner: null as null | { webContents: { setBackgroundThrottling(value: boolean): void } },
+  owner: null as null | {
+    isMinimized(): boolean;
+    isVisible(): boolean;
+    webContents: { setBackgroundThrottling(value: boolean): void };
+  },
   fromWebContents: vi.fn(),
   setBackgroundThrottling: vi.fn(),
+  send: vi.fn(),
+  nativeMinimized: false,
+  nativeVisible: true,
+  windowEvents: new Map<string, () => void>(),
   windowOptions: null as null | { webPreferences?: { backgroundThrottling?: boolean } },
 }));
 
 vi.mock("electron", () => {
   const BrowserWindow = vi.fn((options: { webPreferences?: { backgroundThrottling?: boolean } }) => {
     electronRuntime.windowOptions = options;
+    electronRuntime.windowEvents.clear();
     return {
       hide: vi.fn(),
       isDestroyed: () => false,
+      isMinimized: () => electronRuntime.nativeMinimized,
+      isVisible: () => electronRuntime.nativeVisible,
       loadURL: vi.fn().mockResolvedValue(undefined),
-      on: vi.fn(),
+      on: (name: string, handler: () => void) => electronRuntime.windowEvents.set(name, handler),
       once: vi.fn(),
       show: vi.fn(),
       webContents: {
         on: vi.fn(),
         once: vi.fn(),
+        send: electronRuntime.send,
         setWebRTCIPHandlingPolicy: vi.fn(),
         setWindowOpenHandler: vi.fn(),
       },
@@ -50,9 +62,12 @@ import { parseDesktopPerformancePolicy } from "./performance-policy.js";
 import { createMainWindow } from "./window.js";
 
 it("accepts only the Electron-facing boolean permission", () => {
-  expect(parseDesktopPerformancePolicy({ chromiumBackgroundThrottlingAllowed: true })).toEqual({
+  const input = { chromiumBackgroundThrottlingAllowed: true };
+  const parsed = parseDesktopPerformancePolicy(input);
+  expect(parsed).toEqual({
     chromiumBackgroundThrottlingAllowed: true,
   });
+  expect(parsed).not.toBe(input);
   expect(() => parseDesktopPerformancePolicy({
     chromiumBackgroundThrottlingAllowed: "yes",
   })).toThrow("Política de desempenho inválida");
@@ -62,12 +77,41 @@ it("accepts only the Electron-facing boolean permission", () => {
   })).toThrow("Política de desempenho inválida");
 });
 
+it("rejects arrays, custom prototypes, wrong keys, symbols, and non-enumerable extras", () => {
+  const array = Object.assign([], { chromiumBackgroundThrottlingAllowed: true });
+  const inherited = Object.create({ chromiumBackgroundThrottlingAllowed: true });
+  const customPrototype = Object.assign(Object.create({ command: "quit" }), {
+    chromiumBackgroundThrottlingAllowed: true,
+  });
+  const symbolExtra = {
+    chromiumBackgroundThrottlingAllowed: true,
+    [Symbol("command")]: "quit",
+  };
+  const nonEnumerableExtra = { chromiumBackgroundThrottlingAllowed: true };
+  Object.defineProperty(nonEnumerableExtra, "command", { value: "quit" });
+
+  for (const value of [
+    array,
+    inherited,
+    customPrototype,
+    { backgroundThrottlingAllowed: true },
+    symbolExtra,
+    nonEnumerableExtra,
+  ]) {
+    expect(() => parseDesktopPerformancePolicy(value)).toThrow("Política de desempenho inválida");
+  }
+});
+
 describe("performance:set-policy", () => {
   beforeEach(() => {
     electronRuntime.handlers.clear();
     electronRuntime.fromWebContents.mockReset();
     electronRuntime.setBackgroundThrottling.mockReset();
+    electronRuntime.nativeMinimized = false;
+    electronRuntime.nativeVisible = true;
     electronRuntime.owner = {
+      isMinimized: () => electronRuntime.nativeMinimized,
+      isVisible: () => electronRuntime.nativeVisible,
       webContents: { setBackgroundThrottling: electronRuntime.setBackgroundThrottling },
     };
     electronRuntime.fromWebContents.mockImplementation(() => electronRuntime.owner);
@@ -125,6 +169,48 @@ describe("performance:set-policy", () => {
   });
 });
 
+describe("window:visibility", () => {
+  beforeEach(() => {
+    electronRuntime.handlers.clear();
+    electronRuntime.fromWebContents.mockReset();
+    electronRuntime.nativeMinimized = false;
+    electronRuntime.nativeVisible = true;
+    electronRuntime.owner = {
+      isMinimized: () => electronRuntime.nativeMinimized,
+      isVisible: () => electronRuntime.nativeVisible,
+      webContents: { setBackgroundThrottling: electronRuntime.setBackgroundThrottling },
+    };
+    electronRuntime.fromWebContents.mockImplementation(() => electronRuntime.owner);
+    registerDesktopIpc({ getConfig: () => null } as never, (url) => url === "risk://app");
+  });
+
+  it("reads native visibility from the trusted sender's owning window", async () => {
+    const handler = electronRuntime.handlers.get("window:visibility");
+    expect(handler).toBeDefined();
+    const sender = { getURL: () => "risk://app" };
+
+    expect(await handler!({ sender }, undefined)).toBe(true);
+    electronRuntime.nativeMinimized = true;
+    expect(await handler!({ sender }, undefined)).toBe(false);
+    electronRuntime.nativeMinimized = false;
+    electronRuntime.nativeVisible = false;
+    expect(await handler!({ sender }, undefined)).toBe(false);
+    expect(electronRuntime.fromWebContents).toHaveBeenCalledWith(sender);
+  });
+
+  it("rejects untrusted reads before resolving an owner window", async () => {
+    const handler = electronRuntime.handlers.get("window:visibility");
+    expect(handler).toBeDefined();
+    electronRuntime.fromWebContents.mockClear();
+
+    await expect(handler!(
+      { sender: { getURL: () => "https://attacker.invalid" } },
+      undefined,
+    )).rejects.toThrow("Origem do renderer não autorizada");
+    expect(electronRuntime.fromWebContents).not.toHaveBeenCalled();
+  });
+});
+
 it("starts BrowserWindows with Chromium background throttling allowed", () => {
   electronRuntime.windowOptions = null;
 
@@ -141,4 +227,36 @@ it("starts BrowserWindows with Chromium background throttling allowed", () => {
   expect(electronRuntime.windowOptions).toMatchObject({
     webPreferences: { backgroundThrottling: true },
   });
+});
+
+it("reports native hide, minimize, restore, and show visibility as booleans", () => {
+  electronRuntime.send.mockReset();
+  electronRuntime.nativeMinimized = false;
+  electronRuntime.nativeVisible = true;
+
+  createMainWindow({
+    pageUrl: "risk://app/index.html",
+    rootDirectory: "C:\\risk",
+    iconPath: "C:\\risk\\icon.png",
+    isQuitting: () => false,
+    trayAvailable: () => true,
+    isTrustedRendererUrl: (url) => url.startsWith("risk://app"),
+    onClosed: vi.fn(),
+  });
+
+  electronRuntime.nativeVisible = false;
+  electronRuntime.windowEvents.get("hide")?.();
+  electronRuntime.nativeVisible = true;
+  electronRuntime.nativeMinimized = true;
+  electronRuntime.windowEvents.get("minimize")?.();
+  electronRuntime.nativeMinimized = false;
+  electronRuntime.windowEvents.get("restore")?.();
+  electronRuntime.windowEvents.get("show")?.();
+
+  expect(electronRuntime.send.mock.calls).toEqual([
+    ["window:visibility-changed", false],
+    ["window:visibility-changed", false],
+    ["window:visibility-changed", true],
+    ["window:visibility-changed", true],
+  ]);
 });

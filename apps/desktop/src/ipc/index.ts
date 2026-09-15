@@ -61,6 +61,13 @@ export function registerDesktopIpc(
     return { fullscreen: enabled };
   });
 
+  ipcMain.handle("window:visibility", async (event) => {
+    assertTrusted(event.sender.getURL());
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (!owner) throw new Error("Janela do Risk não encontrada.");
+    return owner.isVisible() && !owner.isMinimized();
+  });
+
   ipcMain.handle("shell:open-external", async (event, value: unknown) => {
     assertTrusted(event.sender.getURL());
     if (typeof value !== "string" || value.length > 2_048) throw new Error("Link externo inválido.");

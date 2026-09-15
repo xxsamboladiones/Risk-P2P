@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { useRiskApplication } from "../application/ApplicationContext";
 import { useCallStore } from "../store";
 import type { PerformancePolicy, PerformanceSignals, RuntimeActivity } from "./policy";
@@ -43,6 +43,41 @@ type DesktopPerformancePolicyApi = {
   }): Promise<void>;
 };
 
+type DesktopWindowVisibilityApi = {
+  getWindowVisibility?(): Promise<unknown>;
+  onWindowVisibilityChanged?(callback: (visible: unknown) => void): () => void;
+};
+
+export function observeDesktopWindowVisibility(
+  resolveDesktop: () => DesktopWindowVisibilityApi | undefined,
+  onVisibility: (visible: boolean) => void,
+): () => void {
+  const desktop = resolveDesktop();
+  if (!desktop?.getWindowVisibility || !desktop.onWindowVisibilityChanged) return () => {};
+
+  let disposed = false;
+  let eventRevision = 0;
+  const unsubscribe = desktop.onWindowVisibilityChanged((visible) => {
+    if (disposed || typeof visible !== "boolean") return;
+    eventRevision += 1;
+    onVisibility(visible);
+  });
+  const initialRevision = eventRevision;
+  void desktop.getWindowVisibility().then((visible) => {
+    if (
+      disposed
+      || eventRevision !== initialRevision
+      || typeof visible !== "boolean"
+    ) return;
+    onVisibility(visible);
+  }).catch(() => undefined);
+
+  return () => {
+    disposed = true;
+    unsubscribe();
+  };
+}
+
 export function createDesktopPerformancePolicyBridge(
   resolveDesktop: () => DesktopPerformancePolicyApi | undefined = () => window.desktop,
 ): (chromiumBackgroundThrottlingAllowed: boolean) => void {
@@ -62,6 +97,10 @@ export function usePerformancePolicy(): PerformancePolicy {
 export function PerformanceRuntimeBridge() {
   const { call, performance, performanceActivity } = useRiskApplication();
   const documentVisible = useSyncExternalStore(subscribeDocumentVisibility, getDocumentVisible);
+  const desktopVisibilityAvailable = Boolean(
+    window.desktop?.getWindowVisibility && window.desktop.onWindowVisibilityChanged,
+  );
+  const [nativeWindowVisible, setNativeWindowVisible] = useState<boolean>();
   const callState = useSyncExternalStore(useCallStore.subscribe, useCallStore.getState);
   const gameState = useSyncExternalStore(call.game.subscribe, call.game.getSnapshot);
   const trackedActivity = useSyncExternalStore(
@@ -72,10 +111,17 @@ export function PerformanceRuntimeBridge() {
   const desktopPerformancePolicyBridge = useMemo(createDesktopPerformancePolicyBridge, []);
 
   const gameSessionActive = Boolean(gameState.host || gameState.playing);
+  const windowVisible = desktopVisibilityAvailable ? nativeWindowVisible : documentVisible;
+
+  useEffect(() => observeDesktopWindowVisibility(
+    () => window.desktop,
+    setNativeWindowVisible,
+  ), []);
 
   useEffect(() => {
+    if (windowVisible === undefined) return;
     performance.update(performanceSignalsFromUi({
-      documentVisible,
+      documentVisible: windowVisible,
       callWorkspaceOpen: callState.callWorkspaceOpen,
       roomId: callState.roomId,
       screenShare: callState.localState.screenShare,
@@ -86,10 +132,10 @@ export function PerformanceRuntimeBridge() {
     callState.callWorkspaceOpen,
     callState.localState.screenShare,
     callState.roomId,
-    documentVisible,
     gameSessionActive,
     performance,
     trackedActivity,
+    windowVisible,
   ]);
 
   useEffect(() => {

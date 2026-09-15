@@ -6,10 +6,21 @@ export function parseDesktopPerformancePolicy(value: unknown): DesktopPerformanc
   if (
     !value
     || typeof value !== "object"
-    || Object.keys(value).length !== 1
-    || typeof (value as DesktopPerformancePolicy).chromiumBackgroundThrottlingAllowed !== "boolean"
+    || Array.isArray(value)
+    || Object.getPrototypeOf(value) !== Object.prototype
   ) {
     throw new Error("Política de desempenho inválida.");
   }
-  return value as DesktopPerformancePolicy;
+  const keys = Reflect.ownKeys(value);
+  const descriptor = Object.getOwnPropertyDescriptor(value, "chromiumBackgroundThrottlingAllowed");
+  if (
+    keys.length !== 1
+    || keys[0] !== "chromiumBackgroundThrottlingAllowed"
+    || !descriptor
+    || !("value" in descriptor)
+    || typeof descriptor.value !== "boolean"
+  ) {
+    throw new Error("Política de desempenho inválida.");
+  }
+  return { chromiumBackgroundThrottlingAllowed: descriptor.value };
 }

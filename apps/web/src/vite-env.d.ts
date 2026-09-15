@@ -46,6 +46,8 @@ interface Window {
     chooseScreenSource(): Promise<string | null>;
     selectScreenSource(sourceId: string): Promise<void>;
     setWindowFullscreen(enabled: boolean): Promise<{ fullscreen: boolean }>;
+    getWindowVisibility(): Promise<boolean>;
+    onWindowVisibilityChanged(callback: (visible: boolean) => void): () => void;
     setPerformancePolicy(policy: {
       chromiumBackgroundThrottlingAllowed: boolean;
     }): Promise<void>;

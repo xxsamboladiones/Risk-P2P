@@ -51,5 +51,11 @@ interface Window {
     getNetworkInterfaces(): Promise<RiskDesktopNetworkInterface[]>;
     openExternal(url: string): Promise<void>;
     onBackendStatus(callback: (status: RiskDesktopBackendStatus) => void): () => void;
+    onPerformanceRendererSnapshotRequest?(callback: () => void): () => void;
+    reportPerformanceRendererSnapshot?(snapshot: {
+      longTaskCount: number;
+      longTaskDurationMs: number;
+      heapUsedBytes?: number;
+    }): Promise<void>;
   };
 }

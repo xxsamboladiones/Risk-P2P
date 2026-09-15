@@ -9,8 +9,16 @@ import "./styles.css";
 import "./components/modal-layout.css";
 import "./components/theme-overrides.css";
 import { initializeTheme } from "./services/theme/settings";
+import { installRendererPerformanceProbe } from "./performance/probe";
 
 initializeTheme();
+
+if (window.desktop?.onPerformanceRendererSnapshotRequest && window.desktop.reportPerformanceRendererSnapshot) {
+  installRendererPerformanceProbe({
+    onRequestSnapshot: window.desktop.onPerformanceRendererSnapshotRequest,
+    reportSnapshot: window.desktop.reportPerformanceRendererSnapshot,
+  });
+}
 
 createRoot(document.getElementById("root")!).render(<React.StrictMode>
   <RiskApplicationProvider application={riskApplication}>

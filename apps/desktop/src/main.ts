@@ -1,4 +1,5 @@
-import { app, BrowserWindow, dialog, type Tray } from "electron";
+import { app, BrowserWindow, dialog, globalShortcut, type Tray } from "electron";
+import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DesktopBackendManager } from "./backend.js";
@@ -16,6 +17,8 @@ import {
 import { ScreenCaptureController } from "./screen-capture.js";
 import { createApplicationTray, isTrayAvailable } from "./tray.js";
 import { createMainWindow } from "./window.js";
+import { PerformanceRecorder, type RiskPerformanceReportV1 } from "./performance-recorder.js";
+import type { RendererPerformanceSnapshot } from "./ipc/index.js";
 
 configurePlatformRuntime();
 registerRiskScheme();
@@ -23,6 +26,12 @@ registerRiskScheme();
 const rootDirectory = path.dirname(fileURLToPath(import.meta.url));
 const DEVELOPMENT_ORIGINS = new Set(["http://localhost:5173", "http://127.0.0.1:5173"]);
 const PACKAGED_ORIGIN_REPORT_FILE = process.env.RISK_PACKAGED_ORIGIN_REPORT_FILE?.trim();
+const PERFORMANCE_REPORT_FILE = process.env.RISK_PERFORMANCE_REPORT_FILE?.trim();
+const PERFORMANCE_SCENARIO = process.env.RISK_PERFORMANCE_SCENARIO?.trim() || "unnamed";
+const configuredPerformanceDuration = Number(process.env.RISK_PERFORMANCE_DURATION_MS);
+const PERFORMANCE_DURATION_MS = Number.isFinite(configuredPerformanceDuration) && configuredPerformanceDuration > 0
+  ? configuredPerformanceDuration
+  : 60_000;
 const DEV_BACKEND_BRIDGE_FILE = path.resolve(rootDirectory, "../../../.risk/dev-backend.json");
 const APP_ICON_PATH = app.isPackaged
   ? path.join(process.resourcesPath, "icon.png")
@@ -32,6 +41,67 @@ let pageUrl = "http://localhost:5173";
 let isQuitting = false;
 let mainWindow: BrowserWindow | undefined;
 let tray: Tray | undefined;
+let activePerformanceRecorder: PerformanceRecorder | undefined;
+let pendingRendererSnapshot: {
+  sender: Electron.WebContents;
+  resolve: (snapshot: RendererPerformanceSnapshot) => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+} | undefined;
+
+function requestRendererPerformanceSnapshot(window: BrowserWindow): Promise<RendererPerformanceSnapshot> {
+  if (pendingRendererSnapshot) return Promise.reject(new Error("Já existe uma coleta do renderer em andamento."));
+  return new Promise<RendererPerformanceSnapshot>((resolve, reject) => {
+    const sender = window.webContents;
+    const timeout = setTimeout(() => {
+      if (pendingRendererSnapshot?.sender !== sender) return;
+      pendingRendererSnapshot = undefined;
+      reject(new Error("O renderer não respondeu à coleta de desempenho."));
+    }, 2_000);
+    pendingRendererSnapshot = { sender, resolve, reject, timeout };
+    sender.send("performance:request-renderer-snapshot");
+  });
+}
+
+function acceptRendererPerformanceSnapshot(sender: Electron.WebContents, snapshot: RendererPerformanceSnapshot): void {
+  if (pendingRendererSnapshot?.sender !== sender) return;
+  clearTimeout(pendingRendererSnapshot.timeout);
+  const { resolve } = pendingRendererSnapshot;
+  pendingRendererSnapshot = undefined;
+  resolve(snapshot);
+}
+
+function startPerformanceCapture(): void {
+  if (!PERFORMANCE_REPORT_FILE || activePerformanceRecorder) return;
+  const window = mainWindow;
+  if (!window || window.isDestroyed()) return;
+  const recorder = new PerformanceRecorder({
+    reportFile: PERFORMANCE_REPORT_FILE,
+    scenario: PERFORMANCE_SCENARIO,
+    buildVersion: app.getVersion(),
+    durationMs: PERFORMANCE_DURATION_MS,
+    now: Date.now,
+    getAppMetrics: () => app.getAppMetrics(),
+    requestRendererSnapshot: () => requestRendererPerformanceSnapshot(window),
+    writeFile: async (file, contents) => writeFile(file, contents, "utf8"),
+  });
+  activePerformanceRecorder = recorder;
+  recorder.start();
+  setTimeout(() => {
+    void recorder.finish()
+      .then((report: RiskPerformanceReportV1) => console.info("Relatório de desempenho do Risk gravado", {
+        scenario: report.scenario,
+        reportFile: PERFORMANCE_REPORT_FILE,
+      }))
+      .catch((error) => console.error("Falha ao gravar relatório de desempenho do Risk", error))
+      .finally(() => { if (activePerformanceRecorder === recorder) activePerformanceRecorder = undefined; });
+  }, PERFORMANCE_DURATION_MS + 100);
+}
+
+function registerPerformanceMeasurementShortcut(): void {
+  if (!PERFORMANCE_REPORT_FILE) return;
+  globalShortcut.register("CommandOrControl+Alt+Shift+F11", startPerformanceCapture);
+}
 
 function isTrustedRendererUrl(value: string): boolean {
   try {
@@ -96,7 +166,7 @@ if (hasSingleInstanceLock) {
 
   app.whenReady().then(async () => {
     // O IPC também registra um atalho global, que exige o Electron pronto.
-    registerDesktopIpc(backend, isTrustedRendererUrl);
+    registerDesktopIpc(backend, isTrustedRendererUrl, acceptRendererPerformanceSnapshot);
     if (app.isPackaged) {
       await registerPackagedProtocol(path.resolve(process.resourcesPath, "web"));
       pageUrl = PACKAGED_ENTRY_URL;
@@ -115,6 +185,7 @@ if (hasSingleInstanceLock) {
       quit: quitApplication,
     });
     openMainWindow();
+    registerPerformanceMeasurementShortcut();
     app.on("activate", showMainWindow);
   }).catch((error) => {
     console.error("Falha ao iniciar o Risk", error);
@@ -130,6 +201,7 @@ app.on("before-quit", () => {
   tray?.destroy();
   tray = undefined;
   screenCapture.clear();
+  globalShortcut.unregister("CommandOrControl+Alt+Shift+F11");
   void backend.clearDevBridge();
   backend.stop();
 });

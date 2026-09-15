@@ -1,11 +1,31 @@
-import { BrowserWindow, globalShortcut, ipcMain, shell } from "electron";
+import { BrowserWindow, globalShortcut, ipcMain, shell, type WebContents } from "electron";
 import { networkInterfaces } from "node:os";
 import type { DesktopBackendManager } from "../backend.js";
 import { collectNetworkInterfaces } from "../network-interfaces.js";
 
+export type RendererPerformanceSnapshot = {
+  longTaskCount: number;
+  longTaskDurationMs: number;
+  heapUsedBytes?: number;
+};
+
+function readRendererPerformanceSnapshot(value: unknown): RendererPerformanceSnapshot | null {
+  if (!value || typeof value !== "object") return null;
+  const snapshot = value as Record<string, unknown>;
+  const validNumber = (candidate: unknown): candidate is number => typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0;
+  if (!validNumber(snapshot.longTaskCount) || !validNumber(snapshot.longTaskDurationMs)) return null;
+  if (snapshot.heapUsedBytes !== undefined && !validNumber(snapshot.heapUsedBytes)) return null;
+  return {
+    longTaskCount: snapshot.longTaskCount,
+    longTaskDurationMs: snapshot.longTaskDurationMs,
+    ...(snapshot.heapUsedBytes === undefined ? {} : { heapUsedBytes: snapshot.heapUsedBytes }),
+  };
+}
+
 export function registerDesktopIpc(
   backend: DesktopBackendManager,
   isTrustedRendererUrl: (value: string) => boolean,
+  onRendererPerformanceSnapshot?: (sender: WebContents, snapshot: RendererPerformanceSnapshot) => void,
 ): void {
   globalShortcut.register("CommandOrControl+Alt+Shift+F12", () => {
     const config = backend.getConfig();
@@ -46,5 +66,12 @@ export function registerDesktopIpc(
     const url = new URL(value);
     if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error("Protocolo de link não permitido.");
     await shell.openExternal(url.toString());
+  });
+
+  ipcMain.handle("performance:renderer-snapshot", async (event, value: unknown) => {
+    assertTrusted(event.sender.getURL());
+    const snapshot = readRendererPerformanceSnapshot(value);
+    if (!snapshot) throw new Error("Métrica de desempenho do renderer inválida.");
+    onRendererPerformanceSnapshot?.(event.sender, snapshot);
   });
 }

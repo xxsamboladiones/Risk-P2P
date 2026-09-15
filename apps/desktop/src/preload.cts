@@ -1,4 +1,5 @@
 const { contextBridge, ipcRenderer } = require("electron") as typeof import("electron");
+const performanceMeasurementEnabled = Boolean(process.env.RISK_PERFORMANCE_REPORT_FILE?.trim());
 
 export type DesktopSource = {
   id: string;
@@ -246,4 +247,16 @@ contextBridge.exposeInMainWorld("desktop", {
     ipcRenderer.on("backend:status", listener);
     return () => ipcRenderer.removeListener("backend:status", listener);
   },
+  ...(performanceMeasurementEnabled ? {
+    onPerformanceRendererSnapshotRequest: (callback: () => void): (() => void) => {
+      const listener = () => callback();
+      ipcRenderer.on("performance:request-renderer-snapshot", listener);
+      return () => ipcRenderer.removeListener("performance:request-renderer-snapshot", listener);
+    },
+    reportPerformanceRendererSnapshot: (snapshot: {
+      longTaskCount: number;
+      longTaskDurationMs: number;
+      heapUsedBytes?: number;
+    }): Promise<void> => ipcRenderer.invoke("performance:renderer-snapshot", snapshot),
+  } : {}),
 });

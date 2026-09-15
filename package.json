@@ -11,6 +11,7 @@
     "build:backend:desktop": "node scripts/prepare-desktop-backend.mjs",
     "build:backend:desktop:debug": "node scripts/prepare-desktop-backend.mjs --debug",
     "build:desktop": "pnpm build:backend:desktop && pnpm build:web && pnpm --filter @risk/desktop build",
+    "performance:report": "node scripts/performance/summarize-report.mjs",
     "verify:build-env": "node scripts/verify-build-env.mjs",
     "verify:turn-config": "node scripts/verify-turn-config.mjs",
     "verify:migrations": "node scripts/verify-migration-integrity.mjs",

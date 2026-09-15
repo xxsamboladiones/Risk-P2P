@@ -46,6 +46,9 @@ interface Window {
     chooseScreenSource(): Promise<string | null>;
     selectScreenSource(sourceId: string): Promise<void>;
     setWindowFullscreen(enabled: boolean): Promise<{ fullscreen: boolean }>;
+    setPerformancePolicy(policy: {
+      chromiumBackgroundThrottlingAllowed: boolean;
+    }): Promise<void>;
     getBackendConfig(): Promise<RiskDesktopBackendConfig>;
     onGameModeStopped?(callback: () => void): () => void;
     getNetworkInterfaces(): Promise<RiskDesktopNetworkInterface[]>;

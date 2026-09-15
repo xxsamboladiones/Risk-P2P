@@ -2,6 +2,7 @@ import { BrowserWindow, globalShortcut, ipcMain, shell, type WebContents } from 
 import { networkInterfaces } from "node:os";
 import type { DesktopBackendManager } from "../backend.js";
 import { collectNetworkInterfaces } from "../network-interfaces.js";
+import { parseDesktopPerformancePolicy } from "../performance-policy.js";
 
 export type RendererPerformanceSnapshot = {
   longTaskCount: number;
@@ -73,5 +74,13 @@ export function registerDesktopIpc(
     const snapshot = readRendererPerformanceSnapshot(value);
     if (!snapshot) throw new Error("Métrica de desempenho do renderer inválida.");
     onRendererPerformanceSnapshot?.(event.sender, snapshot);
+  });
+
+  ipcMain.handle("performance:set-policy", async (event, value: unknown) => {
+    assertTrusted(event.sender.getURL());
+    const policy = parseDesktopPerformancePolicy(value);
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    if (!owner) throw new Error("Janela do Risk não encontrada.");
+    owner.webContents.setBackgroundThrottling(policy.chromiumBackgroundThrottlingAllowed);
   });
 }

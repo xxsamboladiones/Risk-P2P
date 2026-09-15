@@ -20,6 +20,7 @@ describe("fronteiras do processo Electron", () => {
       "dist/gpu.js",
       "dist/ipc/index.js",
       "dist/permissions.js",
+      "dist/performance-policy.js",
       "dist/protocol.js",
       "dist/screen-capture.js",
       "dist/tray.js",

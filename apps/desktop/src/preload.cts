@@ -18,6 +18,10 @@ export type DesktopBackendStatus = {
   message: string;
 };
 
+export type DesktopPerformancePolicy = {
+  chromiumBackgroundThrottlingAllowed: boolean;
+};
+
 export type DesktopNetworkInterface = {
   name: string;
   address: string;
@@ -234,6 +238,7 @@ contextBridge.exposeInMainWorld("desktop", {
   chooseScreenSource: (): Promise<string | null> => ipcRenderer.invoke("screen:choose"),
   selectScreenSource: (sourceId: string): Promise<void> => ipcRenderer.invoke("screen:select", sourceId),
   setWindowFullscreen: (enabled: boolean): Promise<{ fullscreen: boolean }> => ipcRenderer.invoke("window:fullscreen", enabled),
+  setPerformancePolicy: (policy: DesktopPerformancePolicy): Promise<void> => ipcRenderer.invoke("performance:set-policy", policy),
   getBackendConfig: (): Promise<DesktopBackendConfig> => ipcRenderer.invoke("backend:config"),
   onGameModeStopped: (callback: () => void): (() => void) => {
     const listener = () => callback();

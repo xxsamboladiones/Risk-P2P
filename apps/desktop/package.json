@@ -43,6 +43,7 @@
       "dist/ipc/index.js",
       "dist/network-interfaces.js",
       "dist/permissions.js",
+      "dist/performance-policy.js",
       "dist/performance-recorder.js",
       "dist/protocol.js",
       "dist/screen-capture.js",

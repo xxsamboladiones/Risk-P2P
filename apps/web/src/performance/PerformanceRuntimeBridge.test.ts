@@ -1,5 +1,8 @@
 import { expect, it } from "vitest";
-import { performanceSignalsFromUi } from "./PerformanceRuntimeBridge";
+import {
+  createDesktopPerformancePolicyBridge,
+  performanceSignalsFromUi,
+} from "./PerformanceRuntimeBridge";
 
 it("separates call presentation from critical activity", () => {
   expect(performanceSignalsFromUi({
@@ -24,4 +27,27 @@ it("separates call presentation from critical activity", () => {
       gameSessionActive: false,
     },
   });
+});
+
+it("sends the desktop permission only when its boolean value changes", () => {
+  const sent: Array<{ chromiumBackgroundThrottlingAllowed: boolean }> = [];
+  const bridge = createDesktopPerformancePolicyBridge(() => ({
+    setPerformancePolicy: async (policy) => { sent.push(policy); },
+  }));
+
+  bridge(true);
+  bridge(true);
+  bridge(false);
+  bridge(false);
+
+  expect(sent).toEqual([
+    { chromiumBackgroundThrottlingAllowed: true },
+    { chromiumBackgroundThrottlingAllowed: false },
+  ]);
+});
+
+it("treats a missing desktop policy API as a no-op", () => {
+  const bridge = createDesktopPerformancePolicyBridge(() => undefined);
+
+  expect(() => bridge(false)).not.toThrow();
 });

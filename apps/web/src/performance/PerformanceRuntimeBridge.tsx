@@ -1,4 +1,4 @@
-import { useEffect, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useSyncExternalStore } from "react";
 import { useRiskApplication } from "../application/ApplicationContext";
 import { useCallStore } from "../store";
 import type { PerformancePolicy, PerformanceSignals, RuntimeActivity } from "./policy";
@@ -37,6 +37,23 @@ const subscribeDocumentVisibility = (listener: () => void): (() => void) => {
   return () => document.removeEventListener("visibilitychange", listener);
 };
 
+type DesktopPerformancePolicyApi = {
+  setPerformancePolicy?(policy: {
+    chromiumBackgroundThrottlingAllowed: boolean;
+  }): Promise<void>;
+};
+
+export function createDesktopPerformancePolicyBridge(
+  resolveDesktop: () => DesktopPerformancePolicyApi | undefined = () => window.desktop,
+): (chromiumBackgroundThrottlingAllowed: boolean) => void {
+  let previousPermission: boolean | undefined;
+  return (chromiumBackgroundThrottlingAllowed) => {
+    if (previousPermission === chromiumBackgroundThrottlingAllowed) return;
+    previousPermission = chromiumBackgroundThrottlingAllowed;
+    void resolveDesktop()?.setPerformancePolicy?.({ chromiumBackgroundThrottlingAllowed });
+  };
+}
+
 export function usePerformancePolicy(): PerformancePolicy {
   const { performance } = useRiskApplication();
   return useSyncExternalStore(performance.subscribe, performance.getSnapshot);
@@ -51,7 +68,8 @@ export function PerformanceRuntimeBridge() {
     performanceActivity.subscribe,
     performanceActivity.getSnapshot,
   );
-  useSyncExternalStore(performance.subscribe, performance.getSnapshot);
+  const policy = useSyncExternalStore(performance.subscribe, performance.getSnapshot);
+  const desktopPerformancePolicyBridge = useMemo(createDesktopPerformancePolicyBridge, []);
 
   const gameSessionActive = Boolean(gameState.host || gameState.playing);
 
@@ -72,6 +90,13 @@ export function PerformanceRuntimeBridge() {
     gameSessionActive,
     performance,
     trackedActivity,
+  ]);
+
+  useEffect(() => {
+    desktopPerformancePolicyBridge(policy.chromiumBackgroundThrottlingAllowed);
+  }, [
+    desktopPerformancePolicyBridge,
+    policy.chromiumBackgroundThrottlingAllowed,
   ]);
 
   return null;

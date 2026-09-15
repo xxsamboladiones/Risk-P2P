@@ -14,6 +14,18 @@ describe("RuntimeActivityTracker", () => {
     expect(tracker.getSnapshot().transferActive).toBe(false);
   });
 
+  it("keeps activity true until every lease for the same key releases", () => {
+    const tracker = new RuntimeActivityTracker();
+    const releaseA = tracker.acquire("transferActive", "transfer-1");
+    const releaseB = tracker.acquire("transferActive", "transfer-1");
+
+    releaseA();
+    expect(tracker.getSnapshot().transferActive).toBe(true);
+
+    releaseB();
+    expect(tracker.getSnapshot().transferActive).toBe(false);
+  });
+
   it("does not notify for overlapping work that leaves an activity active", () => {
     const tracker = new RuntimeActivityTracker();
     const listener = vi.fn();

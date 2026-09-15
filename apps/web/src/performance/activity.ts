@@ -3,11 +3,11 @@ import type { RuntimeActivity } from "./policy";
 type ActivityKind = keyof RuntimeActivity;
 
 export class RuntimeActivityTracker {
-  private readonly keys: Record<ActivityKind, Set<string>> = {
-    callActive: new Set(),
-    transferActive: new Set(),
-    screenPublicationActive: new Set(),
-    gameSessionActive: new Set(),
+  private readonly keyCounts: Record<ActivityKind, Map<string, number>> = {
+    callActive: new Map(),
+    transferActive: new Map(),
+    screenPublicationActive: new Map(),
+    gameSessionActive: new Map(),
   };
 
   private snapshot: RuntimeActivity = {
@@ -27,16 +27,23 @@ export class RuntimeActivityTracker {
   };
 
   acquire(kind: ActivityKind, key: string): () => void {
-    const activityKeys = this.keys[kind];
-    const wasEmpty = activityKeys.size === 0;
-    activityKeys.add(key);
-    if (wasEmpty && activityKeys.size > 0) this.setActive(kind, true);
+    const keyCounts = this.keyCounts[kind];
+    const wasEmpty = keyCounts.size === 0;
+    keyCounts.set(key, (keyCounts.get(key) ?? 0) + 1);
+    if (wasEmpty) this.setActive(kind, true);
 
     let released = false;
     return () => {
       if (released) return;
       released = true;
-      if (!activityKeys.delete(key) || activityKeys.size > 0) return;
+      const remainingLeases = (keyCounts.get(key) ?? 1) - 1;
+      if (remainingLeases > 0) {
+        keyCounts.set(key, remainingLeases);
+        return;
+      }
+
+      keyCounts.delete(key);
+      if (keyCounts.size > 0) return;
       this.setActive(kind, false);
     };
   }

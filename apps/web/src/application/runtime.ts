@@ -16,7 +16,6 @@ import { RiskApplication } from "./RiskApplication";
 import { SessionService } from "./SessionService";
 
 const createSignaling = () => new SupabaseSignalingProvider();
-const createChat = () => new ChatController(createSignaling);
 
 const resilientDesktopInviteDependencies: InviteDependencies = {
   createSignaling,
@@ -43,6 +42,7 @@ const resilientDesktopInviteDependencies: InviteDependencies = {
 export function createRiskApplication(): RiskApplication {
   const performance = new PerformanceCoordinator();
   const performanceActivity = new RuntimeActivityTracker();
+  const createChat = () => new ChatController(createSignaling, performanceActivity);
 
   return new RiskApplication({
     gateway: api,

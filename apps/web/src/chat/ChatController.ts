@@ -23,6 +23,7 @@ import {
 } from "../services/protocol-compatibility";
 import type { LocalChatMessage, MessagePageOptions } from "../services/offline/chat-storage";
 import { loadRtcNetworkContext } from "../services/network/runtime";
+import { RuntimeActivityTracker } from "../performance/activity";
 import {
   applyGroupRevocationCertificate,
   getOrCreateLocalIdentity,
@@ -62,7 +63,7 @@ const missingSignaling = (): SignalingProvider => {
 export class ChatController {
   private signaling?: SignalingProvider;
   private transport?: MeshWebRTCTransport;
-  private readonly attachments = new ChatAttachmentService();
+  private readonly attachments: ChatAttachmentService;
   private readonly messages = new MessageService();
   private readonly outbox = new OutboxService();
   private readonly groups = new GroupChatService();
@@ -111,7 +112,12 @@ export class ChatController {
   private localTypingActive = false;
   private lastTypingSentAt = 0;
 
-  constructor(private readonly createSignaling: () => SignalingProvider = missingSignaling) {}
+  constructor(
+    private readonly createSignaling: () => SignalingProvider = missingSignaling,
+    activity: RuntimeActivityTracker = new RuntimeActivityTracker(),
+  ) {
+    this.attachments = new ChatAttachmentService(activity);
+  }
 
   history(channelId: string, options?: MessagePageOptions): Promise<LocalChatMessage[]> { return this.messages.history(channelId, options); }
 

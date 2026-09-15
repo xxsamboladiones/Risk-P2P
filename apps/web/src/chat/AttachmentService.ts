@@ -5,6 +5,7 @@ import {
 } from "../services/attachments/attachment-service";
 import { createAttachmentStorage } from "../services/attachments/desktop-storage";
 import type { StoredAttachmentRecord } from "../services/attachments/indexeddb-storage";
+import { RuntimeActivityTracker } from "../performance/activity";
 
 /**
  * Adapta o serviço de transferência P2P ao ciclo de vida de uma sessão de chat.
@@ -13,8 +14,11 @@ import type { StoredAttachmentRecord } from "../services/attachments/indexeddb-s
 export class ChatAttachmentService {
   private active?: P2PAttachmentService;
   private generation = 0;
+  private readonly transferReleases = new Map<string, () => void>();
   private readonly attachmentCallbacks = new Set<(record: StoredAttachmentRecord) => void>();
   private readonly progressCallbacks = new Set<(progress: AttachmentRuntimeState) => void>();
+
+  constructor(private readonly activity: RuntimeActivityTracker = new RuntimeActivityTracker()) {}
 
   async connect(
     transport: MeshWebRTCTransport,
@@ -31,11 +35,13 @@ export class ChatAttachmentService {
     service.addEventListener("attachment", (event) => {
       if (this.active !== service) return;
       const record = (event as CustomEvent<StoredAttachmentRecord>).detail;
+      this.observeTransferState(record.transferId, record.state);
       this.attachmentCallbacks.forEach((callback) => callback(record));
     });
     service.addEventListener("progress", (event) => {
       if (this.active !== service) return;
       const progress = (event as CustomEvent<AttachmentRuntimeState>).detail;
+      this.observeTransferState(progress.record.transferId, progress.record.state);
       this.progressCallbacks.forEach((callback) => callback(progress));
     });
     return this.generation;
@@ -45,9 +51,24 @@ export class ChatAttachmentService {
     if (expectedGeneration !== undefined && expectedGeneration !== this.generation) return;
     this.generation += 1;
     this.active = undefined;
+    this.transferReleases.forEach((release) => release());
+    this.transferReleases.clear();
   }
   isConnected(): boolean { return Boolean(this.active); }
   currentGeneration(): number { return this.generation; }
+
+  observeTransferState(id: string, state: StoredAttachmentRecord["state"]): void {
+    const active = state === "accepted"
+      || state === "queued"
+      || state === "transferring"
+      || state === "verifying";
+    if (active && !this.transferReleases.has(id)) {
+      this.transferReleases.set(id, this.activity.acquire("transferActive", id));
+    } else if (!active) {
+      this.transferReleases.get(id)?.();
+      this.transferReleases.delete(id);
+    }
+  }
 
   async history(channelId: string, isCurrentChannel: boolean): Promise<StoredAttachmentRecord[]> {
     if (this.active && isCurrentChannel) return this.active.history();

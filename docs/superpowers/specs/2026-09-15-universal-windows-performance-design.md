@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-15
 
-**Status:** Approved design
+**Status:** Approved design with review amendments
 
 **Primary platform:** Windows 10 and newer
 
@@ -54,13 +54,21 @@ An aggressive module rewrite is permitted only when profiling demonstrates that 
 
 ## Runtime States
 
-The coordinator exposes semantic states rather than raw device details:
+Lifecycle and media pressure are separate axes because a constrained call can be either visible or hidden. The coordinator exposes semantic values rather than raw device details:
 
 - `foreground`: the app is visible and interactive; normal quality and responsiveness take priority.
 - `foreground-call`: the call workspace is visible; media, diagnostics, and visible presentation remain active.
 - `background-call`: a call continues while its workspace or window is hidden; audio, signaling, publication, and required recovery remain active, while invisible presentation work is suspended.
 - `idle-hidden`: no call or active transfer requires foreground cadence; renderer UI work and non-urgent polling are paused or heavily coalesced while presence, messaging, and notifications remain functional.
-- `media-constrained`: sustained measurements show the machine cannot maintain the current publication profile; adaptive media policy may reduce the screen profile but no lower than 480p/30.
+
+Media pressure is an independent deterministic state:
+
+```typescript
+type ExecutionMode = "foreground" | "foreground-call" | "background-call" | "idle-hidden";
+type MediaPressure = "normal" | "warning" | "overloaded";
+```
+
+`mediaPressure: "overloaded"` means sustained measurements show that the machine cannot maintain the current publication profile. Adaptive media policy may reduce the screen profile but no lower than 480p/30.
 
 Returning to a more active state is event-driven. Deferred work is coalesced so focus restoration does not cause a burst of expired timers or repeated state refreshes.
 
@@ -76,19 +84,49 @@ The coordinator lives in a focused renderer runtime module and has a pure policy
 
 The Electron bridge exposes only aggregated values needed by the policy and never exposes arbitrary process inspection. Expensive metrics are sampled only while a scenario can use them, and all observers and timers have explicit cleanup.
 
-The coordinator emits a small immutable policy containing cadences and permissions such as whether hidden video presentation, voice visualization, diagnostics, and non-urgent synchronization should run. Consumers must not depend on threshold details.
+The coordinator emits a small immutable policy containing cadences and permissions such as whether hidden video presentation, visual voice activity, diagnostics, and non-urgent synchronization should run. Consumers must not depend on threshold details.
+
+### Policy ownership
+
+The coordinator is a pure policy engine. It owns signal normalization, counters, hysteresis, cooldowns, and the derivation of `PerformancePolicy`. It does not own or call feature implementations.
+
+It may produce decisions such as:
+
+```typescript
+{
+  mode: "background-call",
+  mediaPressure: "warning",
+  visualVoiceActivityEnabled: false,
+  hiddenVideoPresentationEnabled: false,
+  diagnosticsIntervalMs: 10_000,
+  backgroundThrottlingAllowed: false,
+  requestedScreenProfile: "720p30"
+}
+```
+
+It must never call `mesh.getStats()`, change a media track, stop a video element, mutate React state, invoke `CallController`, or control an Electron window directly. Mesh, media, React, and Electron adapters observe the policy and execute only their own responsibilities. This dependency direction prevents the coordinator from becoming another application controller.
 
 If a signal or browser API is unavailable, the policy remains at the normal-quality state. Measurement failure never stops a call, restarts a transmission, or silently disables a feature.
 
 ## Stability and Hysteresis
 
-Media adaptation requires sustained evidence rather than a single slow frame or network sample. The policy reduces resource demand after a short consecutive overload window and recovers only after a longer stable window. Cooldowns prevent profile oscillation.
+Media adaptation requires sustained evidence rather than a single slow frame or network sample. The pure state keeps `overloadSamples`, `recoverySamples`, `lastTransitionAt`, and `cooldownUntil`. Missing samples preserve the current profile and cannot independently trigger a transition.
+
+The initial deterministic cadence is one aggregate sample every two seconds while screen publication is active:
+
+- two consecutive bad samples move pressure from `normal` to `warning` without changing profile;
+- four consecutive bad samples move pressure to `overloaded` and reduce exactly one profile rung;
+- fifteen consecutive healthy samples permit recovery by exactly one profile rung;
+- every profile change starts a twenty-second cooldown during which no further profile change occurs;
+- a healthy sample before overload resets `overloadSamples`, while a bad sample during recovery resets `recoverySamples`.
+
+Benchmark evidence may tune the counts, cadence, and cooldown before release, but their named state and one-rung transition model remain part of the architecture and test contract.
 
 Adaptation follows the current profile's frame-rate family:
 
 - ordinary 30 FPS sharing: 1080p/30 to 720p/30 to 480p/30;
 - an explicitly selected 720p/30 profile may reduce only to 480p/30;
-- game mode or an explicitly selected 60 FPS profile retains 60 FPS while capacity permits, then moves to the best existing lower-cost profile consistent with game-mode policy; the universal overload floor remains 480p/30;
+- game mode and explicitly selected 60 FPS sharing use the exact ladder 1080p/60 to 720p/60 to 480p/60 to 480p/30;
 - camera adaptation remains governed by existing WebRTC behavior unless profiling identifies it as a material bottleneck.
 
 The last valid publication profile remains active if applying a new profile fails. Failures are logged in diagnostics without interrupting media.
@@ -136,12 +174,19 @@ The packaged Windows application must be tested because browser development mode
 
 ## Media and WebRTC Work
 
-The call pipeline separates required transport work from optional presentation and diagnostics:
+The call pipeline separates required transport work from optional presentation and diagnostics. Voice activity has two explicit roles:
+
+- semantic VAD is an application-level signal that may drive active-speaker selection, prioritization, statistics, accessibility, or future call logic;
+- visual VAD exists only to render speaking borders and animations.
+
+Current code uses VAD only for visual speaking classes, but the interface preserves the distinction. `visualVoiceActivityEnabled: false` stops analyzers created only for presentation. It must not disable a present or future semantic VAD consumer.
+
+The remaining media rules are:
 
 - WebRTC statistics collection uses a shared cadence and a single sample per peer per interval;
 - diagnostics views consume cached summaries instead of triggering their own collections;
 - inactive or closed calls perform no periodic stats collection;
-- voice activity runs only for audible, presented participants and stops for hidden tiles;
+- visual voice activity runs only for audible, presented participants and stops for hidden tiles;
 - remote video elements that cannot be seen stop presentation work without disabling the underlying audio or connection;
 - local camera and screen previews detach or pause when hidden while publication continues;
 - publication parameter updates are deduplicated and applied only when the requested effective profile changes;
@@ -178,7 +223,7 @@ The implementation adds a repeatable benchmark harness with comparable scenarios
 6. a minimized call;
 7. screen publication at 1080p/30 with ordinary desktop activity;
 8. constrained screen publication demonstrating 1080p/30 to 720p/30 to 480p/30 adaptation and recovery;
-9. game mode using its existing high-frame-rate policy.
+9. game mode demonstrating 1080p/60 to 720p/60 to 480p/60 to 480p/30 adaptation and recovery.
 
 The harness records, where supported:
 
@@ -192,11 +237,11 @@ The harness records, where supported:
 
 Acceptance is based on these invariants:
 
-- hidden idle performs no periodic UI, voice-activity, or call-diagnostic work;
+- hidden idle performs no periodic UI, visual voice-activity, or call-diagnostic work;
 - no call means no periodic WebRTC statistics collection;
 - minimized calls retain required transport/audio behavior while invisible video presentation and voice visualization stop;
 - initial feature code excludes call, game, attachment-gallery, and RNNoise implementations until needed;
-- the adaptive screen-share policy never selects less than 854x480 at 30 FPS;
+- the adaptive screen-share policy never selects less than 854x480 at 30 FPS, and 60 FPS sharing follows the defined four-rung ladder;
 - normal visible quality and styling remain unchanged when the machine is not constrained;
 - all existing functional test suites and packaged Windows verification pass;
 - before/after reports use the same build type, scenario script, duration, and machine, and do not claim a CPU or memory improvement without measured evidence.
@@ -207,9 +252,9 @@ Numerical CPU and memory reduction percentages are reported from the target Wind
 
 Implementation uses test-driven development. Each behavior is introduced by a failing test and verified independently before integration.
 
-- Pure policy tests cover state transitions, missing metrics, consecutive overload samples, cooldowns, recovery, explicit 60 FPS selection, and the 480p/30 floor.
+- Pure policy tests cover lifecycle and pressure as independent axes, missing metrics, warning state, consecutive overload samples, cooldowns, one-rung transitions, recovery, the exact 60 FPS ladder, and the 480p/30 floor.
 - Lifecycle tests cover visibility changes, minimized workspace behavior, active calls, transfers, cleanup, and focus restoration.
-- React tests prove that diagnostic updates do not rerender unrelated grids/timelines and that hidden media presentation and voice observation stop.
+- React tests prove that diagnostic updates do not rerender unrelated grids/timelines, hidden media presentation stops, visual VAD stops, and any semantic VAD consumer remains active.
 - Loading tests verify that feature modules are absent from the eager graph and load successfully at their boundaries.
 - RTC tests count stats calls, parameter changes, and track continuity during adaptation.
 - Chat tests cover long-history windowing, scroll anchoring, message ordering, replies, reactions, pins, and attachment cleanup.
@@ -220,18 +265,43 @@ Performance tests supplement functional tests; they do not replace them.
 
 ## Delivery Sequence
 
-1. Add measurement primitives and capture the reproducible baseline without changing runtime policy.
-2. Add the pure coordinator and lifecycle states behind current behavior.
-3. Suspend invisible work and consolidate recurring diagnostics.
-4. Isolate React render boundaries and stabilize media/state identities.
-5. Introduce feature-level lazy loading and deferred asset initialization.
-6. Optimize long chat histories, attachments, and non-urgent persistence work.
-7. Add media-pressure hysteresis and the 480p/30 floor.
-8. Apply dynamic Electron/Windows lifecycle and GPU safeguards.
-9. Run complete functional, packaged, and target-machine performance comparisons.
-10. Profile remaining bottlenecks and use an isolated approach-3 replacement only when the 25 percent criterion is met.
+Implementation is divided into four independently measurable integration units. Each unit records its own before/after report so later gains are attributable rather than combined into one unexplained result.
 
-Each step is independently reviewable and must preserve the user's existing uncommitted changes. Commits stage only files belonging to the performance work.
+### PR 1: Measurement and lifecycle
+
+- add benchmark primitives and capture the reproducible baseline without changing behavior;
+- add the pure coordinator, independent execution/pressure state, and policy ownership boundary;
+- connect document and Electron visibility;
+- implement `background-call` and `idle-hidden` lifecycle decisions;
+- verify packaged Windows minimize, tray, restore, notification, call, and transfer behavior.
+
+### PR 2: Low-risk hot-path reductions
+
+- split visual VAD from the semantic contract and suspend only visual analysis;
+- consolidate `getStats()` collection and expose cached summaries;
+- suspend hidden video presentation and local previews while publication continues;
+- reuse stable `MediaStream` wrappers and deduplicate media parameter updates;
+- narrow React subscriptions and isolate diagnostics from grids and timelines;
+- measure each change group independently inside the PR benchmark report.
+
+### PR 3: Loading and retained memory
+
+- introduce call, game, attachment-gallery, settings, and optional processing lazy boundaries;
+- split `CallWorkspace` and `HomeView` only where profiling proves a render or retention boundary;
+- virtualize long chat histories with stable anchoring;
+- load/decode attachments and call assets on demand and release them deterministically;
+- optimize non-urgent persistence batching only where acknowledgement and crash semantics remain equivalent.
+
+### PR 4: Adaptive media and Windows runtime
+
+- implement `MediaPressure`, counters, hysteresis, cooldown, and one-rung transitions;
+- add 480p/30 and 480p/60 profiles and the exact 30 FPS and 60 FPS ladders;
+- connect cached WebRTC/encode pressure without duplicating stats collection;
+- apply dynamic Electron background behavior and evidence-based GPU fallback;
+- run complete functional, packaged, and target-machine comparisons;
+- profile remaining bottlenecks and use an isolated approach-3 replacement only when the 25 percent criterion is met.
+
+Each PR is independently reviewable and must preserve the user's existing uncommitted changes. Commits stage only files belonging to the performance work. A later PR cannot claim gains measured only after combining unrelated later changes.
 
 ## Risks and Mitigations
 

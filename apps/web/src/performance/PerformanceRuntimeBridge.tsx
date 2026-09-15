@@ -58,15 +58,18 @@ export function observeDesktopWindowVisibility(
 
   let disposed = false;
   let eventRevision = 0;
+  const initialRevision = eventRevision;
   const unsubscribe = desktop.onWindowVisibilityChanged((visible) => {
     if (disposed || typeof visible !== "boolean") return;
     eventRevision += 1;
     onVisibility(visible);
   });
-  if (typeof initialDocumentVisibility === "boolean") {
+  if (
+    eventRevision === initialRevision
+    && typeof initialDocumentVisibility === "boolean"
+  ) {
     onVisibility(initialDocumentVisibility);
   }
-  const initialRevision = eventRevision;
   void desktop.getWindowVisibility().then((visible) => {
     if (
       disposed

@@ -102,6 +102,37 @@ it("uses native hide and restore events without letting a late initial read over
   expect(unsubscribe).toHaveBeenCalledOnce();
 });
 
+it("keeps a native event delivered synchronously during subscription authoritative", async () => {
+  const coordinator = new PerformanceCoordinator();
+  coordinator.update({
+    documentVisible: true,
+    callWorkspaceVisible: true,
+    activity: {
+      callActive: true,
+      transferActive: false,
+      screenPublicationActive: false,
+      gameSessionActive: false,
+    },
+  });
+
+  const stop = observeDesktopWindowVisibility(() => ({
+    getWindowVisibility: async () => true,
+    onWindowVisibilityChanged: (callback) => {
+      callback(false);
+      return () => {};
+    },
+  }), (visible) => coordinator.update({ documentVisible: visible }), true);
+
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(coordinator.getSnapshot()).toMatchObject({
+    mode: "background-call",
+    chromiumBackgroundThrottlingAllowed: false,
+  });
+  stop();
+});
+
 it("keeps document visibility when the desktop visibility API is missing", () => {
   const observed: boolean[] = [];
   const stop = observeDesktopWindowVisibility(() => undefined, (visible) => observed.push(visible));

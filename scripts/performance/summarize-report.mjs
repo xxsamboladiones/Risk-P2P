@@ -15,7 +15,7 @@ function validateReport(value, source) {
     || (renderer.heapUsedBytes !== undefined && !isNumber(renderer.heapUsedBytes))) {
     throw new Error(`${source}: renderer metrics are invalid.`);
   }
-  if (!Array.isArray(value.processes) || !value.processes.every((sample) => (
+  if (!Array.isArray(value.processes) || value.processes.length === 0 || !value.processes.every((sample) => (
     sample && isNumber(sample.cpuPercent) && isNumber(sample.workingSetBytes)
   ))) throw new Error(`${source}: process metrics are invalid.`);
   if (!value.counters || typeof value.counters !== "object"
@@ -34,7 +34,6 @@ async function readReport(file) {
 }
 
 function mean(samples, key) {
-  if (samples.length === 0) return 0;
   return samples.reduce((total, sample) => total + sample[key], 0) / samples.length;
 }
 

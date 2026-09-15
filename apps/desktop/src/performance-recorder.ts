@@ -40,6 +40,8 @@ export type PerformanceRecorderOptions = {
   getAppMetrics: () => readonly AppMetric[];
   requestRendererSnapshot: () => Promise<RendererSnapshot>;
   writeFile: (path: string, contents: string) => Promise<void>;
+  onComplete?: (report: RiskPerformanceReportV1) => void;
+  onError?: (error: Error) => void;
   setInterval?: (callback: () => void, delayMs: number) => unknown;
   clearInterval?: (timer: unknown) => void;
   setTimeout?: (callback: () => void, delayMs: number) => unknown;
@@ -80,6 +82,7 @@ export function isRiskPerformanceReportV1(value: unknown): value is RiskPerforma
     || !isFiniteNumber(report.durationMs)
     || !isRendererSnapshot(report.renderer)
     || !Array.isArray(report.processes)
+    || report.processes.length === 0
     || !report.processes.every(isProcessAggregate)
     || !report.counters
     || typeof report.counters !== "object") return false;
@@ -114,7 +117,12 @@ export class PerformanceRecorder {
     const setSamplingInterval = this.options.setInterval ?? setInterval;
     const setFinishTimeout = this.options.setTimeout ?? setTimeout;
     this.samplingTimer = setSamplingInterval(() => this.sample(), 1_000);
-    this.finishTimer = setFinishTimeout(() => { void this.finish(); }, this.options.durationMs);
+    this.finishTimer = setFinishTimeout(() => {
+      this.finish().then(
+        (report) => this.options.onComplete?.(report),
+        (error: unknown) => this.options.onError?.(error instanceof Error ? error : new Error(String(error))),
+      );
+    }, this.options.durationMs);
   }
 
   finish(): Promise<RiskPerformanceReportV1> {
@@ -133,15 +141,9 @@ export class PerformanceRecorder {
     }
     this.samplingTimer = undefined;
     this.finishTimer = undefined;
-    let renderer: RendererSnapshot = { longTaskCount: 0, longTaskDurationMs: 0 };
-    let rendererSnapshotUnavailable = 0;
-    try {
-      const received = await this.options.requestRendererSnapshot();
-      if (isRendererSnapshot(received)) renderer = received;
-      else rendererSnapshotUnavailable = 1;
-    } catch {
-      rendererSnapshotUnavailable = 1;
-    }
+    if (this.processSamples.length === 0) throw new Error("Nenhuma amostra de processo foi coletada.");
+    const renderer = await this.options.requestRendererSnapshot();
+    if (!isRendererSnapshot(renderer)) throw new Error("Métrica de desempenho do renderer inválida.");
     const report: RiskPerformanceReportV1 = {
       schemaVersion: 1,
       scenario: this.options.scenario,
@@ -151,7 +153,6 @@ export class PerformanceRecorder {
       processes: this.processSamples,
       counters: {
         processSampleCount: this.processSamples.length,
-        ...(rendererSnapshotUnavailable === 1 ? { rendererSnapshotUnavailable } : {}),
       },
     };
     await this.options.writeFile(this.options.reportFile, JSON.stringify(report, null, 2));

@@ -17,7 +17,7 @@ import {
 import { ScreenCaptureController } from "./screen-capture.js";
 import { createApplicationTray, isTrayAvailable } from "./tray.js";
 import { createMainWindow } from "./window.js";
-import { PerformanceRecorder, type RiskPerformanceReportV1 } from "./performance-recorder.js";
+import { PerformanceRecorder } from "./performance-recorder.js";
 import type { RendererPerformanceSnapshot } from "./ipc/index.js";
 
 configurePlatformRuntime();
@@ -71,6 +71,10 @@ function acceptRendererPerformanceSnapshot(sender: Electron.WebContents, snapsho
   resolve(snapshot);
 }
 
+function requestRendererPerformanceCaptureStart(window: BrowserWindow): void {
+  window.webContents.send("performance:start-renderer-capture");
+}
+
 function startPerformanceCapture(): void {
   if (!PERFORMANCE_REPORT_FILE || activePerformanceRecorder) return;
   const window = mainWindow;
@@ -84,18 +88,18 @@ function startPerformanceCapture(): void {
     getAppMetrics: () => app.getAppMetrics(),
     requestRendererSnapshot: () => requestRendererPerformanceSnapshot(window),
     writeFile: async (file, contents) => writeFile(file, contents, "utf8"),
+    onComplete: (report) => {
+      console.info("Relatório de desempenho do Risk gravado", { scenario: report.scenario, reportFile: PERFORMANCE_REPORT_FILE });
+      if (activePerformanceRecorder === recorder) activePerformanceRecorder = undefined;
+    },
+    onError: (error) => {
+      console.error("Falha ao gravar relatório de desempenho do Risk", error);
+      if (activePerformanceRecorder === recorder) activePerformanceRecorder = undefined;
+    },
   });
   activePerformanceRecorder = recorder;
+  requestRendererPerformanceCaptureStart(window);
   recorder.start();
-  setTimeout(() => {
-    void recorder.finish()
-      .then((report: RiskPerformanceReportV1) => console.info("Relatório de desempenho do Risk gravado", {
-        scenario: report.scenario,
-        reportFile: PERFORMANCE_REPORT_FILE,
-      }))
-      .catch((error) => console.error("Falha ao gravar relatório de desempenho do Risk", error))
-      .finally(() => { if (activePerformanceRecorder === recorder) activePerformanceRecorder = undefined; });
-  }, PERFORMANCE_DURATION_MS + 100);
 }
 
 function registerPerformanceMeasurementShortcut(): void {

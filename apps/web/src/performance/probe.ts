@@ -9,6 +9,7 @@ export type RendererPerformanceProbeOptions = {
 };
 
 export type RendererPerformanceBridge = {
+  onStartCapture: (callback: () => void) => () => void;
   onRequestSnapshot: (callback: () => void) => () => void;
   reportSnapshot: (snapshot: RendererPerformanceSnapshot) => Promise<void>;
 };
@@ -23,6 +24,11 @@ export class RendererPerformanceProbe {
   observeLongTask(durationMs: number): void {
     this.longTaskCount += 1;
     this.longTaskDurationMs += durationMs;
+  }
+
+  startCapture(): void {
+    this.longTaskCount = 0;
+    this.longTaskDurationMs = 0;
   }
 
   startLongTaskObserver(): () => void {
@@ -56,11 +62,13 @@ export class RendererPerformanceProbe {
 export function installRendererPerformanceProbe(bridge: RendererPerformanceBridge): () => void {
   const probe = new RendererPerformanceProbe();
   const stopObserving = probe.startLongTaskObserver();
+  const stopCaptureStarts = bridge.onStartCapture(() => probe.startCapture());
   const stopRequests = bridge.onRequestSnapshot(() => {
     void bridge.reportSnapshot(probe.snapshot());
   });
   return () => {
     stopRequests();
+    stopCaptureStarts();
     stopObserving();
   };
 }

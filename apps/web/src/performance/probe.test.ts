@@ -34,8 +34,13 @@ describe("RendererPerformanceProbe", () => {
 
   it("returns the accumulated renderer snapshot when the desktop recorder requests it", async () => {
     let requested: (() => void) | undefined;
+    let started: (() => void) | undefined;
     const received: unknown[] = [];
     const stop = installRendererPerformanceProbe({
+      onStartCapture: (callback) => {
+        started = callback;
+        return () => undefined;
+      },
       onRequestSnapshot: (callback) => {
         requested = callback;
         return () => undefined;
@@ -47,6 +52,42 @@ describe("RendererPerformanceProbe", () => {
     await Promise.resolve();
 
     expect(received).toEqual([{ longTaskCount: 0, longTaskDurationMs: 0 }]);
+    stop();
+  });
+
+  it("resets preparation measurements when a capture starts", async () => {
+    let notify: ((entries: PerformanceEntryList) => void) | undefined;
+    let started: (() => void) | undefined;
+    let requested: (() => void) | undefined;
+    const received: unknown[] = [];
+    vi.stubGlobal("PerformanceObserver", class {
+      constructor(callback: PerformanceObserverCallback) {
+        notify = (entries) => callback({ getEntries: () => entries } as unknown as PerformanceObserverEntryList, this as PerformanceObserver);
+      }
+
+      observe(): void {}
+      disconnect(): void {}
+      takeRecords(): PerformanceEntryList { return []; }
+    });
+    const stop = installRendererPerformanceProbe({
+      onStartCapture: (callback) => {
+        started = callback;
+        return () => undefined;
+      },
+      onRequestSnapshot: (callback) => {
+        requested = callback;
+        return () => undefined;
+      },
+      reportSnapshot: async (snapshot) => { received.push(snapshot); },
+    });
+
+    notify!([{ duration: 72 } as PerformanceEntry]);
+    started!();
+    notify!([{ duration: 51 } as PerformanceEntry]);
+    requested!();
+    await Promise.resolve();
+
+    expect(received).toEqual([{ longTaskCount: 1, longTaskDurationMs: 51 }]);
     stop();
   });
 });

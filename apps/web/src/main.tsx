@@ -13,8 +13,11 @@ import { installRendererPerformanceProbe } from "./performance/probe";
 
 initializeTheme();
 
-if (window.desktop?.onPerformanceRendererSnapshotRequest && window.desktop.reportPerformanceRendererSnapshot) {
+if (window.desktop?.onPerformanceRendererCaptureStart
+  && window.desktop.onPerformanceRendererSnapshotRequest
+  && window.desktop.reportPerformanceRendererSnapshot) {
   installRendererPerformanceProbe({
+    onStartCapture: window.desktop.onPerformanceRendererCaptureStart,
     onRequestSnapshot: window.desktop.onPerformanceRendererSnapshotRequest,
     reportSnapshot: window.desktop.reportPerformanceRendererSnapshot,
   });

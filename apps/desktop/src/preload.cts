@@ -248,6 +248,11 @@ contextBridge.exposeInMainWorld("desktop", {
     return () => ipcRenderer.removeListener("backend:status", listener);
   },
   ...(performanceMeasurementEnabled ? {
+    onPerformanceRendererCaptureStart: (callback: () => void): (() => void) => {
+      const listener = () => callback();
+      ipcRenderer.on("performance:start-renderer-capture", listener);
+      return () => ipcRenderer.removeListener("performance:start-renderer-capture", listener);
+    },
     onPerformanceRendererSnapshotRequest: (callback: () => void): (() => void) => {
       const listener = () => callback();
       ipcRenderer.on("performance:request-renderer-snapshot", listener);

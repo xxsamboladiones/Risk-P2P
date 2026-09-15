@@ -62,6 +62,41 @@ describe("PerformanceRecorder", () => {
     })).toBe(false);
   });
 
+  it("rejects a report without any process samples", () => {
+    expect(isRiskPerformanceReportV1({
+      schemaVersion: 1,
+      scenario: "foreground-idle-home",
+      buildVersion: "0.2.1",
+      durationMs: 60_000,
+      renderer: { longTaskCount: 0, longTaskDurationMs: 0 },
+      processes: [],
+      counters: { processSampleCount: 0 },
+    })).toBe(false);
+  });
+
+  it("rejects instead of writing a zero renderer snapshot when the renderer is unavailable", async () => {
+    let wrote = false;
+    const recorder = new PerformanceRecorder({
+      reportFile: "C:/reports/home-idle.json",
+      scenario: "foreground-idle-home",
+      buildVersion: "0.2.1",
+      durationMs: 60_000,
+      now: () => 1_000,
+      getAppMetrics: () => [{
+        type: "Browser",
+        cpu: { percentCPUUsage: 4 },
+        memory: { workingSetSize: 100 },
+      }],
+      requestRendererSnapshot: async () => { throw new Error("renderer unavailable"); },
+      writeFile: async () => { wrote = true; },
+    });
+
+    recorder.sample();
+
+    await expect(recorder.finish()).rejects.toThrow("renderer unavailable");
+    expect(wrote).toBe(false);
+  });
+
   it("samples once per scheduled second while a capture is active", async () => {
     let tick: (() => void) | undefined;
     let captured: string | undefined;
@@ -92,5 +127,39 @@ describe("PerformanceRecorder", () => {
     await recorder.finish();
 
     expect(JSON.parse(captured!).processes).toEqual([{ cpuPercent: 7, workingSetBytes: 204_800 }]);
+  });
+
+  it("reports an automatic completion failure from the recorder timer", async () => {
+    let complete: (() => void) | undefined;
+    const errors: Error[] = [];
+    const recorder = new PerformanceRecorder({
+      reportFile: "C:/reports/home-idle.json",
+      scenario: "foreground-idle-home",
+      buildVersion: "0.2.1",
+      durationMs: 60_000,
+      now: () => 1_000,
+      getAppMetrics: () => [{
+        type: "Browser",
+        cpu: { percentCPUUsage: 4 },
+        memory: { workingSetSize: 100 },
+      }],
+      requestRendererSnapshot: async () => ({ longTaskCount: 0, longTaskDurationMs: 0 }),
+      writeFile: async () => { throw new Error("disk full"); },
+      onError: (error) => { errors.push(error); },
+      setInterval: () => 1,
+      clearInterval: () => undefined,
+      setTimeout: (callback) => {
+        complete = callback;
+        return 2;
+      },
+      clearTimeout: () => undefined,
+    });
+
+    recorder.sample();
+    recorder.start();
+    complete!();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(errors.map((error) => error.message)).toEqual(["disk full"]);
   });
 });

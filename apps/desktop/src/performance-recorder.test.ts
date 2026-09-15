@@ -129,6 +129,38 @@ describe("PerformanceRecorder", () => {
     expect(JSON.parse(captured!).processes).toEqual([{ cpuPercent: 7, workingSetBytes: 204_800 }]);
   });
 
+  it("rejects a capture whose scheduled sample has no Browser or Tab metrics", async () => {
+    let tick: (() => void) | undefined;
+    let wrote = false;
+    const recorder = new PerformanceRecorder({
+      reportFile: "C:/reports/home-idle.json",
+      scenario: "foreground-idle-home",
+      buildVersion: "0.2.1",
+      durationMs: 60_000,
+      now: () => 1_000,
+      getAppMetrics: () => [{
+        type: "GPU",
+        cpu: { percentCPUUsage: 8 },
+        memory: { workingSetSize: 300 },
+      }],
+      requestRendererSnapshot: async () => ({ longTaskCount: 0, longTaskDurationMs: 0 }),
+      writeFile: async () => { wrote = true; },
+      setInterval: (callback) => {
+        tick = callback;
+        return 1;
+      },
+      clearInterval: () => undefined,
+      setTimeout: () => 2,
+      clearTimeout: () => undefined,
+    });
+
+    recorder.start();
+    tick!();
+
+    await expect(recorder.finish()).rejects.toThrow("Nenhuma amostra de processo foi coletada.");
+    expect(wrote).toBe(false);
+  });
+
   it("reports an automatic completion failure from the recorder timer", async () => {
     let complete: (() => void) | undefined;
     const errors: Error[] = [];

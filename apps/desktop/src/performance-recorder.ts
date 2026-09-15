@@ -70,7 +70,7 @@ function isRendererSnapshot(value: unknown): value is RendererSnapshot {
 function isProcessAggregate(value: unknown): value is ProcessAggregate {
   if (!value || typeof value !== "object") return false;
   const metric = value as Record<string, unknown>;
-  return isFiniteNumber(metric.cpuPercent) && isFiniteNumber(metric.workingSetBytes);
+  return isFiniteNumber(metric.cpuPercent) && isFiniteNumber(metric.workingSetBytes) && metric.workingSetBytes > 0;
 }
 
 export function isRiskPerformanceReportV1(value: unknown): value is RiskPerformanceReportV1 {
@@ -109,6 +109,7 @@ export class PerformanceRecorder {
     const samples = this.options.getAppMetrics()
       .map(toProcessSample)
       .filter((sample): sample is ProcessSample => sample !== null);
+    if (samples.length === 0) return;
     this.processSamples.push(aggregateProcessSamples(samples));
   }
 

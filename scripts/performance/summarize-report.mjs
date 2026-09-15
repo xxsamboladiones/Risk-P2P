@@ -16,7 +16,7 @@ function validateReport(value, source) {
     throw new Error(`${source}: renderer metrics are invalid.`);
   }
   if (!Array.isArray(value.processes) || value.processes.length === 0 || !value.processes.every((sample) => (
-    sample && isNumber(sample.cpuPercent) && isNumber(sample.workingSetBytes)
+    sample && isNumber(sample.cpuPercent) && isNumber(sample.workingSetBytes) && sample.workingSetBytes > 0
   ))) throw new Error(`${source}: process metrics are invalid.`);
   if (!value.counters || typeof value.counters !== "object"
     || !Object.values(value.counters).every(isNumber)) throw new Error(`${source}: counters are invalid.`);

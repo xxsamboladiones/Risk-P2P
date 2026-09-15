@@ -42,3 +42,28 @@ test("rejects an empty process sample report instead of summarizing it as zero a
   assert.equal(result.code, 1);
   assert.match(result.stderr, /process metrics are invalid/);
 });
+
+test("rejects a zero working-set process sample instead of summarizing an incomplete capture", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "risk-performance-"));
+  const valid = {
+    schemaVersion: 1,
+    scenario: "foreground-idle-home",
+    buildVersion: "0.2.1",
+    durationMs: 60_000,
+    renderer: { longTaskCount: 0, longTaskDurationMs: 0 },
+    processes: [{ cpuPercent: 4, workingSetBytes: 102_400 }],
+    counters: { processSampleCount: 1 },
+  };
+  const incomplete = { ...valid, processes: [{ cpuPercent: 0, workingSetBytes: 0 }] };
+  const before = path.join(directory, "before.json");
+  const after = path.join(directory, "after.json");
+  await Promise.all([
+    writeFile(before, JSON.stringify(valid)),
+    writeFile(after, JSON.stringify(incomplete)),
+  ]);
+
+  const result = await runSummary(before, after);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /process metrics are invalid/);
+});

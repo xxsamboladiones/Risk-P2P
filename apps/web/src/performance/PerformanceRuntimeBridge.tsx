@@ -96,13 +96,25 @@ export function createDesktopPerformancePolicyBridge(
   };
 }
 
+export function createForegroundResumeBridge(
+  resume: () => Promise<void>,
+): (visible: boolean | undefined) => void {
+  let previousVisibility: boolean | undefined;
+  return (visible) => {
+    if (visible === undefined) return;
+    const previous = previousVisibility;
+    previousVisibility = visible;
+    if (previous === false && visible) void resume().catch(() => undefined);
+  };
+}
+
 export function usePerformancePolicy(): PerformancePolicy {
   const { performance } = useRiskApplication();
   return useSyncExternalStore(performance.subscribe, performance.getSnapshot);
 }
 
 export function PerformanceRuntimeBridge() {
-  const { call, performance, performanceActivity } = useRiskApplication();
+  const { backgroundChats, call, performance, performanceActivity } = useRiskApplication();
   const documentVisible = useSyncExternalStore(subscribeDocumentVisibility, getDocumentVisible);
   const desktopVisibilityAvailable = Boolean(
     window.desktop?.getWindowVisibility && window.desktop.onWindowVisibilityChanged,
@@ -116,6 +128,10 @@ export function PerformanceRuntimeBridge() {
   );
   const policy = useSyncExternalStore(performance.subscribe, performance.getSnapshot);
   const desktopPerformancePolicyBridge = useMemo(createDesktopPerformancePolicyBridge, []);
+  const foregroundResumeBridge = useMemo(
+    () => createForegroundResumeBridge(() => backgroundChats.resume()),
+    [backgroundChats],
+  );
 
   const gameSessionActive = Boolean(gameState.host || gameState.playing);
   const windowVisible = desktopVisibilityAvailable ? nativeWindowVisible : documentVisible;
@@ -152,6 +168,14 @@ export function PerformanceRuntimeBridge() {
     desktopPerformancePolicyBridge,
     policy.chromiumBackgroundThrottlingAllowed,
   ]);
+
+  useEffect(() => {
+    document.documentElement.dataset.riskExecutionMode = policy.mode;
+  }, [policy.mode]);
+
+  useEffect(() => {
+    foregroundResumeBridge(windowVisible);
+  }, [foregroundResumeBridge, windowVisible]);
 
   return null;
 }

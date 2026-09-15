@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Check, Clipboard, Link2, X } from "lucide-react";
 import { useRiskApplication } from "../application/ApplicationContext";
+import { usePerformancePolicy } from "../performance/PerformanceRuntimeBridge";
+import { PolicyTimer } from "../performance/policy-timer";
 import { normalizeRiskInviteCode, type InviteType } from "../services/invites/code";
 import type { IncomingInviteRequest, InviteSnapshot, InviteService } from "../services/invites/service";
 import type { PublicGroupMetadata } from "../services/offline/social-storage";
@@ -9,18 +11,19 @@ export function P2PInvitePanel({ type, token, displayName, group, initialMode = 
   type: InviteType; token: string; displayName: string; group?: PublicGroupMetadata; initialMode?: "create" | "join"; onComplete?(): void;
 }) {
   const { invites } = useRiskApplication();
+  const policy = usePerformancePolicy();
   const [mode, setMode] = useState<"create" | "join">(initialMode);
   const [code, setCode] = useState(""); const [state, setState] = useState<InviteSnapshot>();
   const [request, setRequest] = useState<IncomingInviteRequest>(); const [error, setError] = useState("");
   const [copied, setCopied] = useState(false); const [now, setNow] = useState(Date.now());
   const [busy, setBusy] = useState(false);
   const service = useRef<InviteService | undefined>(undefined);
+  const expiryTimer = useRef<PolicyTimer | undefined>(undefined);
   const completedInvite = useRef<string | undefined>(undefined);
+  if (!expiryTimer.current) expiryTimer.current = new PolicyTimer(() => setNow(Date.now()));
 
   useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
     return () => {
-      window.clearInterval(timer);
       const current = service.current;
       service.current = undefined;
       // Depois de accepted/rejected o InviteService ainda mantém o DataChannel
@@ -32,6 +35,12 @@ export function P2PInvitePanel({ type, token, displayName, group, initialMode = 
       void current?.cancel(false);
     };
   }, []);
+
+  useEffect(() => {
+    const timer = expiryTimer.current;
+    timer?.setCadence(policy.mode === "idle-hidden" ? null : 1_000);
+    return () => timer?.stop();
+  }, [policy.mode]);
 
   useEffect(() => {
     if (state?.status !== "accepted") return;

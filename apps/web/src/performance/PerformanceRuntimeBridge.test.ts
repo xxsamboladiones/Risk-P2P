@@ -2,6 +2,7 @@ import { expect, it, vi } from "vitest";
 import { PerformanceCoordinator } from "./coordinator";
 import {
   createDesktopPerformancePolicyBridge,
+  createForegroundResumeBridge,
   observeDesktopWindowVisibility,
   performanceSignalsFromUi,
 } from "./PerformanceRuntimeBridge";
@@ -52,6 +53,20 @@ it("treats a missing desktop policy API as a no-op", () => {
   const bridge = createDesktopPerformancePolicyBridge(() => undefined);
 
   expect(() => bridge(false)).not.toThrow();
+});
+
+it("requests a refresh only when actual window visibility returns", () => {
+  const resume = vi.fn(async () => undefined);
+  const bridge = createForegroundResumeBridge(resume);
+
+  bridge(undefined);
+  bridge(true);
+  bridge(false);
+  bridge(false);
+  bridge(true);
+  bridge(true);
+
+  expect(resume).toHaveBeenCalledOnce();
 });
 
 it("uses native hide and restore events without letting a late initial read overwrite them", async () => {

@@ -217,6 +217,23 @@ describe("BackgroundChatManager", () => {
     await manager.disconnect();
   });
 
+  it("coalesces repeated foreground resumes into one background sync", async () => {
+    vi.useFakeTimers();
+    const manager = new BackgroundChatManager();
+    const groups = [groupWithTextChannels("background-resume")];
+    runtime.failedOnce.add("background-resume");
+    await manager.sync(groups, "Ana", []);
+    expect(runtime.connectAttempts.get("background-resume")).toBe(1);
+    const sync = vi.spyOn(manager, "sync");
+
+    await Promise.all([manager.resume(), manager.resume()]);
+
+    expect(sync).toHaveBeenCalledTimes(1);
+    expect(runtime.connectAttempts.get("background-resume")).toBe(2);
+    await manager.disconnect();
+    vi.useRealTimers();
+  });
+
   it("retries a transient background connection failure", async () => {
     vi.useFakeTimers();
     const manager = new BackgroundChatManager();

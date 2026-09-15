@@ -42,6 +42,7 @@ export class BackgroundChatManager {
   private retryTimer?: ReturnType<typeof setTimeout>;
   private retryAttempt = 0;
   private lastSync?: BackgroundSyncArguments;
+  private resumeOperation?: Promise<void>;
   private capacityWarning = "";
 
   constructor(private readonly createController: () => ChatController = () => new ChatController()) {}
@@ -180,6 +181,17 @@ export class BackgroundChatManager {
         throw error;
       }
     });
+  }
+
+  resume(): Promise<void> {
+    if (this.resumeOperation) return this.resumeOperation;
+    const args = this.lastSync;
+    if (!args) return Promise.resolve();
+    const operation = this.sync(...args).finally(() => {
+      if (this.resumeOperation === operation) this.resumeOperation = undefined;
+    });
+    this.resumeOperation = operation;
+    return operation;
   }
 
   private async applySync(

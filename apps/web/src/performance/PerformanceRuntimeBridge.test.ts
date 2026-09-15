@@ -109,3 +109,34 @@ it("keeps document visibility when the desktop visibility API is missing", () =>
   expect(observed).toEqual([]);
   expect(() => stop()).not.toThrow();
 });
+
+it.each([
+  ["a rejected read", () => Promise.reject(new Error("visibility unavailable"))],
+  ["a malformed read", () => Promise.resolve("visible")],
+])("bootstraps critical activity from document visibility after %s", async (_label, readVisibility) => {
+  const coordinator = new PerformanceCoordinator();
+  const criticalActivity = {
+    callActive: true,
+    transferActive: false,
+    screenPublicationActive: false,
+    gameSessionActive: false,
+  };
+  const stop = observeDesktopWindowVisibility(() => ({
+    getWindowVisibility: readVisibility,
+    onWindowVisibilityChanged: () => () => {},
+  }), (visible) => coordinator.update({
+    documentVisible: visible,
+    callWorkspaceVisible: true,
+    activity: criticalActivity,
+  }), true);
+
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(coordinator.getSnapshot()).toMatchObject({
+    mode: "foreground-call",
+    hasCriticalBackgroundWork: true,
+    chromiumBackgroundThrottlingAllowed: false,
+  });
+  stop();
+});

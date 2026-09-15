@@ -51,6 +51,7 @@ type DesktopWindowVisibilityApi = {
 export function observeDesktopWindowVisibility(
   resolveDesktop: () => DesktopWindowVisibilityApi | undefined,
   onVisibility: (visible: boolean) => void,
+  initialDocumentVisibility?: boolean,
 ): () => void {
   const desktop = resolveDesktop();
   if (!desktop?.getWindowVisibility || !desktop.onWindowVisibilityChanged) return () => {};
@@ -62,6 +63,9 @@ export function observeDesktopWindowVisibility(
     eventRevision += 1;
     onVisibility(visible);
   });
+  if (typeof initialDocumentVisibility === "boolean") {
+    onVisibility(initialDocumentVisibility);
+  }
   const initialRevision = eventRevision;
   void desktop.getWindowVisibility().then((visible) => {
     if (
@@ -116,6 +120,7 @@ export function PerformanceRuntimeBridge() {
   useEffect(() => observeDesktopWindowVisibility(
     () => window.desktop,
     setNativeWindowVisible,
+    documentVisible,
   ), []);
 
   useEffect(() => {

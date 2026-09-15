@@ -10,6 +10,7 @@ import "./components/modal-layout.css";
 import "./components/theme-overrides.css";
 import { initializeTheme } from "./services/theme/settings";
 import { installRendererPerformanceProbe } from "./performance/probe";
+import { PerformanceRuntimeBridge } from "./performance/PerformanceRuntimeBridge";
 
 initializeTheme();
 
@@ -25,6 +26,7 @@ if (window.desktop?.onPerformanceRendererCaptureStart
 
 createRoot(document.getElementById("root")!).render(<React.StrictMode>
   <RiskApplicationProvider application={riskApplication}>
+    <PerformanceRuntimeBridge/>
     <AppErrorBoundary><App/></AppErrorBoundary>
     <DesktopRecoveryNotice/>
   </RiskApplicationProvider>

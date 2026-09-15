@@ -9,6 +9,8 @@ import type { InviteDependencies } from "../services/invites/service";
 import { SupabaseSignalingProvider } from "../services/supabase/signaling";
 import { VoiceActivityDirectory } from "../services/supabase/voice-activity";
 import { loadRtcNetworkContext } from "../services/network/runtime";
+import { RuntimeActivityTracker } from "../performance/activity";
+import { PerformanceCoordinator } from "../performance/coordinator";
 import { InviteApplicationService } from "./InviteApplicationService";
 import { RiskApplication } from "./RiskApplication";
 import { SessionService } from "./SessionService";
@@ -39,6 +41,9 @@ const resilientDesktopInviteDependencies: InviteDependencies = {
 };
 
 export function createRiskApplication(): RiskApplication {
+  const performance = new PerformanceCoordinator();
+  const performanceActivity = new RuntimeActivityTracker();
+
   return new RiskApplication({
     gateway: api,
     call: new CallController(createSignaling, api),
@@ -52,6 +57,8 @@ export function createRiskApplication(): RiskApplication {
       resilientDesktopInviteDependencies,
       () => Boolean(window.desktop?.getBackendConfig),
     ),
+    performance,
+    performanceActivity,
     resetRuntimeAdapters: () => {
       resetApiRuntimeConfig();
       resetChatStorageRuntime();

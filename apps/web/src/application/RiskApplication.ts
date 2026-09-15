@@ -2,6 +2,8 @@ import type { CallController } from "../call";
 import type { ChatController } from "../chat";
 import type { BackgroundChatManager } from "../services/chat/background-manager";
 import type { VoiceActivityDirectory } from "../services/supabase/voice-activity";
+import type { RuntimeActivityTracker } from "../performance/activity";
+import type { PerformanceCoordinator } from "../performance/coordinator";
 import type { InviteApplicationService } from "./InviteApplicationService";
 import type { SessionService } from "./SessionService";
 import type { RiskGateway } from "./contracts";
@@ -15,6 +17,8 @@ export type RiskApplicationDependencies = {
   voiceActivities: VoiceActivityDirectory;
   session: SessionService;
   invites: InviteApplicationService;
+  performance: PerformanceCoordinator;
+  performanceActivity: RuntimeActivityTracker;
   resetRuntimeAdapters(): void;
 };
 
@@ -28,6 +32,8 @@ export class RiskApplication {
   readonly voiceActivities: VoiceActivityDirectory;
   readonly session: SessionService;
   readonly invites: InviteApplicationService;
+  readonly performance: PerformanceCoordinator;
+  readonly performanceActivity: RuntimeActivityTracker;
   private readonly resetAdapters: () => void;
 
   constructor(dependencies: RiskApplicationDependencies) {
@@ -39,6 +45,8 @@ export class RiskApplication {
     this.voiceActivities = dependencies.voiceActivities;
     this.session = dependencies.session;
     this.invites = dependencies.invites;
+    this.performance = dependencies.performance;
+    this.performanceActivity = dependencies.performanceActivity;
     this.resetAdapters = dependencies.resetRuntimeAdapters;
   }
 

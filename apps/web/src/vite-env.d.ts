@@ -19,6 +19,7 @@ type RiskDesktopSource = {
   name: string;
   displayId: string;
   thumbnail: string;
+  kind: "screen" | "window";
 };
 
 type RiskDesktopBackendConfig = {

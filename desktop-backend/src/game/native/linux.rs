@@ -1,4 +1,4 @@
-use super::{delta, key, keys, Device, Frame, InputBackend};
+use super::{delta, key, keys, wheel_steps, Device, Frame, InputBackend};
 use crate::game::VirtualGamepadBackend;
 use std::{
     collections::HashSet,
@@ -144,6 +144,7 @@ struct KeyboardMouse {
     device: Uinput,
     keys: HashSet<String>,
     buttons: u8,
+    wheel_remainder: i32,
 }
 impl InputBackend for KeyboardMouse {
     fn apply(&mut self, previous: &Frame, next: &Frame) -> Result<(), String> {
@@ -169,11 +170,12 @@ impl InputBackend for KeyboardMouse {
         }
         self.device.emit(2, 0, delta(previous.x, next.x, 2000))?;
         self.device.emit(2, 1, delta(previous.y, next.y, 2000))?;
-        self.device
-            .emit(2, 8, -delta(previous.wheel, next.wheel, 1200) / 120)?;
+        let wheel = wheel_steps(previous.wheel, next.wheel, &mut self.wheel_remainder);
+        self.device.emit(2, 8, wheel)?;
         self.device.sync()
     }
     fn release_all(&mut self) -> Result<(), String> {
+        self.wheel_remainder = 0;
         self.apply(&Frame::default(), &Frame::default())
     }
 }
@@ -231,6 +233,7 @@ pub(super) fn create(device: Device, slot: usize) -> Result<Box<dyn InputBackend
             device: input,
             keys: HashSet::new(),
             buttons: 0,
+            wheel_remainder: 0,
         }))
     }
 }

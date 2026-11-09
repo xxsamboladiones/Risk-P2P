@@ -1,14 +1,15 @@
 import React from "react";
 import { Copy, RefreshCw, Sparkles } from "lucide-react";
 import { RISK_APP_VERSION } from "../services/protocol-compatibility";
+import { copyText } from "../services/clipboard/copy-text";
 
-type State = { error?: Error; copied: boolean };
+type State = { error?: Error; copied: boolean; copyFailed?: boolean };
 
 export class AppErrorBoundary extends React.Component<React.PropsWithChildren, State> {
   override state: State = { copied: false };
 
   static getDerivedStateFromError(error: Error): State {
-    return { error, copied: false };
+    return { error, copied: false, copyFailed: false };
   }
 
   override componentDidCatch(error: Error, info: React.ErrorInfo): void {
@@ -30,6 +31,15 @@ export class AppErrorBoundary extends React.Component<React.PropsWithChildren, S
     }, null, 2);
   }
 
+  private async copyReport(): Promise<void> {
+    try {
+      await copyText(this.report());
+      this.setState({ copied: true, copyFailed: false });
+    } catch {
+      this.setState({ copied: false, copyFailed: true });
+    }
+  }
+
   override render(): React.ReactNode {
     if (!this.state.error) return this.props.children;
     return <main className="fatal-recovery" role="alert">
@@ -40,7 +50,7 @@ export class AppErrorBoundary extends React.Component<React.PropsWithChildren, S
         <small>{this.state.error.message || "Falha inesperada do renderer."}</small>
         <div>
           <button onClick={() => window.location.reload()}><RefreshCw/> Recarregar Risk</button>
-          <button className="secondary" onClick={() => void navigator.clipboard.writeText(this.report()).then(() => this.setState({ copied: true }))}><Copy/> {this.state.copied ? "Relatório copiado" : "Copiar diagnóstico"}</button>
+          <button className="secondary" onClick={() => void this.copyReport()}><Copy/> {this.state.copied ? "Relatório copiado" : this.state.copyFailed ? "Não foi possível copiar" : "Copiar diagnóstico"}</button>
         </div>
       </div>
     </main>;

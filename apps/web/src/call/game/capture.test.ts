@@ -2,9 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { captureGameInput } from "./capture";
 import type { GameInputFrame } from "@risk/protocol";
 
-function fixture(device: "keyboard-mouse" | "gamepad" = "keyboard-mouse", toggle = vi.fn(), preserveLock = () => false) {
+function fixture(device: "keyboard-mouse" | "gamepad" = "keyboard-mouse", toggle = vi.fn(), preserveLock = () => false, initial = { visibilityState: "visible", focused: true }) {
   const element = Object.assign(new EventTarget(), { setAttribute: vi.fn(), removeAttribute: vi.fn() });
-  const document = Object.assign(new EventTarget(), { pointerLockElement: element, visibilityState: "visible", exitPointerLock: vi.fn() });
+  const document = Object.assign(new EventTarget(), { pointerLockElement: element, visibilityState: initial.visibilityState, hasFocus: () => initial.focused, exitPointerLock: vi.fn() });
   const window = new EventTarget(); let time = 0; let frame: FrameRequestCallback | undefined;
   const pad = { connected: true, index: 0, mapping: "standard", axes: [0.4, -0.5, 0, 0], buttons: Array.from({ length: 17 }, (_, i) => ({ value: i === 0 ? 1 : 0 })) };
   vi.stubGlobal("document", document); vi.stubGlobal("window", window); vi.stubGlobal("navigator", { getGamepads: () => [pad] });
@@ -18,6 +18,62 @@ function fixture(device: "keyboard-mouse" | "gamepad" = "keyboard-mouse", toggle
 }
 afterEach(() => vi.unstubAllGlobals());
 describe("captura de input do jogador", () => {
+  it.each([
+    { visibilityState: "hidden", focused: true },
+    { visibilityState: "visible", focused: false },
+  ])("inicia controle neutro se a concessão chega em segundo plano: %j", (initial) => {
+    const t = fixture("gamepad", vi.fn(), () => false, initial);
+    t.tick();
+    expect(t.sent.at(-1)?.gamepad).toEqual({ axes: [0, 0, 0, 0], buttons: Array(17).fill(0) });
+    t.document.visibilityState = "visible"; initial.focused = true;
+    t.emit("focus", {}); t.tick();
+    expect(t.sent.at(-1)?.gamepad?.buttons[0]).toBe(1);
+    expect(t.leave).not.toHaveBeenCalled(); t.close();
+  });
+  it("inicia teclado pausado em segundo plano e exige recaptura após foco", () => {
+    const initial = { visibilityState: "visible", focused: false };
+    const t = fixture("keyboard-mouse", vi.fn(), () => false, initial);
+    t.emit("keydown", { code: "KeyW" }); t.tick();
+    expect(t.sent.at(-1)?.keys).toEqual([]);
+    expect(t.overlays).toHaveBeenLastCalledWith(true);
+    expect(t.document.exitPointerLock).toHaveBeenCalledOnce();
+    initial.focused = true; t.emit("focus", {});
+    t.emit("keydown", { code: "KeyA" }); t.tick();
+    expect(t.sent.at(-1)?.keys).toEqual([]);
+    t.document.dispatchEvent(new Event("pointerlockchange"));
+    t.emit("keydown", { code: "KeyA" });
+    expect(t.sent.at(-1)?.keys).toEqual(["KeyA"]);
+    t.close();
+  });
+  it("pausa o controle ao perder foco e retoma sem nova entrada na sessão", () => {
+    const t = fixture("gamepad"); t.tick();
+    expect(t.sent.at(-1)?.gamepad?.buttons[0]).toBe(1);
+    t.emit("blur", {}); t.tick(15000);
+    expect(t.sent.at(-1)?.gamepad?.buttons.every((value) => value === 0)).toBe(true);
+    expect(t.leave).not.toHaveBeenCalled();
+    t.emit("focus", {}); t.tick();
+    expect(t.sent.at(-1)?.gamepad?.buttons[0]).toBe(1);
+    expect(t.leave).not.toHaveBeenCalled(); t.close();
+  });
+  it("captura controle conectado mesmo quando o driver não informa mapeamento standard", () => {
+    const t = fixture("gamepad");
+    t.pad.mapping = "";
+    t.tick();
+    expect(t.sent.at(-1)?.gamepad).toMatchObject({ axes: [0.4, -0.5, 0, 0] });
+    expect(t.sent.at(-1)?.gamepad?.buttons[0]).toBe(1);
+    t.close();
+  });
+  it("não retoma teclado quando uma captura de mouse pendente termina em segundo plano", () => {
+    const t = fixture();
+    t.emit("blur", {});
+    // A pointer-lock request started before blur may finish after the pause.
+    t.document.dispatchEvent(new Event("pointerlockchange"));
+    t.emit("focus", {});
+    t.emit("keydown", { code: "KeyW" }); t.tick();
+    expect(t.sent.at(-1)?.keys).toEqual([]);
+    expect(t.overlays).toHaveBeenLastCalledWith(true);
+    t.close();
+  });
   it.each(["keyboard-mouse", "gamepad"] as const)("consome F8 uma vez por pressão em %s", (device) => {
     const toggle = vi.fn(); const t = fixture(device, toggle);
     expect(t.emit("keydown", { code: "F8", repeat: false })).toBe(false);
@@ -54,14 +110,17 @@ describe("captura de input do jogador", () => {
     t.close(); t.emit("keydown", { code: "KeyW" }); expect(t.sent).toHaveLength(4);
     expect(t.document.exitPointerLock).toHaveBeenCalledOnce();
   });
-  it.each(["blur", "visibilitychange"])("sai e libera a captura ao receber %s", (reason) => {
+  it.each(["blur", "visibilitychange"])("neutraliza sem sair ao receber %s", (reason) => {
     const t = fixture();
+    t.emit("keydown", { code: "KeyW" });
     if (reason === "blur") t.emit(reason, {});
     else {
       t.document.visibilityState = "hidden";
       t.document.dispatchEvent(new Event(reason));
     }
-    expect(t.leave).toHaveBeenCalledOnce(); t.tick(); expect(t.sent).toHaveLength(0); t.close();
+    expect(t.leave).not.toHaveBeenCalled();
+    expect(t.sent.at(-1)?.keys).toEqual([]);
+    t.tick(); expect(t.sent.at(-1)?.keys).toEqual([]); t.close();
   });
   it("primeiro Esc revela controles e neutraliza teclado; só outra pressão sai", () => {
     const t = fixture();
@@ -112,6 +171,8 @@ describe("captura de input do jogador", () => {
   it("transmite estado completo do controle sem permitir teclado/mouse nessa concessão", () => {
     const t = fixture("gamepad"); t.emit("keydown", { code: "KeyW" }); t.tick();
     expect(t.sent[0]).toMatchObject({ keys: [], buttons: 0, x: 0, gamepad: { axes: [0.4, -0.5, 0, 0], buttons: [1, ...Array(16).fill(0)] } });
-    t.pad.connected = false; t.tick(); expect(t.leave).toHaveBeenCalledOnce(); t.close();
+    t.pad.connected = false; t.tick(); expect(t.leave).not.toHaveBeenCalled();
+    expect(t.sent.at(-1)?.gamepad?.buttons).toEqual(Array(17).fill(0));
+    t.pad.connected = true; t.tick(); expect(t.sent.at(-1)?.gamepad?.buttons[0]).toBe(1); t.close();
   });
 });

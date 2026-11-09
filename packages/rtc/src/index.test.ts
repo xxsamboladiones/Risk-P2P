@@ -87,22 +87,55 @@ class FakeDataChannel {
   counterpart?: FakeDataChannel;
   readyState: RTCDataChannelState = "connecting";
   bufferedAmount = 0;
-  sent: string[] = [];
+  drainWhenLowThresholdChanges = false;
+  sent: Array<string | ArrayBuffer> = [];
   onopen: (() => void) | null = null;
   onclose: (() => void) | null = null;
   onerror: (() => void) | null = null;
   onmessage: ((event: MessageEvent<string>) => void) | null = null;
   readonly ordered: boolean;
   readonly maxRetransmits: number | null;
+  private lowThreshold = 0;
+  private readonly listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
   constructor(readonly label: string, options: RTCDataChannelInit = {}) { this.ordered = options.ordered ?? true; this.maxRetransmits = options.maxRetransmits ?? null; }
+  get bufferedAmountLowThreshold(): number { return this.lowThreshold; }
+  set bufferedAmountLowThreshold(value: number) {
+    this.lowThreshold = value;
+    if (this.drainWhenLowThresholdChanges) {
+      this.bufferedAmount = 0;
+      this.emit("bufferedamountlow");
+    }
+  }
+  addEventListener(type: string, listener: EventListenerOrEventListenerObject | null): void {
+    if (!listener) return;
+    const listeners = this.listeners.get(type) ?? new Set<EventListenerOrEventListenerObject>();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+  removeEventListener(type: string, listener: EventListenerOrEventListenerObject | null): void {
+    if (listener) this.listeners.get(type)?.delete(listener);
+  }
   open(): void { this.readyState = "open"; this.onopen?.(); }
-  send(data: string): void { this.sent.push(data); this.counterpart?.receive(data); }
+  send(data: string | ArrayBuffer): void { this.sent.push(data); if (typeof data === "string") this.counterpart?.receive(data); }
   receive(data: string): void { this.onmessage?.(new MessageEvent("message", { data })); }
+  setBufferedAmount(value: number): void {
+    const crossedThreshold = this.bufferedAmount > this.lowThreshold && value <= this.lowThreshold;
+    this.bufferedAmount = value;
+    if (crossedThreshold) this.emit("bufferedamountlow");
+  }
   close(): void {
     if (this.readyState === "closed") return;
     this.readyState = "closed";
     this.onclose?.();
+    this.emit("close");
     this.counterpart?.close();
+  }
+  private emit(type: string): void {
+    const event = new Event(type);
+    for (const listener of [...(this.listeners.get(type) ?? [])]) {
+      if (typeof listener === "function") listener(event);
+      else listener.handleEvent(event);
+    }
   }
 }
 
@@ -126,7 +159,7 @@ describe("WebScreenShareProvider", () => {
     const stream = await provider.startScreenShare();
 
     expect(selectScreenSource).toHaveBeenCalledWith("screen:1:0");
-    expect(getDisplayMedia).toHaveBeenCalledWith({ video: true, audio: true });
+    expect(getDisplayMedia).toHaveBeenCalledWith({ video: { cursor: "always" }, audio: true });
     expect(stream).toBeDefined();
   });
 
@@ -147,7 +180,7 @@ describe("WebScreenShareProvider", () => {
     const provider = new WebScreenShareProvider();
     await provider.startScreenShare(undefined, false);
 
-    expect(getDisplayMedia).toHaveBeenCalledWith({ video: true, audio: false });
+    expect(getDisplayMedia).toHaveBeenCalledWith({ video: { cursor: "always" }, audio: false });
   });
 });
 
@@ -198,6 +231,27 @@ describe("MeshWebRTCTransport", () => {
     await transport.disconnect(); expect(channel.readyState).toBe("closed");
   });
 
+  it("tolera uma falha de envio do canal de jogo e permite o próximo snapshot", async () => {
+    const transport = new MeshWebRTCTransport("a", [], { ...events(), onGameInput: vi.fn() });
+    transport.requireMediaAuthorization(); await transport.connect("z", true);
+    await transport.authorizePeerMedia("z"); transport.ensureGameInputChannel("z");
+    const channel = FakePeerConnection.dataChannels.find((c) => c.label === "risk.game-input.v1")!;
+    channel.open();
+    vi.spyOn(channel, "send").mockImplementationOnce(() => { throw new DOMException("buffer full", "OperationError"); });
+    expect(transport.sendGameInput("z", "first")).toBe(false);
+    expect(transport.sendGameInput("z", "next")).toBe(true);
+    transport.disconnect();
+  });
+  it("entrega o encerramento aos outros peers mesmo se um canal falhar", async () => {
+    const transport = new MeshWebRTCTransport("a", [], { ...events(), onDataMessage: vi.fn() });
+    await transport.connect("b", true); await transport.connect("c", true);
+    const channels = FakePeerConnection.dataChannels;
+    channels.forEach((channel) => channel.open());
+    vi.spyOn(channels[0]!, "send").mockImplementation(() => { throw new DOMException("closed", "InvalidStateError"); });
+    expect(transport.sendData("game-mode-stop")).toBe(1);
+    expect(channels[1]!.sent).toContain("game-mode-stop");
+    transport.disconnect();
+  });
   it("aplica reprodução de jogo apenas ao peer autorizado e restaura ao revogar", async () => {
     const transport = new MeshWebRTCTransport("a", [], events());
     transport.requireMediaAuthorization(); await transport.connect("z", false);
@@ -660,6 +714,52 @@ describe("MeshWebRTCTransport", () => {
     channel.bufferedAmount = 600 * 1024;
     expect(transport.sendData("mensagem")).toBe(0);
     expect(channel.sent).toHaveLength(0);
+  });
+
+  it("não perde o esvaziamento do canal ocorrido durante a instalação da espera", async () => {
+    vi.useFakeTimers();
+    const peerId = "00000000-0000-4000-8000-000000000002";
+    const callbacks = { ...events(), onTransferMessage: vi.fn(), onTransferState: vi.fn() };
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
+    await transport.connect(peerId, true);
+    transport.ensureTransferChannel(peerId);
+    const channel = FakePeerConnection.dataChannels.find(({ label }) => label === "risk.transfer")!;
+    channel.open();
+    channel.bufferedAmount = 2 * 1024 * 1024;
+    channel.drainWhenLowThresholdChanges = true;
+
+    let settled = false;
+    void transport.waitForTransferBufferedAmountLow(peerId).then(() => { settled = true; });
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(settled).toBe(true);
+    await transport.disconnect();
+  });
+
+  it("resolve esperas simultâneas conforme cada limite é alcançado", async () => {
+    vi.useFakeTimers();
+    const peerId = "00000000-0000-4000-8000-000000000002";
+    const callbacks = { ...events(), onTransferMessage: vi.fn(), onTransferState: vi.fn() };
+    const transport = new MeshWebRTCTransport("00000000-0000-4000-8000-000000000001", [], callbacks);
+    await transport.connect(peerId, true);
+    transport.ensureTransferChannel(peerId);
+    const channel = FakePeerConnection.dataChannels.find(({ label }) => label === "risk.transfer")!;
+    channel.open();
+    channel.bufferedAmount = 2 * 1024 * 1024;
+    let lowSettled = false;
+    let emptySettled = false;
+    void transport.waitForTransferBufferedAmountLow(peerId, 1024 * 1024).then(() => { lowSettled = true; });
+    void transport.waitForTransferBufferedAmountLow(peerId, 0).then(() => { emptySettled = true; });
+
+    channel.setBufferedAmount(512 * 1024);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(lowSettled).toBe(true);
+    expect(emptySettled).toBe(false);
+
+    channel.setBufferedAmount(0);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(emptySettled).toBe(true);
+    await transport.disconnect();
   });
 });
 

@@ -36,14 +36,18 @@ export class DesktopGameBackend implements GameBackend {
           });
           if (!refresh.ok) throw new GameBackendError("Não foi possível renovar a sessão de jogo.", refresh.status);
           const session = await refresh.json() as { accessToken: string };
-          sessionStorage.setItem("accessToken", session.accessToken);
+          // Logout or another refresh may have changed the session while this request was pending.
+          if (sessionStorage.getItem("accessToken") === accessToken) sessionStorage.setItem("accessToken", session.accessToken);
         })().finally(() => { this.refreshing = undefined; });
         await this.refreshing;
       }
       response = await perform(sessionStorage.getItem("accessToken"));
     }
+    if (!response.ok) {
+      const error = await response.json().catch(() => undefined);
+      throw new GameBackendError(error?.message ?? "Backend de jogo indisponível. Atualize o aplicativo desktop.", response.status);
+    }
     const value = await response.json();
-    if (!response.ok) throw new GameBackendError(value.message ?? "Backend de jogo indisponível. Atualize o aplicativo desktop.", response.status);
     return value as T;
   }
 }

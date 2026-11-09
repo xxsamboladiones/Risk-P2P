@@ -19,7 +19,7 @@ describe("WebScreenShareProvider restrictOwnAudio", () => {
     await new WebScreenShareProvider().startScreenShare();
 
     expect(getDisplayMedia).toHaveBeenCalledWith({
-      video: true,
+      video: { cursor: "always" },
       audio: { restrictOwnAudio: true },
     });
   });
@@ -31,6 +31,6 @@ describe("WebScreenShareProvider restrictOwnAudio", () => {
 
     await new WebScreenShareProvider().startScreenShare();
 
-    expect(getDisplayMedia).toHaveBeenCalledWith({ video: true, audio: true });
+    expect(getDisplayMedia).toHaveBeenCalledWith({ video: { cursor: "always" }, audio: true });
   });
 });

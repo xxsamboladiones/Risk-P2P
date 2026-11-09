@@ -2,7 +2,7 @@
 
 O anfitrião compartilha a tela e ativa **Modo Jogo** no rodapé. Isso autoriza a entrada automática de participantes autenticados da chamada. O botão **Jogar Junto** aparece na transmissão remota. Um jogador por vez pode usar teclado/mouse; até quatro podem usar controles, quando o backend do anfitrião oferece controles virtuais.
 
-O painel do anfitrião identifica os jogadores e oferece **Revogar**. Quem foi revogado não pode voltar na mesma sessão. Desligar e ligar o modo cria uma sessão nova. Em tela cheia, as sobreposições somem após 3 segundos. **Esc** mostra os controles; outra pressão de **Esc** em até 2 segundos sai do Modo Jogo. No teclado/mouse, o primeiro Esc também solta as teclas e pausa a captura; **Continuar com teclado e mouse** retoma a mesma sessão. O controle físico continua funcionando enquanto as sobreposições aparecem. Perder o foco, ocultar a chamada ou desconectar encerra o acesso. **Ctrl + Alt + Shift + F12** encerra todas as sessões de jogo pelo processo Electron, inclusive quando outra janela está em foco (sujeito à disponibilidade do atalho global no sistema).
+O painel do anfitrião identifica os jogadores e oferece **Revogar**. Quem foi revogado não pode voltar na mesma sessão. Desligar e ligar o modo cria uma sessão nova. Em tela cheia, as sobreposições somem após 3 segundos. **Esc** mostra os controles; outra pressão de **Esc** em até 2 segundos sai do Modo Jogo. No teclado/mouse, o primeiro Esc também solta as teclas e pausa a captura; **Continuar com teclado e mouse** retoma a mesma sessão. O controle físico continua funcionando enquanto as sobreposições aparecem. Perder o foco ou ocultar a chamada pausa os comandos sem encerrar o acesso. O cliente mantém snapshots neutros enquanto a interface está oculta; ao retornar, o controle retoma e teclado/mouse pode ser retomado pelo botão Continuar. Desconectar da chamada encerra o acesso. **F8** alterna entre teclado/mouse e controle quando ambos estão disponíveis. **Ctrl + Alt + Shift + F12** encerra todas as sessões de jogo pelo processo Electron, inclusive quando outra janela está em foco (sujeito à disponibilidade do atalho global no sistema).
 
 Teclado/mouse atua no computador e na janela que estiver em foco, não fica restrito à janela capturada. O anfitrião deve deixar o jogo em foco. Não há acesso persistente, execução de comandos, transferência de arquivos nem instalação automática de drivers por este recurso.
 
@@ -12,7 +12,7 @@ Teclado/mouse atua no computador e na janela que estiver em foco, não fica rest
 |---|---|---|
 | Hospedar teclado/mouse | SendInput, usando scan codes | uinput |
 | Participar com teclado/mouse | Pointer Lock e KeyboardEvent.code | Pointer Lock e KeyboardEvent.code |
-| Capturar controle do participante | Gamepad API, mapeamento standard | Gamepad API, mapeamento standard |
+| Capturar controle do participante | Gamepad API, com suporte ao mapeamento standard e fallback de driver | Gamepad API, com suporte ao mapeamento standard e fallback de driver |
 | Controle virtual no anfitrião | Xbox 360 virtual via ViGEmBus, até quatro | Um dispositivo uinput por jogador, até quatro |
 
 No Windows, o backend usa ViGEmBus para criar controles Xbox 360 virtuais. O Risk verifica se o bus está disponível ao iniciar o Modo Jogo: quando o driver está acessível, anuncia suporte a gamepad; quando não está, mantém teclado/mouse disponível e informa o motivo ao participante. O aplicativo não instala nem eleva silenciosamente o driver. Os controles virtuais são neutralizados quando a entrada pausa e removidos quando a concessão é encerrada.
@@ -20,6 +20,8 @@ No Windows, o backend usa ViGEmBus para criar controles Xbox 360 virtuais. O Ris
 No Linux, `/dev/uinput` precisa existir e ser gravável pelo usuário que executa o Risk. O aplicativo verifica isso e mostra uma mensagem se estiver indisponível; não altera permissões nem solicita execução como root. Dispositivos virtuais são destruídos ao encerrar a concessão. É necessário validar o reconhecimento do controle pelo jogo/distribuição utilizados.
 
 No Windows, SendInput respeita o nível de integridade do processo. Jogos elevados ou que recusam input sintético podem não aceitar os comandos. Esta implementação não contorna essas restrições. Referências: [Microsoft SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput), [ViGEmBus](https://vigem.org/), [Linux uinput](https://docs.kernel.org/input/uinput.html).
+
+Para compartilhamento de jogos em tela cheia no Windows, o Risk usa DirectX/DXGI na captura de monitores. Isso evita o caso em que Windows Graphics Capture (WGC) recebe apenas a área de trabalho composta enquanto PCSX2, Minecraft ou outro jogo apresenta os frames em uma superfície fullscreen/overlay separada. Ative **Jogos em tela cheia** no seletor e escolha o monitor onde o jogo será aberto; o Risk lista somente fontes de tela nesse modo e a captura permanece vinculada ao monitor durante a troca. A captura de janelas comuns continua usando WGC. `RISK_FORCE_WGC_SCREEN=1` reativa WGC também para monitores em uma máquina que precise desse caminho; `RISK_DISABLE_WGC=1` desativa WGC tanto para monitores quanto para janelas.
 
 ## Fluxo e limites
 
@@ -32,7 +34,7 @@ No Windows, SendInput respeita o nível de integridade do processo. Jogos elevad
 - Após 250 ms sem input, o watchdog neutraliza teclas, botões e eixos, mas preserva a concessão e o dispositivo virtual por até 10 s para permitir retomada após uma oscilação breve. O primeiro frame após a pausa não aplica movimento acumulado do mouse. Sem heartbeat do anfitrião por 5 s, o backend encerra a sessão. O watchdog roda a cada 100 ms. Uma falha fatal do próprio processo nativo não oferece essa garantia.
 - Falhas HTTP transitórias não revogam imediatamente o jogador. O token expirado é renovado; falta persistente de autenticação ou uma revogação real continuam encerrando o acesso.
 - Enquanto joga, o receptor solicita `jitterBufferTarget = 0` para áudio e vídeo do anfitrião e restaura os valores anteriores ao sair. É uma preferência de baixa latência, limitada pelo navegador e pela rede, conforme a [especificação WebRTC](https://www.w3.org/TR/webrtc/#dom-rtcrtpreceiver-jitterbuffertarget).
-- O modo começa em 1080p60 e prioriza framerate. RTT acima de 90 ms, perda acima de 2% ou jitter acima de 25 ms selecionam 720p60. Mudanças de qualidade têm intervalo mínimo de 10 s. Ao desligar, volta a preferência anterior. Esses limiares são uma política inicial, não uma garantia de latência semelhante ao Parsec.
+- O modo começa em 720p60 e prioriza framerate. Sobe para 1080p60 quando todos os peers têm capacidade medida suficiente (RTT abaixo de 60 ms, pelo menos 12 Mbps disponíveis e codificação abaixo de 12 ms). RTT acima de 90 ms, perda acima de 2% ou jitter acima de 25 ms selecionam 720p60. Mudanças de qualidade têm intervalo mínimo de 10 s. Ao desligar, volta a preferência anterior. Esses limiares são uma política inicial, não uma garantia de latência semelhante ao Parsec.
 
 ## Validação e empacotamento
 

@@ -20,16 +20,24 @@ export class GameModeController {
   private heartbeatBusy = false;
   private lastHeartbeat = 0;
   private blocked = new Set<string>();
-  private joining = new Set<string>();
+  private joining = new Map<string, symbol>();
   private queues = new Map<string, { busy: boolean; latest?: GameInputFrame; sequence: number }>();
   private request?: { switching?: boolean; id: string; peer: string; session: string; timer: ReturnType<typeof setTimeout> };
   private lastQualityChange = 0;
   private starting = false;
+  private inputTimer?: ReturnType<typeof setInterval>;
+  private outgoingSequence = 0;
+  private lastCaptureAt = 0;
+  private outgoingMotion = { x: 0, y: 0, wheel: 0 };
+  private captureBase = { x: 0, y: 0, wheel: 0 };
   constructor(private readonly deps: Dependencies, private readonly backend: GameBackend = new DesktopGameBackend()) {}
   getSnapshot = (): GameView => this.view;
   subscribe = (listener: () => void): (() => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
   private update(patch: Partial<GameView>): void { this.view = { ...this.view, ...patch }; this.listeners.forEach((listener) => listener()); }
-  private send(peer: string | undefined, message: GameControl): void { this.deps.transport()?.sendData(encodeGameControl(message), peer); }
+  private send(peer: string | undefined, message: GameControl): void {
+    try { this.deps.transport()?.sendData(encodeGameControl(message), peer); }
+    catch { /* Local stop/revoke must complete even if the remote channel closes during send. */ }
+  }
   private announce(peer?: string): void { const h = this.view.host; if (h) this.send(peer, { type: "game-mode-start", sessionId: h.sessionId, screenStreamId: h.screenStreamId, gamepad: h.gamepad, reason: h.reason }); }
   async start(): Promise<void> {
     if (this.view.host || this.starting) return;
@@ -79,7 +87,8 @@ export class GameModeController {
     switch (message.type) {
       case "game-sync": this.announce(peer); break;
       case "game-mode-start":
-        if (this.view.playing?.peerId === peer && this.view.playing.sessionId !== message.sessionId) this.leave();
+        if ((this.view.playing?.peerId === peer && this.view.playing.sessionId !== message.sessionId)
+          || (this.request?.peer === peer && this.request.session !== message.sessionId)) this.leave();
         this.update({ offers: { ...this.view.offers, [peer]: message } }); break;
       case "game-mode-stop":
         if (this.view.offers[peer]?.sessionId === message.sessionId) {
@@ -92,6 +101,13 @@ export class GameModeController {
         if (this.request?.peer === peer && this.request.id === message.requestId && this.request.session === message.sessionId) {
           clearTimeout(this.request.timer); this.request = undefined;
           this.update({ playing: { ...message, peerId: peer }, pending: undefined });
+          clearInterval(this.inputTimer);
+          this.outgoingSequence = 0;
+          this.outgoingMotion = { x: 0, y: 0, wheel: 0 };
+          this.beginInputCapture();
+          this.inputTimer = setInterval(() => {
+            if (performance.now() - this.lastCaptureAt >= 500) this.pauseInput();
+          }, 250);
           this.deps.transport()?.setGameModePlayback?.(peer, true);
         } else if (this.view.playing?.peerId !== peer || this.view.playing.grantId !== message.grantId || this.view.playing.sessionId !== message.sessionId) this.send(peer, { type: "leave", sessionId: message.sessionId, grantId: message.grantId });
         break;
@@ -112,11 +128,12 @@ export class GameModeController {
     const previous = host.players.find((p) => p.peerId === peer);
     if (request.previousGrantId ? previous?.grantId !== request.previousGrantId : Boolean(previous)) { reject("Concessão de jogo inválida."); return; }
     const grantId = crypto.randomUUID();
-    this.joining.add(peer);
+    const attempt = Symbol();
+    this.joining.set(peer, attempt);
     this.queues.delete(peer);
     try {
       const { slot } = await this.backend.request<{ slot: number }>("join", { sessionId: host.sessionId, peerId: peer, grantId, device: request.device, previousGrantId: request.previousGrantId });
-      if (this.view.host?.sessionId !== host.sessionId || this.deps.screenId() !== host.screenStreamId || !this.deps.authenticated(peer) || this.blocked.has(peer) || (previous && !this.view.host.players.includes(previous))) {
+      if (this.joining.get(peer) !== attempt || this.view.host?.sessionId !== host.sessionId || this.deps.screenId() !== host.screenStreamId || !this.deps.authenticated(peer) || this.blocked.has(peer) || (previous && !this.view.host.players.includes(previous))) {
         await this.backend.request("revoke", { sessionId: host.sessionId, peerId: peer, grantId }); return;
       }
       const player = { peerId: peer, grantId, slot, device: request.device, requestId: request.requestId };
@@ -124,9 +141,10 @@ export class GameModeController {
       this.update({ host: { ...this.view.host, players: [...this.view.host.players.filter((p) => p !== previous), player] } });
       this.send(peer, { type: "join-accepted", sessionId: host.sessionId, ...player });
     } catch (error) { reject(error instanceof Error ? error.message : "Não foi possível liberar o acesso."); }
-    finally { this.joining.delete(peer); }
+    finally { if (this.joining.get(peer) === attempt) this.joining.delete(peer); }
   }
   async revoke(peer: string, block = true): Promise<void> {
+    this.joining.delete(peer);
     if (block) this.blocked.add(peer);
     const host = this.view.host;
     const player = host?.players.find((p) => p.peerId === peer);
@@ -159,6 +177,7 @@ export class GameModeController {
     this.send(playing.peerId, { type: "join-request", sessionId: playing.sessionId, requestId: id, device, previousGrantId: playing.grantId });
   }
   leave(): void {
+    clearInterval(this.inputTimer); this.inputTimer = undefined;
     if (this.request) clearTimeout(this.request.timer);
     this.request = undefined;
     const playing = this.view.playing;
@@ -168,7 +187,24 @@ export class GameModeController {
   }
   sendInput(frame: GameInputFrame): boolean {
     const p = this.view.playing;
-    return Boolean(p && p.sessionId === frame.sessionId && p.grantId === frame.grantId && this.deps.transport()?.sendGameInput?.(p.peerId, JSON.stringify(frame)));
+    if (!p || p.sessionId !== frame.sessionId || p.grantId !== frame.grantId) return false;
+    this.lastCaptureAt = performance.now();
+    this.outgoingMotion = { x: this.captureBase.x + frame.x, y: this.captureBase.y + frame.y, wheel: this.captureBase.wheel + frame.wheel };
+    return this.transmitInput({ ...frame, ...this.outgoingMotion });
+  }
+  beginInputCapture(): void {
+    this.captureBase = { ...this.outgoingMotion };
+    this.lastCaptureAt = performance.now();
+  }
+  pauseInput(): void {
+    const p = this.view.playing;
+    if (!p) return;
+    this.transmitInput({ version: 1, sessionId: p.sessionId, grantId: p.grantId, sequence: 0, keys: [], buttons: 0, ...this.outgoingMotion,
+      ...(p.device === "gamepad" ? { gamepad: { axes: [0, 0, 0, 0], buttons: Array(17).fill(0) } } : {}) });
+  }
+  private transmitInput(frame: GameInputFrame): boolean {
+    const p = this.view.playing;
+    return Boolean(p && this.deps.transport()?.sendGameInput?.(p.peerId, JSON.stringify({ ...frame, sequence: this.outgoingSequence++ })));
   }
   handleInput(peer: string, raw: string): void {
     const host = this.view.host;

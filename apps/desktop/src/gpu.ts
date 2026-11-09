@@ -3,6 +3,17 @@ import { accessSync, constants as fsConstants, existsSync, readFileSync } from "
 
 export function configurePlatformRuntime(): void {
   const disabledFeatures: string[] = [];
+  if (process.platform === "win32") {
+    if (process.env.RISK_DISABLE_WGC === "1") {
+      disabledFeatures.push("WebRtcAllowWgcDesktopCapturer", "WebRtcAllowWgcScreenCapturer");
+    } else if (process.env.RISK_FORCE_WGC_SCREEN !== "1") {
+      // WGC pode receber somente o desktop composto quando um jogo apresenta a
+      // imagem em uma superfície fullscreen/overlay separada. Para monitores,
+      // o capturador DirectX/DXGI acompanha o scanout usado por PCSX2 e por
+      // versões afetadas do Minecraft. Captura de janela continua usando WGC.
+      disabledFeatures.push("WebRtcAllowWgcScreenCapturer");
+    }
+  }
   if (process.platform === "linux") {
     // pipewire-pulse pode expor o PID do daemon em vez do PID do cliente.
     process.env["PULSE_PROP_application.name"] = "Risk";

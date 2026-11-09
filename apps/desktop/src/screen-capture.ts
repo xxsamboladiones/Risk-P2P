@@ -31,6 +31,7 @@ export class ScreenCaptureController {
         name: source.name,
         displayId: source.display_id,
         thumbnail: source.thumbnail.toDataURL(),
+        kind: source.id.startsWith("screen:") ? "screen" : "window",
       }));
     });
 
@@ -51,7 +52,10 @@ export class ScreenCaptureController {
       }
 
       const sources = allSources.slice(0, 20);
-      const buttons = [...sources.map((source) => source.name.slice(0, 80)), "Cancelar"];
+      const buttons = [...sources.map((source) => {
+        const kind = source.id.startsWith("screen:") ? "Tela inteira" : "Janela";
+        return `[${kind}] ${source.name}`.slice(0, 80);
+      }), "Cancelar"];
       const owner = BrowserWindow.fromWebContents(event.sender);
       const options = {
         type: "question" as const,

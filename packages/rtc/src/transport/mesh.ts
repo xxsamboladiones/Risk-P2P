@@ -286,8 +286,8 @@ export class MeshWebRTCTransport implements MeshCallTransport {
         logger.warn("DataChannel de controle congestionado; mensagem não enviada", { peerId, bufferedAmount: channel.bufferedAmount });
         continue;
       }
-      channel.send(data);
-      sent += 1;
+      try { channel.send(data); sent += 1; }
+      catch { logger.warn("Falha ao enviar pelo DataChannel de controle", { peerId }); }
     }
     return sent;
   }
@@ -303,8 +303,8 @@ export class MeshWebRTCTransport implements MeshCallTransport {
     const channel = this.peers.get(peerId)?.gameInputChannel;
     if (!this.mediaAuthorizedPeers.has(peerId) || channel?.readyState !== "open"
       || channel.bufferedAmount > 0 || encodedMessageSize(data) > MAX_GAME_PACKET_BYTES) return false;
-    channel.send(data);
-    return true;
+    try { channel.send(data); return true; }
+    catch { return false; } // A closing/full SCTP channel must not interrupt the capture loop.
   }
 
   setGameModePlayback(peerId: string, enabled: boolean): void {
@@ -380,25 +380,47 @@ export class MeshWebRTCTransport implements MeshCallTransport {
   async waitForTransferBufferedAmountLow(peerId: string, threshold = TRANSFER_LOW_WATER_MARK_BYTES): Promise<void> {
     const channel = this.requirePeer(peerId).transferDataChannel;
     if (!channel || channel.readyState !== "open") throw new Error(`Canal ${TRANSFER_CHANNEL_LABEL} indisponível para ${peerId}.`);
-    if (channel.bufferedAmount <= threshold) return;
-    channel.bufferedAmountLowThreshold = Math.max(0, threshold);
+    const requestedThreshold = Number.isFinite(threshold) ? Math.max(0, threshold) : TRANSFER_LOW_WATER_MARK_BYTES;
+    if (channel.bufferedAmount <= requestedThreshold) return;
     await new Promise<void>((resolve, reject) => {
       let timeout: ReturnType<typeof setTimeout> | undefined;
+      let poll: ReturnType<typeof setInterval> | undefined;
+      let settled = false;
       const cleanup = () => {
         if (timeout) clearTimeout(timeout);
+        if (poll) clearInterval(poll);
         channel.removeEventListener("bufferedamountlow", onLow);
         channel.removeEventListener("close", onClosed);
         channel.removeEventListener("error", onClosed);
       };
-      const onLow = () => { cleanup(); resolve(); };
-      const onClosed = () => { cleanup(); reject(new Error(`Canal ${TRANSFER_CHANNEL_LABEL} foi fechado durante a transferência.`)); };
-      timeout = setTimeout(() => {
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
         cleanup();
-        reject(new Error(`Canal ${TRANSFER_CHANNEL_LABEL} permaneceu congestionado por mais de ${TRANSFER_BUFFER_WAIT_TIMEOUT_MS / 1000}s.`));
+        if (error) reject(error);
+        else resolve();
+      };
+      const check = () => {
+        if (channel.readyState !== "open") {
+          finish(new Error(`Canal ${TRANSFER_CHANNEL_LABEL} foi fechado durante a transferência.`));
+        } else if (channel.bufferedAmount <= requestedThreshold) {
+          finish();
+        }
+      };
+      const onLow = () => check();
+      const onClosed = () => finish(new Error(`Canal ${TRANSFER_CHANNEL_LABEL} foi fechado durante a transferência.`));
+      channel.addEventListener("bufferedamountlow", onLow);
+      channel.addEventListener("close", onClosed);
+      channel.addEventListener("error", onClosed);
+      timeout = setTimeout(() => {
+        finish(new Error(`Canal ${TRANSFER_CHANNEL_LABEL} permaneceu congestionado por mais de ${TRANSFER_BUFFER_WAIT_TIMEOUT_MS / 1000}s.`));
       }, TRANSFER_BUFFER_WAIT_TIMEOUT_MS);
-      channel.addEventListener("bufferedamountlow", onLow, { once: true });
-      channel.addEventListener("close", onClosed, { once: true });
-      channel.addEventListener("error", onClosed, { once: true });
+      // `bufferedamountlow` pode ocorrer entre a leitura inicial e a instalação
+      // do listener. O polling curto também protege esperas concorrentes, pois
+      // RTCDataChannel expõe apenas um threshold compartilhado.
+      poll = setInterval(check, 25);
+      channel.bufferedAmountLowThreshold = Math.min(channel.bufferedAmountLowThreshold, requestedThreshold);
+      check();
     });
   }
 

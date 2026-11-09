@@ -1,21 +1,25 @@
 import { GAME_KEYS, type GameInputFrame, type GameDevice } from "@risk/protocol";
+import { findConnectedGamepad } from "./gamepad";
 
 export function captureGameInput(element: HTMLElement, grant: { sessionId: string; grantId: string; device: GameDevice }, send: (frame: GameInputFrame) => boolean, leave: () => void, showOverlays: (keyboardPaused: boolean) => void = () => {}, switchDevice: () => void = () => {}, preserveLock: () => boolean = () => false): () => void {
   element.setAttribute("data-risk-game-playing", "true");
   const keys = new Set<string>();
   let buttons = 0, x = 0, y = 0, wheel = 0, sequence = 0, stopped = false, animation = 0;
   let lastSent = 0, lastSuccess = performance.now(), gamepadIndex: number | undefined;
-  let keyboardPaused = false, escapeHeld = false, switchHeld = false, nativeEscapePending = false;
+  let keyboardPaused = grant.device === "keyboard-mouse" && document.pointerLockElement !== element;
+  let escapeHeld = false, switchHeld = false, nativeEscapePending = false;
   let lastEscape: number | undefined;
-  const ownsKeyboard = () => !keyboardPaused && grant.device === "keyboard-mouse" && document.pointerLockElement === element;
+  let backgroundPaused = false;
+  const ownsKeyboard = () => !backgroundPaused && !keyboardPaused && grant.device === "keyboard-mouse" && document.pointerLockElement === element;
   const stop = () => { if (!stopped) { stopped = true; leave(); } };
   const snapshot = () => {
     if (stopped) return;
     const frame: GameInputFrame = { version: 1, sessionId: grant.sessionId, grantId: grant.grantId, sequence: sequence++, keys: [...keys], buttons, x, y, wheel };
     if (grant.device === "gamepad") {
       const pads = [...(navigator.getGamepads?.() ?? [])];
-      const pad = gamepadIndex === undefined ? pads.find((p) => p?.connected && p.mapping === "standard") : pads[gamepadIndex];
-      if (gamepadIndex !== undefined && !pad?.connected) { stop(); return; }
+      const candidate = findConnectedGamepad(pads, gamepadIndex);
+      const pad = !backgroundPaused && candidate?.connected ? candidate : undefined;
+      if (!candidate?.connected) gamepadIndex = undefined;
       if (pad) gamepadIndex = pad.index;
       frame.gamepad = {
         axes: Array.from({ length: 4 }, (_, i) => Math.max(-1, Math.min(1, pad?.axes[i] ?? 0))),
@@ -76,6 +80,7 @@ export function captureGameInput(element: HTMLElement, grant: { sessionId: strin
   const lock = () => {
     if (stopped || grant.device !== "keyboard-mouse") return;
     if (document.pointerLockElement === element) {
+      if (backgroundPaused || document.visibilityState !== "visible" || document.hasFocus?.() === false) { pause(); return; }
       keyboardPaused = false; lastEscape = undefined; nativeEscapePending = false;
       showOverlays(false);
     } else if (!keyboardPaused) {
@@ -84,7 +89,20 @@ export function captureGameInput(element: HTMLElement, grant: { sessionId: strin
       reveal();
     }
   };
-  const hidden = () => { if (document.visibilityState !== "visible") stop(); };
+  const pause = () => {
+    backgroundPaused = true;
+    escapeHeld = false; switchHeld = false;
+    keys.clear(); buttons = 0;
+    if (grant.device === "keyboard-mouse") keyboardPaused = true;
+    snapshot();
+    if (document.pointerLockElement === element) document.exitPointerLock();
+    showOverlays(keyboardPaused);
+  };
+  const focus = () => {
+    backgroundPaused = document.visibilityState !== "visible" || document.hasFocus?.() === false;
+    if (!backgroundPaused) showOverlays(keyboardPaused);
+  };
+  const hidden = () => { if (document.visibilityState !== "visible") pause(); else focus(); };
   const context = (event: Event) => { if (ownsKeyboard()) event.preventDefault(); };
   const tick = (time: number) => {
     if (stopped) return;
@@ -94,15 +112,18 @@ export function captureGameInput(element: HTMLElement, grant: { sessionId: strin
   window.addEventListener("keydown", keyboard, true); window.addEventListener("keyup", keyboard, true);
   window.addEventListener("mousemove", mouse, true); window.addEventListener("mousedown", mouse, true); window.addEventListener("mouseup", mouse, true);
   window.addEventListener("wheel", scroll, { capture: true, passive: false });
-  window.addEventListener("blur", stop); element.addEventListener("contextmenu", context);
+  window.addEventListener("blur", pause); window.addEventListener("focus", focus); element.addEventListener("contextmenu", context);
   document.addEventListener("pointerlockchange", lock); document.addEventListener("visibilitychange", hidden);
+  // A grant may arrive after the window already lost focus, before capture existed.
+  if (document.visibilityState !== "visible" || document.hasFocus?.() === false) pause();
+  else showOverlays(keyboardPaused);
   animation = requestAnimationFrame(tick);
   return () => {
     stopped = true; cancelAnimationFrame(animation);
     element.removeAttribute("data-risk-game-playing");
     window.removeEventListener("keydown", keyboard, true); window.removeEventListener("keyup", keyboard, true);
     window.removeEventListener("mousemove", mouse, true); window.removeEventListener("mousedown", mouse, true); window.removeEventListener("mouseup", mouse, true);
-    window.removeEventListener("wheel", scroll, true); window.removeEventListener("blur", stop); element.removeEventListener("contextmenu", context);
+    window.removeEventListener("wheel", scroll, true); window.removeEventListener("blur", pause); window.removeEventListener("focus", focus); element.removeEventListener("contextmenu", context);
     document.removeEventListener("pointerlockchange", lock); document.removeEventListener("visibilitychange", hidden);
     if (document.pointerLockElement === element && !preserveLock()) document.exitPointerLock();
   };

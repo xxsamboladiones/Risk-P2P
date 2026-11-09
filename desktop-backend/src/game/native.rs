@@ -64,3 +64,29 @@ pub(super) fn create(device: Device, slot: usize) -> Result<Box<dyn InputBackend
 pub(super) fn delta(previous: i64, next: i64, limit: i64) -> i32 {
     (next - previous).clamp(-limit, limit) as i32
 }
+
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn wheel_steps(previous: i64, next: i64, remainder: &mut i32) -> i32 {
+    let accumulated = *remainder - delta(previous, next, 1200);
+    *remainder = accumulated % 120;
+    accumulated / 120
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_wheel_deltas_accumulate_into_linux_detents() {
+        let mut remainder = 0;
+        assert_eq!(wheel_steps(0, 40, &mut remainder), 0);
+        assert_eq!(wheel_steps(40, 80, &mut remainder), 0);
+        assert_eq!(wheel_steps(80, 120, &mut remainder), -1);
+        assert_eq!(remainder, 0);
+        assert_eq!(wheel_steps(120, 80, &mut remainder), 0);
+        assert_eq!(wheel_steps(80, -40, &mut remainder), 1);
+        assert_eq!(remainder, 40);
+        assert_eq!(wheel_steps(-40, 0, &mut remainder), 0);
+        assert_eq!(remainder, 0);
+    }
+}

@@ -6,16 +6,84 @@ import type { GameBackend } from "./DesktopGameBackend";
 
 function setup() {
   const sendData = vi.fn((_data: string, _peer?: string) => 1);
+  const sendGameInput = vi.fn((_peer: string, _raw: string) => true);
   const backend: GameBackend = { request: vi.fn(async (op: string) => (op === "join" ? { slot: 0 } : { gamepad: true, keyboardMouse: true, players: [] })) as GameBackend["request"], input: vi.fn(async () => {}) };
   let screen: string | undefined = "screen";
   let authenticated = true;
-  const game = new GameModeController({ transport: () => ({ sendData, sendGameInput: () => true, ensureGameInputChannel: vi.fn() } as unknown as CallTransport), authenticated: () => authenticated,
+  const game = new GameModeController({ transport: () => ({ sendData, sendGameInput, ensureGameInputChannel: vi.fn() } as unknown as CallTransport), authenticated: () => authenticated,
     canHost: () => true, screenId: () => screen, quality: vi.fn(async () => {}) }, backend);
   const settle = async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); };
-  return { game, backend, sendData, settle, screen: (value?: string) => { screen = value; }, auth: (value: boolean) => { authenticated = value; } };
+  return { game, backend, sendData, sendGameInput, settle, screen: (value?: string) => { screen = value; }, auth: (value: boolean) => { authenticated = value; } };
 }
 afterEach(() => vi.useRealTimers());
 describe("Modo Jogo", () => {
+  it("encerra o backend mesmo quando o canal de controle falha ao anunciar a saída", async () => {
+    vi.useFakeTimers(); const t = setup(); await t.game.start();
+    const sessionId = t.game.getSnapshot().host!.sessionId;
+    t.sendData.mockImplementation(() => { throw new DOMException("closed", "InvalidStateError"); });
+    await expect(t.game.stop()).resolves.toBeUndefined();
+    expect(t.backend.request).toHaveBeenCalledWith("stop", { sessionId });
+    expect(t.game.getSnapshot().host).toBeUndefined();
+  });
+  it("cancela entrada pendente quando o anfitrião anuncia uma nova sessão", () => {
+    vi.useFakeTimers(); const t = setup();
+    t.game.handleControl("host", encodeGameControl({ type: "game-mode-start", sessionId: "old", screenStreamId: "screen", gamepad: true }));
+    t.game.join("host", "keyboard-mouse");
+    const request = JSON.parse(t.sendData.mock.calls.at(-1)![0]);
+    t.game.handleControl("host", encodeGameControl({ type: "game-mode-start", sessionId: "new", screenStreamId: "screen", gamepad: true }));
+    t.game.handleControl("host", encodeGameControl({ type: "join-accepted", sessionId: "old", requestId: request.requestId, grantId: "old-grant", device: "keyboard-mouse", slot: 0 }));
+    expect(t.game.getSnapshot().pending).toBeUndefined();
+    expect(t.game.getSnapshot().playing).toBeUndefined();
+    expect(JSON.parse(t.sendData.mock.calls.at(-1)![0])).toMatchObject({ type: "leave", grantId: "old-grant" });
+    t.game.leave();
+  });
+  it("descarta uma entrada que terminou depois que o participante saiu", async () => {
+    vi.useFakeTimers(); const t = setup(); await t.game.start();
+    const sessionId = t.game.getSnapshot().host!.sessionId;
+    let finish!: (value: { slot: number }) => void;
+    vi.mocked(t.backend.request).mockImplementationOnce(() => new Promise((done) => { finish = done as typeof finish; }));
+    t.game.handleControl("peer", encodeGameControl({ type: "join-request", sessionId, requestId: "stale", device: "keyboard-mouse" }));
+    t.game.peerLeft("peer"); finish({ slot: 0 }); await t.settle();
+    expect(t.game.getSnapshot().host!.players).toHaveLength(0);
+    expect(t.backend.request).toHaveBeenCalledWith("revoke", expect.objectContaining({ sessionId, peerId: "peer" }));
+    await t.game.reset();
+  });
+  it("a limpeza de uma entrada antiga não desbloqueia a entrada da nova sessão", async () => {
+    vi.useFakeTimers(); const t = setup(); await t.game.start();
+    const old = t.game.getSnapshot().host!.sessionId;
+    let oldDone!: (value: { slot: number }) => void;
+    vi.mocked(t.backend.request).mockImplementationOnce(() => new Promise((done) => { oldDone = done as typeof oldDone; }));
+    t.game.handleControl("peer", encodeGameControl({ type: "join-request", sessionId: old, requestId: "old", device: "keyboard-mouse" }));
+    await t.game.stop(); await t.game.start();
+    const sessionId = t.game.getSnapshot().host!.sessionId;
+    let newDone!: (value: { slot: number }) => void;
+    vi.mocked(t.backend.request).mockImplementationOnce(() => new Promise((done) => { newDone = done as typeof newDone; }));
+    t.game.handleControl("peer", encodeGameControl({ type: "join-request", sessionId, requestId: "new", device: "keyboard-mouse" }));
+    oldDone({ slot: 0 }); await t.settle(); await t.settle();
+    const joins = () => vi.mocked(t.backend.request).mock.calls.filter(([op]) => op === "join").length;
+    expect(joins()).toBe(2);
+    t.game.handleControl("peer", encodeGameControl({ type: "join-request", sessionId, requestId: "duplicate", device: "keyboard-mouse" }));
+    expect(joins()).toBe(2);
+    newDone({ slot: 0 }); await t.settle(); await t.game.reset();
+  });
+  it("preserva sessão sem UI montada e retoma sequência e mouse sem saltos", async () => {
+    vi.useFakeTimers(); const t = setup(); const frames: GameInputFrame[] = [];
+    t.sendGameInput.mockImplementation((_peer, raw) => { frames.push(JSON.parse(raw)); return true; });
+    t.game.handleControl("host", encodeGameControl({ type: "game-mode-start", sessionId: "session", screenStreamId: "screen", gamepad: true }));
+    t.game.join("host", "keyboard-mouse");
+    const requestId = JSON.parse(t.sendData.mock.calls.at(-1)![0]).requestId;
+    t.game.handleControl("host", encodeGameControl({ type: "join-accepted", sessionId: "session", requestId, grantId: "grant", device: "keyboard-mouse", slot: 0 }));
+    t.game.beginInputCapture();
+    const frame: GameInputFrame = { version: 1, sessionId: "session", grantId: "grant", sequence: 0, keys: ["KeyW"], buttons: 1, x: 40, y: 10, wheel: 0 };
+    t.game.sendInput(frame); t.game.pauseInput();
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(t.game.getSnapshot().playing?.grantId).toBe("grant");
+    expect(frames.at(-1)).toMatchObject({ keys: [], buttons: 0, x: 40, y: 10 });
+    t.game.beginInputCapture(); t.game.sendInput({ ...frame, sequence: 0, x: 2, y: 3 });
+    expect(frames.at(-1)).toMatchObject({ keys: ["KeyW"], x: 42, y: 13 });
+    expect(frames.every((f, i) => i === 0 || f.sequence > frames[i - 1]!.sequence)).toBe(true);
+    t.game.leave(); const count = frames.length; await vi.advanceTimersByTimeAsync(1000); expect(frames).toHaveLength(count);
+  });
   it("substitui concessão atomicamente e ignora pacotes da concessão anterior", async () => {
     vi.useFakeTimers(); const t = setup(); await t.game.start();
     const sessionId = t.game.getSnapshot().host!.sessionId;

@@ -1,9 +1,25 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DesktopGameBackend } from "./DesktopGameBackend";
+import { DesktopGameBackend, GameBackendError } from "./DesktopGameBackend";
 
 vi.mock("../../services/offline/desktop-backend-client", () => ({ desktopConfig: async () => ({ baseUrl: "http://127.0.0.1:3333", token: "local-token" }) }));
 afterEach(() => vi.unstubAllGlobals());
 describe("autenticação do backend de jogo", () => {
+  it("não restaura um token quando o usuário sai durante a renovação", async () => {
+    let token: string | null = "expired";
+    const save = vi.fn((_key: string, value: string) => { token = value; });
+    vi.stubGlobal("sessionStorage", { getItem: () => token, setItem: save });
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.endsWith("/auth/refresh")) { token = null; return Response.json({ accessToken: "renewed" }); }
+      return Response.json({ message: "expired" }, { status: 401 });
+    }));
+    await expect(new DesktopGameBackend().request("heartbeat")).rejects.toBeInstanceOf(GameBackendError);
+    expect(save).not.toHaveBeenCalled(); expect(token).toBeNull();
+  });
+  it("preserva o status de uma rejeição HTTP com corpo de texto", async () => {
+    vi.stubGlobal("sessionStorage", { getItem: () => "token" });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("Unprocessable Entity", { status: 422 })));
+    await expect(new DesktopGameBackend().request("heartbeat")).rejects.toMatchObject({ status: 422 });
+  });
   it("renova o token vencido uma única vez para requisições simultâneas", async () => {
     let token = "expired";
     vi.stubGlobal("sessionStorage", { getItem: () => token, setItem: (_: string, value: string) => { token = value; } });

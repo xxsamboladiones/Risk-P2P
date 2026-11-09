@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type FormEvent, type RefObject } from "react";
 import {
   Activity,
+  AppWindow,
   Copy,
+  Gamepad2,
   Hash,
   Maximize2,
   MessageCircle,
   Mic,
   MicOff,
+  Monitor,
   MonitorUp,
   PanelLeft,
   PhoneOff,
@@ -38,6 +41,7 @@ import {
   type ScreenQuality,
 } from "../services/rtc/screen-quality";
 import { useCallStore, type Participant } from "../store";
+import { filterScreenSources, screenSourceKind } from "./screen-source-selection";
 import { ConversationTimeline } from "./ConversationTimeline";
 import { responsiveCallGrid } from "./call-layout";
 import { InCallAudioSettings } from "./InCallAudioSettings";
@@ -120,6 +124,7 @@ function FullscreenButton({ target }: { target: RefObject<HTMLElement | null> })
 
 function VideoTile({
   game,
+  inputVisible = true,
   participant,
   tileId,
   focused,
@@ -128,6 +133,7 @@ function VideoTile({
   onFocus,
 }: {
   game?: GameModeController;
+  inputVisible?: boolean;
   participant: Participant;
   tileId: string;
   focused: boolean;
@@ -199,7 +205,7 @@ function VideoTile({
       {screenHasAudio && <VolumeControl label="Transmissão" value={screenVolume} onChange={setScreenVolume}/>} 
     </div>}
     <div className="tile-label"><span>{participant.displayName}</span>{!participant.state.microphone && <MicOff size={15}/>} {participant.state.screenAudio && !compact && <em>ÁUDIO DA TELA</em>}</div>
-    {game && <GameTileControls game={game} peerId={participant.peerId} target={articleRef} visible={source === "screen" && participant.state.screenShare}/>}
+    {game && <GameTileControls game={game} peerId={participant.peerId} target={articleRef} visible={inputVisible && source === "screen" && participant.state.screenShare}/>}
   </article>;
 }
 
@@ -296,6 +302,9 @@ function ScreenSourcePicker({
   onChoose(source: RiskDesktopSource): void;
   onClose(): void;
 }) {
+  const [fullscreenGames, setFullscreenGames] = useState(false);
+  const visibleSources = filterScreenSources(sources, fullscreenGames);
+
   return <div className="screen-picker-backdrop" onMouseDown={onClose}>
     <section className="screen-picker" onMouseDown={(event) => event.stopPropagation()}>
       <header>
@@ -308,14 +317,27 @@ function ScreenSourcePicker({
         >{includeAudio ? <Volume2 size={17}/> : <VolumeX size={17}/>}<span>{includeAudio ? "Com áudio" : "Sem áudio"}</span></button>
         <button className="screen-picker-close" onClick={onClose} aria-label="Fechar"><X/></button>
       </header>
-      {loading ? <div className="screen-picker-loading"><Sparkles/><span>Buscando telas e janelas…</span></div> :
-        <div className="screen-source-grid">
-          {sources.map((source) => <button key={source.id} className="screen-source" onClick={() => onChoose(source)}>
-            <div className="screen-source-preview">{source.thumbnail ? <img src={source.thumbnail} alt=""/> : <MonitorUp/>}</div>
-            <span title={source.name}>{source.name}</span>
-          </button>)}
-          {!sources.length && <div className="screen-picker-empty">Nenhuma tela ou janela foi encontrada.</div>}
-        </div>}
+      <div className="screen-picker-body">
+        <div className={`fullscreen-game-capture ${fullscreenGames ? "active" : ""}`}>
+          <button onClick={() => setFullscreenGames(!fullscreenGames)} aria-pressed={fullscreenGames}>
+            <Gamepad2 size={18}/>
+            <span><strong>Jogos em tela cheia</strong><small>Use para PCSX2, Minecraft e jogos que somem ao entrar em tela cheia</small></span>
+          </button>
+          {fullscreenGames && <p>Escolha o monitor onde o jogo será aberto. A captura continuará ativa quando o jogo trocar para tela cheia.</p>}
+        </div>
+        {loading ? <div className="screen-picker-loading"><Sparkles/><span>Buscando telas e janelas…</span></div> :
+          <div className="screen-source-grid">
+            {visibleSources.map((source) => {
+              const kind = screenSourceKind(source);
+              return <button key={source.id} className="screen-source" onClick={() => onChoose(source)}>
+                <div className="screen-source-preview">{source.thumbnail ? <img src={source.thumbnail} alt=""/> : <MonitorUp/>}</div>
+                <span className="screen-source-name" title={source.name}>{source.name}</span>
+                <small className={`screen-source-kind ${kind}`}>{kind === "screen" ? <Monitor size={13}/> : <AppWindow size={13}/>} {kind === "screen" ? "Tela inteira" : "Janela"}</small>
+              </button>;
+            })}
+            {!visibleSources.length && <div className="screen-picker-empty">{fullscreenGames ? "Nenhum monitor foi encontrado." : "Nenhuma tela ou janela foi encontrada."}</div>}
+          </div>}
+      </div>
     </section>
   </div>;
 }
@@ -354,7 +376,7 @@ export function CallWorkspace({ call, chat: fallbackChat, onMinimize }: { call: 
   const [replyingTo, setReplyingTo] = useState<ChatMessage | null>(null);
   const [typingUsers, setTypingUsers] = useState<string[]>([]);
   const workspaceOpen = useCallStore((state) => state.callWorkspaceOpen);
-  useEffect(() => { if (view !== "call" || !workspaceOpen) call.game.leave(); }, [call, view, workspaceOpen]);
+  useEffect(() => { if (view !== "call" || !workspaceOpen) call.game.pauseInput(); }, [call, view, workspaceOpen]);
 
   const context = callContext;
   const chat = context?.textChannelId ? backgroundChats.groupController(context.textChannelId) : fallbackChat;
@@ -567,6 +589,7 @@ export function CallWorkspace({ call, chat: fallbackChat, onMinimize }: { call: 
       for (const file of files) await chat.sendAttachment(file);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Falha ao enviar arquivo.");
+      throw cause;
     }
   }
 
@@ -671,6 +694,7 @@ export function CallWorkspace({ call, chat: fallbackChat, onMinimize }: { call: 
           const id = `peer-${participant.peerId}`;
           return <VideoTile
             game={call.game}
+            inputVisible={view === "call" && workspaceOpen}
             key={participant.peerId}
             participant={participant}
             tileId={id}
@@ -694,6 +718,7 @@ export function CallWorkspace({ call, chat: fallbackChat, onMinimize }: { call: 
         {!messages.length && !attachments.length && <div className="channel-welcome"><MessageCircle/><h2>Chat da chamada</h2><p>O chat P2P conecta automaticamente enquanto você permanece na sala de voz.</p></div>}
       </div>
       <MessageComposer
+        key={context?.textChannelId}
         placeholder={context?.textChannelName ? `Conversar em #${context.textChannelName}` : "Chat indisponível"}
         canAttach={chatStatus === "ready"}
         onSubmit={submitMessage}

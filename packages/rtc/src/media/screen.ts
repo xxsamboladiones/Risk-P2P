@@ -1,4 +1,10 @@
-export type ScreenSource = { id: string; name: string; thumbnail?: string; displayId?: string };
+export type ScreenSource = {
+  id: string;
+  name: string;
+  thumbnail?: string;
+  displayId?: string;
+  kind?: "screen" | "window";
+};
 
 export interface ScreenShareProvider {
   getSources(): Promise<ScreenSource[]>;
@@ -14,7 +20,10 @@ type DesktopScreenBridge = {
 
 type DisplayAudioConstraints = MediaTrackConstraints & { restrictOwnAudio?: boolean };
 type DisplayAudioSettings = MediaTrackSettings & { restrictOwnAudio?: boolean };
+type DisplayVideoConstraints = MediaTrackConstraints & { cursor?: "always" | "motion" | "never" };
 type RiskMediaCaptureOptions = { restrictOwnAudio?: boolean };
+
+const DISPLAY_VIDEO_CONSTRAINTS: DisplayVideoConstraints = { cursor: "always" };
 
 function desktopScreenBridge(): DesktopScreenBridge | undefined {
   return (globalThis as typeof globalThis & { desktop?: DesktopScreenBridge }).desktop;
@@ -53,7 +62,7 @@ export class WebScreenShareProvider implements ScreenShareProvider {
     const audio: boolean | DisplayAudioConstraints = includeAudio
       ? restrictOwnAudio ? { restrictOwnAudio: true } : true
       : false;
-    this.stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio });
+    this.stream = await navigator.mediaDevices.getDisplayMedia({ video: DISPLAY_VIDEO_CONSTRAINTS, audio });
 
     if (includeAudio && restrictOwnAudio) {
       const audioTrack = this.stream.getAudioTracks()[0];

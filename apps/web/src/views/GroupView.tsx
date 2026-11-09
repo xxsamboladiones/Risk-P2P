@@ -44,6 +44,6 @@ export function GroupView(props: GroupViewProps) {
       {props.timeline}
       {!props.messageCount && !props.attachmentCount && <div className="channel-welcome"><Hash/><h2>Bem-vindo a #{props.channel.name}</h2><p>Este é o começo deste canal P2P salvo neste dispositivo.</p></div>}
     </div>
-    <MessageComposer placeholder={`Conversar em #${props.channel.name}`} canAttach={props.chatStatus === "ready"} onSubmit={props.onSubmit} onFiles={props.onFiles} replyingTo={props.replyingTo} onCancelReply={props.onCancelReply} onTyping={props.onTyping} mentionCandidates={props.mentionCandidates}/>
+    <MessageComposer key={props.channel.id} placeholder={`Conversar em #${props.channel.name}`} canAttach={props.chatStatus === "ready"} onSubmit={props.onSubmit} onFiles={props.onFiles} replyingTo={props.replyingTo} onCancelReply={props.onCancelReply} onTyping={props.onTyping} mentionCandidates={props.mentionCandidates}/>
   </>;
 }

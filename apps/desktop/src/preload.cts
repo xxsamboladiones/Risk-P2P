@@ -6,6 +6,7 @@ export type DesktopSource = {
   name: string;
   displayId: string;
   thumbnail: string;
+  kind: "screen" | "window";
 };
 
 export type DesktopBackendConfig = {

@@ -4,6 +4,7 @@ import { createPortal } from "react-dom";
 import type { GameDevice } from "@risk/protocol";
 import type { GameModeController } from "../call/game/GameModeController";
 import { captureGameInput } from "../call/game/capture";
+import { findConnectedGamepad } from "../call/game/gamepad";
 import "./game-mode.css";
 
 export function GameTileControls({ game, peerId, target, visible }: { game: GameModeController; peerId: string; target: RefObject<HTMLElement | null>; visible: boolean }) {
@@ -22,8 +23,8 @@ export function GameTileControls({ game, peerId, target, visible }: { game: Game
     if (!player || player.peerId !== peerId || current.pending || switching.current) return;
     if (!current.offers[peerId]?.gamepad) { setError(current.offers[peerId]?.reason ?? "Controle indisponível neste anfitrião."); return; }
     const next = player.device === "gamepad" ? "keyboard-mouse" : "gamepad";
-    if (next === "gamepad" && ![...(navigator.getGamepads?.() ?? [])].some((pad) => pad?.connected && pad.mapping === "standard")) {
-      setError("Conecte um controle e pressione um botão antes de alternar."); return;
+    if (next === "gamepad" && !findConnectedGamepad([...(navigator.getGamepads?.() ?? [])])) {
+      setError("O Risk ainda não recebeu o controle. Pressione um botão no controle conectado a este computador e tente novamente."); return;
     }
     switching.current = true; setError(undefined);
     try {
@@ -45,13 +46,15 @@ export function GameTileControls({ game, peerId, target, visible }: { game: Game
   useEffect(() => {
     setKeyboardPaused(false);
     if (!sessionId || !grantId || !playingDevice || !target.current) return;
-    if (!visible) { game.leave(); return; }
+    if (!visible) { game.pauseInput(); return; }
     const element = target.current;
     element.dispatchEvent(new Event("risk-show-overlays"));
-    return captureGameInput(element, { sessionId, grantId, device: playingDevice }, (frame) => game.sendInput(frame), () => game.leave(), (paused) => {
+    game.beginInputCapture();
+    const close = captureGameInput(element, { sessionId, grantId, device: playingDevice }, (frame) => game.sendInput(frame), () => game.leave(), (paused) => {
       setKeyboardPaused(paused);
       element.dispatchEvent(new Event("risk-show-overlays"));
     }, () => void toggleDevice(), () => game.getSnapshot().playing?.device === "keyboard-mouse" && game.getSnapshot().playing?.peerId === peerId && game.getSnapshot().playing?.grantId !== grantId);
+    return () => { close(); if (game.getSnapshot().playing?.grantId === grantId) game.pauseInput(); };
   }, [game, sessionId, grantId, playingDevice, target, visible, toggleDevice, peerId]);
   useEffect(() => {
     if (playing?.device === "gamepad" && !pending && document.pointerLockElement === target.current) document.exitPointerLock();
@@ -59,7 +62,7 @@ export function GameTileControls({ game, peerId, target, visible }: { game: Game
   useEffect(() => {
     if (!playing && !pending && document.pointerLockElement === target.current) document.exitPointerLock();
   }, [playing, pending, target]);
-  useEffect(() => () => { if (game.getSnapshot().playing?.peerId === peerId || game.getSnapshot().pending === peerId) game.leave(); }, [game, peerId]);
+  useEffect(() => () => { if (game.getSnapshot().playing?.peerId === peerId) game.pauseInput(); }, [game, peerId]);
   if (!offer || !visible) return null;
   const resume = async () => {
     setError(undefined);

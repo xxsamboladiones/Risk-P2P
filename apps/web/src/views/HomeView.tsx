@@ -496,7 +496,10 @@ export function HomeView() {
   async function sendFiles(files: File[]) {
     try {
       for (const file of files) await activeConversationChat.sendAttachment(file);
-    } catch (cause) { setError(cause instanceof Error ? cause.message : "Falha ao enviar arquivo"); }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Falha ao enviar arquivo");
+      throw cause;
+    }
   }
 
   async function attachmentAction(action: (record: ChatAttachmentRecord) => Promise<void>, record: ChatAttachmentRecord) {
@@ -768,6 +771,7 @@ export function HomeView() {
             {!messages.length && !attachments.length && <div className="channel-welcome"><MessageCircle/><h2>Conversa com {activeFriend.displayName}</h2><p>Os dois amigos devem abrir esta conversa e clicar em Conectar P2P. Depois disso mensagens e arquivos seguem diretamente pelo WebRTC.</p></div>}
           </div>
           <MessageComposer
+            key={conversationId}
             placeholder={`Mensagem para ${activeFriend.displayName}`}
             canAttach={chatStatus === "ready"}
             onSubmit={submitMessage}

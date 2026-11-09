@@ -85,6 +85,20 @@ impl Session {
             (None, None) => {}
             _ => return Err("Concessão de jogo inválida".into()),
         }
+        if let Some(player) = self
+            .players
+            .get_mut(&peer_id)
+            .filter(|p| p.device == device)
+        {
+            // Renew the grant without allocating another OS device or consuming a slot.
+            player.backend.release_all()?;
+            player.grant_id = grant_id;
+            player.last = Frame::default();
+            player.sequence = None;
+            player.received = Instant::now();
+            player.idle = false;
+            return Ok(player.slot);
+        }
         let slot = match device {
             Device::KeyboardMouse => {
                 if self.players.values().any(|p| p.device == device) {
@@ -392,17 +406,32 @@ mod tests {
     #[derive(Default)]
     struct Observed {
         frames: Vec<Frame>,
+        previous: Vec<Frame>,
         releases: usize,
+        fail_apply: bool,
+        failed_releases: usize,
     }
     struct Fake(Arc<StdMutex<Observed>>);
     impl InputBackend for Fake {
-        fn apply(&mut self, _: &Frame, next: &Frame) -> Result<(), String> {
-            self.0.lock().unwrap().frames.push(next.clone());
-            Ok(())
+        fn apply(&mut self, previous: &Frame, next: &Frame) -> Result<(), String> {
+            let mut seen = self.0.lock().unwrap();
+            seen.previous.push(previous.clone());
+            seen.frames.push(next.clone());
+            if seen.fail_apply {
+                Err("injection failed".into())
+            } else {
+                Ok(())
+            }
         }
         fn release_all(&mut self) -> Result<(), String> {
-            self.0.lock().unwrap().releases += 1;
-            Ok(())
+            let mut seen = self.0.lock().unwrap();
+            seen.releases += 1;
+            if seen.failed_releases > 0 {
+                seen.failed_releases -= 1;
+                Err("release failed".into())
+            } else {
+                Ok(())
+            }
         }
     }
     fn setup() -> (Engine, Uuid, Arc<StdMutex<Observed>>) {
@@ -513,6 +542,63 @@ mod tests {
             .is_err());
     }
     #[test]
+    fn same_device_replacement_reuses_the_existing_backend_and_slot() {
+        let (mut e, owner, seen) = setup();
+        e.input(owner, "peer", frame(0)).unwrap();
+        let s = e.session.as_mut().unwrap();
+        assert_eq!(
+            s.join(
+                "peer".into(),
+                "new".into(),
+                Device::KeyboardMouse,
+                Some("grant".into()),
+                |_, _| panic!("existing device must be reused")
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(s.players["peer"].grant_id, "new");
+        assert_eq!(seen.lock().unwrap().releases, 1);
+        assert!(e.input(owner, "peer", frame(1)).is_err());
+        e.input(
+            owner,
+            "peer",
+            Frame {
+                grant_id: "new".into(),
+                ..frame(0)
+            },
+        )
+        .unwrap();
+        assert_eq!(seen.lock().unwrap().frames.len(), 2);
+    }
+
+    #[test]
+    fn same_gamepad_replacement_works_when_all_slots_are_occupied() {
+        let (mut e, _, _) = setup();
+        let s = e.session.as_mut().unwrap();
+        for i in 1..=4 {
+            s.join(
+                format!("pad{i}"),
+                format!("grant{i}"),
+                Device::Gamepad,
+                None,
+                |_, _| Ok(Box::new(Fake(Arc::default()))),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            s.join(
+                "pad2".into(),
+                "new".into(),
+                Device::Gamepad,
+                Some("grant2".into()),
+                |_, _| panic!("existing pad must be reused")
+            )
+            .unwrap(),
+            2
+        );
+    }
+    #[test]
     fn rejects_old_packets_and_recovers_a_lost_keyup_with_the_next_snapshot() {
         let (mut e, owner, seen) = setup();
         e.input(owner, "peer", frame(2)).unwrap();
@@ -605,6 +691,47 @@ mod tests {
         assert_eq!(seen.lock().unwrap().releases, 1);
         e.input(owner, "peer", frame(1)).unwrap();
         assert_eq!(seen.lock().unwrap().frames.len(), 2);
+    }
+    #[test]
+    fn input_failure_revokes_the_grant_and_releases_partial_input() {
+        let (mut e, owner, seen) = setup();
+        seen.lock().unwrap().fail_apply = true;
+        assert!(e.input(owner, "peer", frame(0)).is_err());
+        assert!(!e.session.as_ref().unwrap().players.contains_key("peer"));
+        assert_eq!(seen.lock().unwrap().releases, 1);
+        assert!(e.input(owner, "peer", frame(1)).is_err());
+    }
+
+    #[test]
+    fn timeout_release_failure_revokes_and_retries_during_drop() {
+        let (mut e, owner, seen) = setup();
+        e.input(owner, "peer", frame(0)).unwrap();
+        seen.lock().unwrap().failed_releases = 1;
+        e.expire(Instant::now() + Duration::from_millis(300));
+        assert!(!e.session.as_ref().unwrap().players.contains_key("peer"));
+        assert_eq!(seen.lock().unwrap().releases, 2);
+    }
+
+    #[test]
+    fn resuming_after_idle_discards_accumulated_motion() {
+        let (mut e, owner, seen) = setup();
+        e.input(owner, "peer", frame(0)).unwrap();
+        e.expire(Instant::now() + Duration::from_millis(300));
+        e.input(
+            owner,
+            "peer",
+            Frame {
+                x: 500,
+                y: -300,
+                wheel: 120,
+                ..frame(1)
+            },
+        )
+        .unwrap();
+        let observed = seen.lock().unwrap();
+        let baseline = &observed.previous[1];
+        assert_eq!((baseline.x, baseline.y, baseline.wheel), (500, -300, 120));
+        assert!(baseline.keys.is_empty());
     }
     #[test]
     fn validates_untrusted_input_before_native_injection() {

@@ -24,7 +24,7 @@ describe("startScreenCapture", () => {
     });
     expect(chooseScreenSource).toHaveBeenCalledOnce();
     expect(selectScreenSource).toHaveBeenCalledWith("screen:1");
-    expect(getDisplayMedia).toHaveBeenCalledWith({ video: true, audio: false });
+    expect(getDisplayMedia).toHaveBeenCalledWith({ video: { cursor: "always" }, audio: false });
     expect(provider.startScreenShare).not.toHaveBeenCalled();
   });
 

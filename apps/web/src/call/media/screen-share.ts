@@ -1,6 +1,9 @@
 import type { ScreenShareProvider } from "@risk/rtc";
 
 export type DisplayAudioSettings = MediaTrackSettings & { restrictOwnAudio?: boolean };
+type DisplayVideoConstraints = MediaTrackConstraints & { cursor?: "always" | "motion" | "never" };
+
+const DISPLAY_VIDEO_CONSTRAINTS: DisplayVideoConstraints = { cursor: "always" };
 
 export type DesktopScreenAudioPreparation = {
   mode: "display" | "pipewire" | "unavailable";
@@ -201,7 +204,7 @@ async function startDesktopVideoShare(selectedSourceId?: string): Promise<MediaS
   const sourceId = selectedSourceId ?? await window.desktop.chooseScreenSource();
   if (!sourceId) throw new DOMException("Compartilhamento cancelado.", "NotAllowedError");
   await window.desktop.selectScreenSource(sourceId);
-  return navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+  return navigator.mediaDevices.getDisplayMedia({ video: DISPLAY_VIDEO_CONSTRAINTS, audio: false });
 }
 
 async function startPipeWireDesktopShare(
